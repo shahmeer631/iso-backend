@@ -1,0 +1,277 @@
+@import url('https://fonts.googleapis.com/css2?family=Cinzel:wght@400;700;900&family=EB+Garamond:ital,wght@0,400;0,600;1,400&display=swap');
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  width: 1122px;
+  height: 794px;
+  font-family: 'EB Garamond', Georgia, serif;
+  background: #f5f0dc;
+}
+
+.certificate {
+  width: 1122px;
+  height: 794px;
+  background: #f5f0dc;
+  position: relative;
+  overflow: hidden;
+}
+
+/* ── Borders ── */
+.outer-border {
+  position: absolute;
+  inset: 8px;
+  border: 4px solid #1a2a5e;
+  padding: 6px;
+}
+
+.inner-border {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  border: 1.5px solid #c8a84b;
+  padding: 22px 36px 18px 36px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* ── Corner ornaments (pure CSS) ── */
+.inner-border::before,
+.inner-border::after {
+  content: '';
+  position: absolute;
+  width: 48px;
+  height: 48px;
+  border-color: #c8a84b;
+  border-style: solid;
+}
+.inner-border::before { top: 6px; left: 6px;  border-width: 3px 0 0 3px; }
+.inner-border::after  { bottom: 6px; right: 6px; border-width: 0 3px 3px 0; }
+
+/* ── Watermark ── */
+.watermark {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 340px;
+  opacity: 0.07;
+  pointer-events: none;
+  z-index: 0;
+}
+
+/* ── All content above watermark ── */
+.inner-border > * { position: relative; z-index: 1; }
+
+/* ── Layout: two columns ── */
+.body-columns {
+  display: flex;
+  gap: 32px;
+  flex: 1;
+  margin-top: 10px;
+}
+
+.col-left  { flex: 1.1; display: flex; flex-direction: column; }
+.col-right { flex: 0.9; display: flex; flex-direction: column; padding-left: 28px; border-left: 1px solid #c8a84b; }
+
+/* ── Header ── */
+.header {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  border-bottom: 2px solid #1a2a5e;
+  padding-bottom: 10px;
+  margin-bottom: 0;
+}
+
+.logo {
+  width: 70px;
+  height: auto;
+}
+
+.header-text h1 {
+  font-family: 'Cinzel', serif;
+  font-size: 13px;
+  color: #1a2a5e;
+  letter-spacing: 1px;
+  font-weight: 700;
+}
+
+.header-text .cert-main-title {
+  font-family: 'Cinzel', serif;
+  font-size: 26px;
+  color: #1a2a5e;
+  font-weight: 900;
+  letter-spacing: 2px;
+  line-height: 1.1;
+}
+
+.header-text .cert-subtitle {
+  font-family: 'Cinzel', serif;
+  font-size: 11px;
+  color: #1a2a5e;
+  letter-spacing: 2.5px;
+  margin-top: 2px;
+}
+
+/* ── Left column content ── */
+.certify-text {
+  font-size: 14px;
+  color: #333;
+  margin-top: 18px;
+  font-style: italic;
+}
+
+.recipient {
+  font-family: 'Cinzel', serif;
+  font-size: 26px;
+  color: #c8a84b;
+  font-weight: 700;
+  margin: 6px 0 8px 0;
+  line-height: 1.2;
+}
+
+.fulfilled-text {
+  font-size: 13px;
+  color: #333;
+  margin-bottom: 6px;
+  font-style: italic;
+}
+
+.course-name {
+  font-family: 'Cinzel', serif;
+  font-size: 20px;
+  color: #1a2a5e;
+  font-weight: 700;
+  line-height: 1.3;
+  margin-top: 2px;
+}
+
+/* ── Bottom of left col: signature + credits + cert no ── */
+.bottom-left {
+  margin-top: auto;
+  display: flex;
+  align-items: flex-end;
+  gap: 32px;
+}
+
+.signature-block img {
+  height: 46px;
+  display: block;
+  margin-bottom: 2px;
+}
+
+.sig-line {
+  width: 160px;
+  height: 1px;
+  background: #1a2a5e;
+  margin-bottom: 4px;
+}
+
+.sig-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: #1a2a5e;
+}
+
+.sig-title {
+  font-size: 11px;
+  color: #555;
+}
+
+.cert-meta {
+  font-size: 12px;
+  color: #333;
+  line-height: 1.8;
+}
+
+.cert-meta strong {
+  color: #1a2a5e;
+}
+
+/* ── Right column ── */
+.col-right .proficiency-intro {
+  font-size: 13px;
+  color: #333;
+  margin-top: 18px;
+  margin-bottom: 10px;
+  line-height: 1.5;
+}
+
+.competency-list {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  flex: 1;
+}
+
+.competency-list li {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  font-size: 12px;
+  color: #333;
+  line-height: 1.4;
+}
+
+.competency-list li img {
+  width: 28px;
+  height: 28px;
+  flex-shrink: 0;
+  margin-top: 1px;
+}
+
+/* ── CPD badge + QR ── */
+.bottom-right {
+  margin-top: auto;
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+}
+
+.cpd-badge {
+  background: linear-gradient(135deg, #c8a84b, #e8d07a);
+  color: #1a2a5e;
+  font-family: 'Cinzel', serif;
+  font-size: 13px;
+  font-weight: 700;
+  padding: 8px 18px;
+  border-radius: 4px;
+  text-align: center;
+  box-shadow: 0 2px 6px rgba(0,0,0,0.2);
+}
+
+.qr-block {
+  text-align: center;
+}
+
+.qr-block img {
+  width: 72px;
+  height: 72px;
+  display: block;
+}
+
+.qr-block p {
+  font-size: 10px;
+  color: #555;
+  margin-top: 2px;
+  letter-spacing: 1px;
+}
+
+.cert-no-block {
+  font-size: 11px;
+  color: #333;
+  text-align: center;
+}
+
+.cert-no-block strong {
+  display: block;
+  color: #1a2a5e;
+  font-size: 12px;
+}

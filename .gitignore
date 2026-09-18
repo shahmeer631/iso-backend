@@ -1,0 +1,40 @@
+# dependencies
+node_modules/
+
+# build
+dist/
+build/
+*.tsbuildinfo
+
+# env / secrets — never commit real values
+.env
+.env.*
+!.env.example
+
+# logs and OS
+logs/
+*.log
+npm-debug.log*
+.DS_Store
+Thumbs.db
+
+# uploads / temp
+uploads/
+tmp/
+temp/
+coverage/
+
+# keys / certs
+*.pem
+*.p12
+*.key
+
+# IDE / tooling
+.idea/
+.vscode/
+.vercel
+.agent
+
+# Prisma (keep schema; ignore generated engines if copied locally)
+prisma/*.db
+prisma/*.db-journal

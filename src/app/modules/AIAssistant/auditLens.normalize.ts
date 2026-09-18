@@ -1,0 +1,369 @@
+import { AUDIT_STEP_META } from "./auditLens.prompt";
+
+export type NormalizedAuditStep = {
+  step_number: number;
+  title: string;
+  stage: string;
+  guidance: string;
+  template_preview?: string;
+  next_step_available: boolean;
+  auditor_guidance?: string;
+  audit_paper?: string;
+  documented_information_template?: string;
+  case_study?: string;
+  what_to_do?: string;
+  when_to_do_it?: string;
+  why_it_is_necessary?: string;
+  specification_to_check?: string;
+  evidence_to_look_for?: string;
+  audit_questions?: string;
+};
+
+function isPlainObject(value: unknown): value is Record<string, any> {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+export function unwrapAiPayload(raw: any): any {
+  let current = raw;
+  for (let i = 0; i < 4; i++) {
+    if (!isPlainObject(current)) break;
+    if (
+      current.data !== undefined &&
+      (current.success !== undefined || current.message !== undefined)
+    ) {
+      current = current.data;
+      continue;
+    }
+    if (
+      current.data &&
+      isPlainObject(current.data) &&
+      (current.data.guidance ||
+        current.data.title ||
+        current.data.step_number ||
+        current.data.options)
+    ) {
+      current = current.data;
+      continue;
+    }
+    break;
+  }
+  return current;
+}
+
+function asString(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (value == null) return "";
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return "";
+  }
+}
+
+function stripMarkdownFences(content: string): string {
+  let text = content.trim();
+  if (text.startsWith("```")) {
+    const firstNewline = text.indexOf("\n");
+    if (firstNewline !== -1) text = text.substring(firstNewline + 1);
+    const lastFence = text.lastIndexOf("```");
+    if (lastFence !== -1) text = text.substring(0, lastFence);
+  }
+  return text.trim();
+}
+
+/** Split markdown by H2 headings into a map of title -> body */
+function splitByH2(markdown: string): Record<string, string> {
+  const sections: Record<string, string> = {};
+  const parts = markdown.split(/\n(?=##\s+)/);
+  for (const part of parts) {
+    const match = part.match(/^##\s+([^\n]+)\n?([\s\S]*)$/);
+    if (!match) continue;
+    const title = match[1].trim().toLowerCase();
+    const body = match[2].trim();
+    sections[title] = body;
+  }
+  return sections;
+}
+
+function findSection(sections: Record<string, string>, needles: string[]): string {
+  for (const [title, body] of Object.entries(sections)) {
+    if (needles.some((n) => title.includes(n.toLowerCase()))) {
+      return body;
+    }
+  }
+  return "";
+}
+
+function extractSubsections(auditorGuidanceBody: string): {
+  what_to_do?: string;
+  when_to_do_it?: string;
+  why_it_is_necessary?: string;
+  specification_to_check?: string;
+  evidence_to_look_for?: string;
+  audit_questions?: string;
+} {
+  if (!auditorGuidanceBody) return {};
+  const parts = auditorGuidanceBody.split(/\n(?=###\s+)/);
+  const map: Record<string, string> = {};
+  for (const part of parts) {
+    const match = part.match(/^###\s+([^\n]+)\n?([\s\S]*)$/);
+    if (!match) continue;
+    map[match[1].trim().toLowerCase()] = match[2].trim();
+  }
+  const pick = (...needles: string[]) => {
+    for (const [k, v] of Object.entries(map)) {
+      if (needles.some((n) => k.includes(n))) return v;
+    }
+    return undefined;
+  };
+  return {
+    what_to_do: pick("what to do", "what"),
+    when_to_do_it: pick("when to do", "when"),
+    why_it_is_necessary: pick("why"),
+    specification_to_check: pick("specification", "requirement"),
+    evidence_to_look_for: pick("evidence"),
+    audit_questions: pick("question", "checkpoint"),
+  };
+}
+
+function synthesizeGuidance(payload: Record<string, any>): string {
+  const parts: string[] = [];
+
+  const headerBits = [
+    payload.title && `**Step:** ${payload.title}`,
+    payload.stage && `**Stage:** ${payload.stage}`,
+  ].filter(Boolean);
+  if (headerBits.length) {
+    parts.push(`## Audit Step\n\n${headerBits.join("\n")}`);
+  }
+
+  const guidanceSections = [
+    {
+      h: "## 1. Auditor Guidance",
+      body:
+        payload.auditor_guidance ||
+        payload.auditorGuidance ||
+        [
+          payload.what_to_do && `### What to Do\n${asString(payload.what_to_do)}`,
+          payload.when_to_do_it && `### When to Do It\n${asString(payload.when_to_do_it)}`,
+          payload.why_it_is_necessary &&
+            `### Why It Is Necessary\n${asString(payload.why_it_is_necessary)}`,
+          payload.specification_to_check &&
+            `### Specification / Requirement to Check\n${asString(payload.specification_to_check)}`,
+          payload.evidence_to_look_for &&
+            `### Evidence to Look For\n${asString(payload.evidence_to_look_for)}`,
+          payload.audit_questions &&
+            `### Audit Questions / Checkpoints\n${asString(payload.audit_questions)}`,
+        ]
+          .filter(Boolean)
+          .join("\n\n"),
+    },
+    {
+      h: "## 2. Audit Paper / Document",
+      body: payload.audit_paper || payload.auditPaper || payload.paper,
+    },
+    {
+      h: "## 3. Documented Information Template",
+      body:
+        payload.documented_information_template ||
+        payload.documentedInformationTemplate ||
+        payload.template,
+    },
+    {
+      h: "## 4. Demonstrated Case Study",
+      body: payload.case_study || payload.caseStudy || payload.demonstrated_scenario,
+    },
+  ];
+
+  for (const section of guidanceSections) {
+    const body = asString(section.body).trim();
+    if (body) parts.push(`${section.h}\n\n${body}`);
+  }
+
+  return parts.join("\n\n").trim();
+}
+
+function extractGuidance(payload: any): string {
+  if (!payload) return "";
+  if (typeof payload === "string") return stripMarkdownFences(payload);
+
+  if (!isPlainObject(payload)) return "";
+
+  const direct =
+    payload.guidance ||
+    payload.content ||
+    payload.markdown ||
+    payload.result ||
+    payload.text;
+
+  if (typeof direct === "string" && direct.trim()) {
+    return stripMarkdownFences(direct);
+  }
+
+  return synthesizeGuidance(payload);
+}
+
+export function isValidAuditGuidance(guidance: string): boolean {
+  const cleaned = (guidance || "").trim();
+  if (cleaned.length < 120) return false;
+  if (/^(null|undefined|n\/a|error)\s*$/i.test(cleaned)) return false;
+
+  const lower = cleaned.toLowerCase();
+  // Soft required-structure check — at least guidance-like content
+  const hasGuidanceCue =
+    lower.includes("what to do") ||
+    lower.includes("auditor guidance") ||
+    lower.includes("evidence") ||
+    lower.includes("## 1");
+  const hasPaperOrTemplate =
+    lower.includes("audit paper") ||
+    lower.includes("documented information") ||
+    lower.includes("template") ||
+    lower.includes("## 2") ||
+    lower.includes("## 3");
+  // Accept if either rich structure OR substantial practical content
+  if (hasGuidanceCue || hasPaperOrTemplate) return true;
+  return cleaned.length >= 400;
+}
+
+/** Soft cleanup of common simulation openers / claims. */
+export function stripSimulationPhrases(guidance: string): string {
+  return guidance
+    .replace(
+      /^I have (initiated|conducted|performed|completed|carried out) (an |the )?audit[^.]*\.\s*/gim,
+      "",
+    )
+    .replace(/^As the auditor,? I (have |did |will )?[^.]*\.\s*/gim, "")
+    .replace(
+      /\bI (interviewed|inspected|reviewed|verified|found that|concluded that)\b[^.]*\./gi,
+      "[Guidance: auditor should verify — not an AI-performed audit activity.]",
+    )
+    .replace(
+      /\bThe organization (is|was) (fully )?(compliant|certified|non-compliant)\b[^.]*\./gi,
+      "Compliance status must be determined by the auditor based on objective evidence.",
+    )
+    .trim();
+}
+
+function enrichStructuredFromGuidance(guidance: string, payload: Record<string, any>) {
+  const sections = splitByH2(guidance);
+  const auditor_guidance =
+    asString(payload.auditor_guidance || payload.auditorGuidance || "") ||
+    findSection(sections, ["auditor guidance", "1. auditor"]);
+  const audit_paper =
+    asString(payload.audit_paper || payload.auditPaper || payload.paper || "") ||
+    findSection(sections, ["audit paper", "2. audit"]);
+  const documented_information_template =
+    asString(
+      payload.documented_information_template ||
+        payload.documentedInformationTemplate ||
+        payload.template ||
+        "",
+    ) || findSection(sections, ["documented information", "3. documented", "template"]);
+  const case_study =
+    asString(
+      payload.case_study ||
+        payload.caseStudy ||
+        payload.demonstrated_scenario ||
+        "",
+    ) || findSection(sections, ["case study", "demonstrated", "4. demonstrated"]);
+
+  const subs = extractSubsections(auditor_guidance);
+
+  return {
+    auditor_guidance: auditor_guidance || undefined,
+    audit_paper: audit_paper || undefined,
+    documented_information_template: documented_information_template || undefined,
+    case_study: case_study || undefined,
+    ...subs,
+  };
+}
+
+export function normalizeAuditStepResponse(
+  raw: any,
+  meta: {
+    stepNumber: number;
+    stepTitle?: string;
+    stage?: string;
+  },
+): NormalizedAuditStep {
+  const payload = unwrapAiPayload(raw);
+  const fallback = AUDIT_STEP_META[meta.stepNumber];
+  const title =
+    (isPlainObject(payload) && (payload.title || payload.step_title)) ||
+    meta.stepTitle ||
+    fallback?.title ||
+    `Step ${meta.stepNumber}`;
+  const stage =
+    (isPlainObject(payload) && payload.stage) ||
+    meta.stage ||
+    fallback?.stage ||
+    "Plan";
+
+  let guidance = extractGuidance(payload);
+  guidance = stripSimulationPhrases(guidance);
+
+  const structured = isPlainObject(payload)
+    ? enrichStructuredFromGuidance(guidance, payload)
+    : enrichStructuredFromGuidance(guidance, {});
+
+  // If guidance was empty but structured parts exist, rebuild
+  if (!isValidAuditGuidance(guidance) && (structured.auditor_guidance || structured.audit_paper)) {
+    guidance = synthesizeGuidance({
+      title,
+      stage,
+      ...structured,
+    });
+  }
+
+  const template_preview =
+    (isPlainObject(payload) &&
+      asString(
+        payload.template_preview ||
+          payload.templatePreview ||
+          "",
+      )) ||
+    structured.audit_paper ||
+    structured.documented_information_template ||
+    undefined;
+
+  const nextRaw =
+    isPlainObject(payload) && payload.next_step_available !== undefined
+      ? payload.next_step_available
+      : meta.stepNumber < 13;
+
+  return {
+    step_number:
+      (isPlainObject(payload) && Number(payload.step_number)) || meta.stepNumber,
+    title: String(title).trim(),
+    stage: String(stage).trim(),
+    guidance,
+    template_preview: template_preview?.trim() || undefined,
+    next_step_available: Boolean(nextRaw),
+    auditor_guidance: structured.auditor_guidance,
+    audit_paper: structured.audit_paper,
+    documented_information_template: structured.documented_information_template,
+    case_study: structured.case_study,
+    what_to_do: structured.what_to_do,
+    when_to_do_it: structured.when_to_do_it,
+    why_it_is_necessary: structured.why_it_is_necessary,
+    specification_to_check: structured.specification_to_check,
+    evidence_to_look_for: structured.evidence_to_look_for,
+    audit_questions: structured.audit_questions,
+  };
+}
+
+export function normalizeAuditContextResponse(raw: any): any {
+  const payload = unwrapAiPayload(raw);
+  if (Array.isArray(payload)) {
+    return { options: payload };
+  }
+  if (isPlainObject(payload) && Array.isArray(payload.options)) {
+    return payload;
+  }
+  if (isPlainObject(payload) && Array.isArray(payload.data)) {
+    return { options: payload.data };
+  }
+  return payload;
+}

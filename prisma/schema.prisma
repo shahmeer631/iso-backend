@@ -1,0 +1,736 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mongodb"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id                   String     @id @default(auto()) @map("_id") @db.ObjectId
+  firstName            String?
+  lastName             String?
+  email                String     @unique
+  phoneNumber          String?
+  bio                  String?
+  preferredLanguage    String?    @default("en")
+  timezone             String?    @default("UTC")
+  courseUpdates        Boolean?   @default(true)
+  marketingEmails      Boolean?   @default(true)
+  weeklyProgressReport Boolean?   @default(true)
+  isEmailVerified      Boolean?   @default(false)
+  password             String?
+  role                 UserRole   @default(USER)
+  status               UserStatus @default(ACTIVE)
+  profileImage         String?
+  currentPlan          PlanStatus @default(FREE)
+  subscribed           String?    @default("FREE_USER")
+  isDeleted            Boolean    @default(false)
+  tokenVersion         Int        @default(0)
+
+  totalSpent       Float? @default(0)
+  enrollmentsCount Int?   @default(0)
+
+  isResetPassword  Boolean   @default(false)
+  canResetPassword Boolean   @default(false)
+  isResentOtp      Boolean   @default(false)
+  lastLoginAt      DateTime?
+
+  createdAt        DateTime         @default(now())
+  updatedAt        DateTime         @updatedAt
+  generationCount  Int              @default(0)
+  lessonProgresses LessonProgress[]
+  lessonChats      LessonChat[]
+  orders           Order[]
+  reviews          Review[]
+  enrollments      Enrollment[]
+  courseNotes      CourseNote[]
+
+  planId           String?       @db.ObjectId // required → optional
+  plan             Plan?         @relation(fields: [planId], references: [id])
+  paymentId        String?       @db.ObjectId
+  payments         Payment[]
+  subscriptions    Subscription[]
+  userAccesses     UserAccess[]
+  stripeCustomerId String?       @unique
+  certificates     Certificate[]
+  groupUsers       GroupUser[]
+  masteryLabs      MasteryLab[]
+  chatSessions     ChatSession[]
+
+  @@map("Users")
+}
+
+enum PlanStatus {
+  FREE
+  SILVER
+  GOLD
+  PLATINUM
+}
+
+model EmailOTP {
+  id        String     @id @default(auto()) @map("_id") @db.ObjectId
+  email     String
+  otpHash   String
+  purpose   OTPPurpose
+  expiresAt DateTime
+  attempts  Int        @default(0)
+  createdAt DateTime   @default(now())
+
+  @@index([email, purpose], name: "email_purpose_idx")
+  @@map("EmailOTPs")
+}
+
+enum OTPPurpose {
+  EMAIL_VERIFY
+  RESET_PASSWORD
+}
+
+enum UserRole {
+  USER
+  SUPER_ADMIN
+}
+
+enum UserStatus {
+  ACTIVE
+  INACTIVE
+  BLOCKED
+}
+
+model Category {
+  id           String        @id @default(auto()) @map("_id") @db.ObjectId
+  name         String
+  slug         String        @unique
+  description  String?
+  courseDesc   String?
+  standardDesc String?
+  standardSub  String?
+  order        Int           @default(0)
+  courses      Course[]
+  videos       Video[]
+  documents    Document[]
+  isoStandards ISOStandard[]
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+  bundles      Bundle[]
+  communities  Community[]
+  masteryLabs  MasteryLab[]
+}
+
+model Course {
+  id          String       @id @default(auto()) @map("_id") @db.ObjectId
+  title       String
+  slug        String       @unique
+  instructor  String
+  director    String?
+  description String?
+  thumbnail   String?
+  categoryId  String       @db.ObjectId
+  category    Category     @relation(fields: [categoryId], references: [id])
+  cpdHours    Int?
+  status      CourseStatus @default(DRAFT)
+  lessons     Lesson[]
+
+  createdAt             DateTime             @default(now())
+  updatedAt             DateTime             @updatedAt
+  enrollments           Enrollment[]
+  reviews               Review[]
+  notes                 CourseNote[]
+  certificates          Certificate[]
+  certificateTemplateId String?              @db.ObjectId
+  certificateTemplate   CertificateTemplate? @relation("CertificateCourses", fields: [certificateTemplateId], references: [id])
+}
+
+model Quiz {
+  id       String @id @default(auto()) @map("_id") @db.ObjectId
+  lessonId String @unique @db.ObjectId
+  lesson   Lesson @relation(fields: [lessonId], references: [id], onDelete: Cascade)
+
+  questions QuizQuestion[]
+}
+
+model QuizQuestion {
+  id     String @id @default(auto()) @map("_id") @db.ObjectId
+  quizId String @db.ObjectId
+  quiz   Quiz   @relation(fields: [quizId], references: [id])
+
+  question String
+  options  String[]
+  answer   String
+}
+
+model Lesson {
+  id       String  @id @default(auto()) @map("_id") @db.ObjectId
+  title    String?
+  content  String?
+  order    Int
+  courseId String  @db.ObjectId
+  videoId  String? @db.ObjectId
+
+  createdAt        DateTime         @default(now())
+  quizzes          Quiz[]
+  chapterId        String?          @db.ObjectId
+  video            Video?           @relation(fields: [videoId], references: [id])
+  lessonDocuments  LessonDocument[]
+  course           Course           @relation(fields: [courseId], references: [id])
+  lessonProgresses LessonProgress[]
+  lessonChats      LessonChat[]
+}
+
+model CourseNote {
+  id       String @id @default(auto()) @map("_id") @db.ObjectId
+  userId   String @db.ObjectId
+  courseId String @db.ObjectId
+  user     User   @relation(fields: [userId], references: [id])
+  course   Course @relation(fields: [courseId], references: [id])
+  content  String
+
+  createdAt DateTime @default(now())
+}
+
+model LessonChat {
+  id String @id @default(auto()) @map("_id") @db.ObjectId
+
+  userId   String @db.ObjectId
+  lessonId String @db.ObjectId
+
+  user   User   @relation(fields: [userId], references: [id])
+  lesson Lesson @relation(fields: [lessonId], references: [id])
+
+  role    ChatRole
+  message String
+
+  createdAt DateTime @default(now())
+}
+
+enum ChatRole {
+  USER
+  AI
+}
+
+model ChatSession {
+  id            String   @id @default(auto()) @map("_id") @db.ObjectId
+  userId        String   @db.ObjectId
+  title         String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  isoStandardId String?  @db.ObjectId
+
+  messages ChatMessage[]
+
+  user User @relation(fields: [userId], references: [id])
+}
+
+model ChatMessage {
+  id        String  @id @default(auto()) @map("_id") @db.ObjectId
+  sessionId String  @db.ObjectId
+  role      String // "user" | "assistant"
+  message   String
+  response  String?
+  sources   Json?
+  followUps Json?
+
+  createdAt DateTime @default(now())
+
+  session ChatSession @relation(fields: [sessionId], references: [id])
+}
+
+model LessonProgress {
+  id        String   @id @default(auto()) @map("_id") @db.ObjectId
+  userId    String   @db.ObjectId
+  lessonId  String   @db.ObjectId
+  user      User     @relation(fields: [userId], references: [id])
+  lesson    Lesson   @relation(fields: [lessonId], references: [id])
+  courseId  String   @db.ObjectId
+  completed Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  @@unique([userId, lessonId])
+}
+
+model Video {
+  id          String      @id @default(auto()) @map("_id") @db.ObjectId
+  title       String
+  description String?
+  // categoryId  String?     @db.ObjectId
+  videoUrl    String
+  thumbnail   String?
+  duration    String?
+  status      VideoStatus @default(PUBLISHED)
+  views       Int         @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // category Category @relation(fields: [categoryId], references: [id])
+  lessons    Lesson[]
+  category   Category? @relation(fields: [categoryId], references: [id])
+  categoryId String?   @db.ObjectId
+}
+
+model Document {
+  id          String  @id @default(auto()) @map("_id") @db.ObjectId
+  title       String
+  description String?
+
+  categoryId String   @db.ObjectId
+  category   Category @relation(fields: [categoryId], references: [id])
+
+  type    String
+  version String?
+  author  String?
+  tags    String?
+
+  fileUrl  String
+  fileSize String?
+
+  downloads Int    @default(0)
+  status    String @default("ACTIVE")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model ISOStandard {
+  id          String    @id @default(auto()) @map("_id") @db.ObjectId
+  // isoCode    String
+  title       String
+  // version    String?
+  fileUrl     String
+  fileSize    Float?
+  description String?
+  downloads   Int       @default(0)
+  categoryId  String    @db.ObjectId
+  category    Category  @relation(fields: [categoryId], references: [id])
+  status      ISOStatus @default(ACTIVE)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("ISOStandards")
+}
+
+model Bundle {
+  id            String       @id @default(auto()) @map("_id") @db.ObjectId
+  title         String
+  description   String?
+  price         Float
+  originalPrice Float?
+  // categoryId    String       @db.ObjectId
+  status        BundleStatus @default(ACTIVE)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // category    Category     @relation(fields: [categoryId], references: [id])
+  bundleItems BundleItem[]
+  category    Category?    @relation(fields: [categoryId], references: [id])
+  categoryId  String?      @db.ObjectId
+}
+
+model BundleItem {
+  id       String         @id @default(auto()) @map("_id") @db.ObjectId
+  bundleId String         @db.ObjectId
+  bundle   Bundle         @relation(fields: [bundleId], references: [id])
+  itemType BundleItemType
+  itemId   String         @db.ObjectId // courseId, documentId, or isoStandardId
+
+  createdAt DateTime @default(now())
+}
+
+model LessonDocument {
+  id       String        @id @default(auto()) @map("_id") @db.ObjectId
+  lessonId String        @db.ObjectId
+  lesson   Lesson        @relation(fields: [lessonId], references: [id])
+  title    String
+  type     LessonDocType
+  fileUrl  String
+}
+
+model Enrollment {
+  id        String  @id @default(auto()) @map("_id") @db.ObjectId
+  userId    String  @db.ObjectId
+  courseId  String  @db.ObjectId
+  user      User    @relation(fields: [userId], references: [id])
+  course    Course  @relation(fields: [courseId], references: [id])
+  progress  Float   @default(0)
+  completed Boolean @default(false)
+
+  createdAt DateTime @default(now())
+}
+
+model Order {
+  id     String @id @default(auto()) @map("_id") @db.ObjectId
+  userId String @db.ObjectId
+  user   User   @relation(fields: [userId], references: [id])
+
+  amount Float
+  status OrderStatus
+
+  createdAt DateTime @default(now())
+}
+
+model Review {
+  id       String  @id @default(auto()) @map("_id") @db.ObjectId
+  userId   String  @db.ObjectId
+  courseId String  @db.ObjectId
+  user     User    @relation(fields: [userId], references: [id])
+  course   Course  @relation(fields: [courseId], references: [id])
+  rating   Int
+  comment  String?
+
+  createdAt DateTime @default(now())
+}
+
+model Group {
+  id           String      @id @default(auto()) @map("_id") @db.ObjectId
+  name         String
+  description  String?
+  permissions  String[]
+  status       GroupStatus @default(ACTIVE)
+  totalMembers Int         @default(0)
+  createdAt    DateTime    @default(now())
+  updatedAt    DateTime    @updatedAt
+  groupUsers   GroupUser[]
+}
+
+model GroupUser {
+  id      String @id @default(auto()) @map("_id") @db.ObjectId
+  userId  String @db.ObjectId
+  groupId String @db.ObjectId
+
+  user  User  @relation(fields: [userId], references: [id])
+  group Group @relation(fields: [groupId], references: [id])
+
+  @@unique([userId, groupId])
+}
+
+// /////////////////////////////////////plan///////////////////////////
+
+model Plan {
+  id          String  @id @default(auto()) @map("_id") @db.ObjectId
+  name        String
+  description String?
+  badge       String?
+  buttonText  String  @default("Get Started")
+
+  // Pricing
+  originalPrice   Float // strikethrough দেখাবে — e.g. 80
+  discountedPrice Float // actual Stripe charge — e.g. 35
+
+  // deprecated - one time payment now
+  validityDays Int?
+  validFrom    DateTime?
+  validUntil   DateTime?
+
+  // Features (image 2 checkbox list)
+  features            String[] // ["LIBRARY", "MASTERY_LAB", "COURSES", "AI_ASSISTANT"]
+  featuresDescription Json?
+  stripeProductId     String   @unique
+  stripePriceId       String   @unique
+
+  isActive  Boolean      @default(true)
+  accesses  UserAccess[]
+  payments  Payment[]
+  subscriptions Subscription[]
+  createdAt DateTime     @default(now())
+  updatedAt DateTime     @updatedAt
+  users     User[]
+}
+
+// ─── COUPON ────────────────────────────────────
+model Coupon {
+  id            String       @id @default(auto()) @map("_id") @db.ObjectId
+  code          String       @unique // "SUMMER2024"
+  discountType  DiscountType // PERCENTAGE বা FIXED
+  discountValue Float // 25 (%) বা 100 ($)
+  usageLimit    Int? // null = unlimited
+  usedCount     Int          @default(0)
+  expiryDate    DateTime?
+  applyTo       String? // planId বা null = all plans
+  minimumAmount Float?
+  firstTimeOnly Boolean      @default(false)
+
+  // Stripe (tracking only)
+  stripeCouponId    String? @unique
+  stripePromoCodeId String? @unique
+
+  isActive Boolean   @default(true)
+  payments Payment[]
+
+  // 🔥 NEW FIELD
+  affiliateId String?    @db.ObjectId
+  affiliate   Affiliate? @relation(fields: [affiliateId], references: [id])
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+enum DiscountType {
+  PERCENTAGE
+  FIXED
+}
+
+// ─── PAYMENT ───────────────────────────────────
+model Payment {
+  id       String  @id @default(auto()) @map("_id") @db.ObjectId
+  userId   String  @db.ObjectId
+  user     User    @relation(fields: [userId], references: [id])
+  planId   String  @db.ObjectId
+  plan     Plan    @relation(fields: [planId], references: [id])
+  couponId String? @db.ObjectId
+  coupon   Coupon? @relation(fields: [couponId], references: [id])
+
+  originalAmount Float // plan.discountedPrice
+  discountAmount Float  @default(0)
+  finalAmount    Float // actual Stripe charge
+  currency       String @default("usd")
+
+  stripePaymentIntentId String        @unique
+  status                PaymentStatus @default(PENDING)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// ─── USER ACCESS ───────────────────────────────
+model UserAccess {
+  id             String  @id @default(auto()) @map("_id") @db.ObjectId
+  userId         String  @db.ObjectId
+  planId         String  @db.ObjectId
+  paymentId      String? @db.ObjectId // Optional now (for one-time legacy)
+  subscriptionId String? @db.ObjectId // Optional now (for recurring)
+
+  user User @relation(fields: [userId], references: [id])
+  plan Plan @relation(fields: [planId], references: [id])
+
+  startDate DateTime  @default(now())
+  expiresAt DateTime? // startDate + validityDays
+
+  isActive Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// ─── SUBSCRIPTION ──────────────────────────────
+model Subscription {
+  id                   String             @id @default(auto()) @map("_id") @db.ObjectId
+  userId               String             @db.ObjectId
+  user                 User               @relation(fields: [userId], references: [id])
+  planId               String             @db.ObjectId
+  plan                 Plan               @relation(fields: [planId], references: [id])
+  
+  stripeSubscriptionId String             @unique
+  stripeCustomerId     String
+  status               SubscriptionStatus @default(INCOMPLETE)
+  
+  currentPeriodStart   DateTime
+  currentPeriodEnd     DateTime
+  cancelAtPeriodEnd    Boolean            @default(false)
+  
+  createdAt            DateTime           @default(now())
+  updatedAt            DateTime           @updatedAt
+}
+
+enum SubscriptionStatus {
+  ACTIVE
+  PAST_DUE
+  CANCELED
+  UNPAID
+  INCOMPLETE
+  INCOMPLETE_EXPIRED
+  TRIALING
+}
+
+model Community {
+  id          String @id @default(auto()) @map("_id") @db.ObjectId
+  name        String
+  description String
+
+  categoryId String   @db.ObjectId
+  category   Category @relation(fields: [categoryId], references: [id])
+  visibility String   @default("PUBLIC") // PUBLIC | PRIVATE
+  moderators String[] // store emails
+  icon       String?
+
+  allowPosts         Boolean @default(true)
+  requireApproval    Boolean @default(false)
+  allowAttachments   Boolean @default(true)
+  emailNotifications Boolean @default(true)
+
+  memberLimit Int? @default(0)
+
+  rules String?
+
+  // ✅ static for now (as per your instruction)
+  membersCount Int    @default(0)
+  postsCount   Int    @default(0)
+  engagement   String @default("Low")
+
+  status String @default("ACTIVE")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Affiliate {
+  id              String          @id @default(auto()) @map("_id") @db.ObjectId
+  name            String
+  email           String          @unique
+  affiliateCode   String          @unique
+  commissionRate  Float
+  status          AffiliateStatus @default(ACTIVE)
+  paymentMethod   String?
+  paymentDetails  String?
+  notes           String?
+  totalSales      Int             @default(0)
+  totalRevenue    Float           @default(0)
+  totalCommission Float           @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  coupons   Coupon[]
+}
+
+model Certificate {
+  id            String              @id @default(auto()) @map("_id") @db.ObjectId
+  userId        String              @db.ObjectId
+  courseId      String              @db.ObjectId
+  templateId    String              @db.ObjectId
+  user          User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  course        Course              @relation(fields: [courseId], references: [id], onDelete: Cascade)
+  template      CertificateTemplate @relation(fields: [templateId], references: [id], onDelete: Cascade)
+  downloadCount Int                 @default(0) // 🔥 ADD THIS
+
+  issuedAt DateTime @default(now())
+}
+
+model CertificateTemplate {
+  id                 String  @id @default(auto()) @map("_id") @db.ObjectId
+  name               String
+  backgroundImageUrl String? // 🔥 Added for dynamic background image upload
+
+  isActive  Boolean @default(true)
+  autoIssue Boolean @default(true)
+
+  courses Course[] @relation("CertificateCourses")
+
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+  certificates Certificate[]
+}
+
+model MasteryLab {
+  id String @id @default(auto()) @map("_id") @db.ObjectId
+
+  userId String? @db.ObjectId // ✅ make optional
+  user   User?   @relation(fields: [userId], references: [id])
+
+  guestId String? // ✅ already added
+
+  industry           String?
+  management_level   String?
+  department         String?
+  suggestedStandards Json?
+  aiFeedback         Json?
+
+  timeTaken Int?
+
+  rightAns Int
+  wrongAns Int
+  total    Int
+  score    Float
+
+  compliance     Float?
+  implementation Float?
+  auditing       Float?
+  riskManagement Float?
+  governance     Float?
+
+  createdAt  DateTime  @default(now())
+  category   Category? @relation(fields: [categoryId], references: [id])
+  categoryId String?   @db.ObjectId
+}
+
+model ApiUsage {
+  id        String   @id @default(auto()) @map("_id") @db.ObjectId
+  userId    String?  @db.ObjectId
+  guestId   String?
+  ip        String?
+  count     Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+enum AffiliateStatus {
+  ACTIVE
+  PENDING
+  SUSPENDED
+}
+
+enum PaymentStatus {
+  PENDING
+  SUCCEEDED
+  FAILED
+  REFUNDED
+}
+
+enum GroupStatus {
+  ACTIVE
+  INACTIVE
+}
+
+enum CourseStatus {
+  DRAFT
+  PUBLISHED
+  ARCHIVED
+}
+
+enum VideoStatus {
+  DRAFT
+  PUBLISHED
+}
+
+enum DocumentStatus {
+  DRAFT
+  ACTIVE
+}
+
+enum ISOStatus {
+  ACTIVE
+  ARCHIVED
+  DRAFT
+}
+
+enum BundleStatus {
+  DRAFT
+  ACTIVE
+  ARCHIVED
+}
+
+enum OrderStatus {
+  PENDING
+  PAID
+  FAILED
+}
+
+enum DocumentType {
+  PDF
+  DOCX
+  XLSX
+  PPT
+}
+
+enum LessonDocType {
+  NOTES
+  STUDY_GUIDE
+  BRIEFING_DOC
+}
+
+enum BundleItemType {
+  COURSE
+  DOCUMENT
+  ISO_STANDARD
+}

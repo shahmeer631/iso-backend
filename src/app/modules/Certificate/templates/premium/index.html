@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Certificate</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        @page {
+            size: 1280px 897px;
+            margin: 0;
+        }
+        
+        body {
+            width: 1280px;
+            height: 897px;
+            margin: 0;
+            padding: 0;
+            position: relative;
+            overflow: hidden;
+        }
+        
+        .template-image {
+            width: 100%;
+            height: 100%;
+            position: absolute;
+            top: 0;
+            left: 0;
+        }
+        
+        /* Recipient Name - on the blank line */
+        .recipient-name {
+            position: absolute;
+            left: 110px;
+            top: 340px; /* Moved up from 365px */
+            font-family: Georgia, serif;
+            font-size: 45px;
+            font-weight: bold;
+            color: #b8860b; /* Beautiful dark gold color */
+            letter-spacing: 1px;
+            text-transform: uppercase;
+        }
+        
+        /* Certificate Number - on the blank line after "Unique Cert. No.:" */
+        .cert-number {
+            position: absolute;
+            left: 788px; /* Moved slightly more right */
+            top: 793px;
+            width: 250px;
+            text-align: center;
+            font-family: Georgia, serif;
+            font-size: 16px;
+            font-weight: bold;
+            color: #2d2d2d;
+            letter-spacing: 0.5px;
+        }
+    </style>
+</head>
+<body>
+    <!-- Template background image (includes QR code) -->
+    <img src="{{TEMPLATE_IMAGE}}" class="template-image" alt="Certificate Template" />
+    
+    <!-- Dynamic recipient name -->
+    <div class="recipient-name">{{RECIPIENT_NAME}}</div>
+    
+    <!-- Dynamic certificate number -->
+    <div class="cert-number">{{CERT_NUMBER}}</div>
+</body>
+</html>

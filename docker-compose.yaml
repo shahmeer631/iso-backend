@@ -1,0 +1,14 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: isobrain-backend
+    restart: unless-stopped
+    ports:
+      - "5900:5900"
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+      PORT: 5900
