@@ -1,5 +1,9 @@
 import prisma from "../../../shared/prisma";
 import extractPdfTextFromUrl from "../../../helpars/pdf-parser";
+import {
+  extractIsoFamilyKey,
+  pickLatestStandardFromList,
+} from "./isoStandardVersion";
 
 /** Cap ISO excerpt returned to the AI payload (performance). */
 const GROUNDING_CHAR_CAP = 4500;
@@ -13,18 +17,15 @@ export const INSTRUCTIONS_GROUNDING_CAP = 1800;
 function normalizeStandardKey(value: string): string {
   return value
     .toLowerCase()
+    .replace(/iso\s*\/\s*iec/g, "iso iec")
     .replace(/[^a-z0-9]+/g, " ")
     .replace(/\s+/g, " ")
     .trim();
 }
 
-function extractIsoCode(value: string): string | null {
-  const match = value.match(/\b(?:iso|iec|iso\/iec)\s*[\d]+(?:[:\-][\d]+)?\b/i);
-  return match ? normalizeStandardKey(match[0]) : null;
-}
-
 /**
- * Find one ACTIVE library ISO standard whose title matches the selected requirement.
+ * Find one ACTIVE library ISO standard whose family matches the selected requirement.
+ * When multiple editions exist, the newest year in the library wins.
  */
 export async function findMatchingISOStandard(specificRequirements: string) {
   const needle = (specificRequirements || "").trim();
@@ -38,31 +39,35 @@ export async function findMatchingISOStandard(specificRequirements: string) {
 
   if (!standards.length) return null;
 
-  const needleKey = normalizeStandardKey(needle);
-  const needleCode = extractIsoCode(needle);
+  const picked = pickLatestStandardFromList(standards, needle);
+  if (picked) {
+    console.log(
+      `[Navigator] family=${picked.family} available=[${picked.availableYears.join(", ")}] selected=${picked.selectedYear ?? "n/a"} documentId=${picked.selected.id} title=${picked.selected.title}`,
+    );
+    return picked.selected;
+  }
 
+  const needleKey = normalizeStandardKey(needle);
   let best: (typeof standards)[0] | null = null;
   let bestScore = 0;
-
   for (const std of standards) {
     const titleKey = normalizeStandardKey(std.title);
     let score = 0;
-
     if (titleKey === needleKey) score = 100;
     else if (titleKey.includes(needleKey) || needleKey.includes(titleKey)) score = 80;
-    else if (needleCode) {
-      const titleCode = extractIsoCode(std.title);
-      if (titleCode && titleCode === needleCode) score = 90;
-      else if (titleKey.includes(needleCode)) score = 70;
-    }
-
     if (score > bestScore) {
       bestScore = score;
       best = std;
     }
   }
 
-  return bestScore >= 70 ? best : null;
+  if (bestScore >= 70 && best) {
+    console.log(
+      `[Navigator] fuzzy-match selected="${best.title}" id=${best.id} score=${bestScore}`,
+    );
+    return best;
+  }
+  return null;
 }
 
 function selectClauseAwareExcerpt(fullText: string, clause?: string): string {
@@ -103,7 +108,7 @@ export async function getNavigatorSupportingDocExcerpt(params: {
   clause?: string;
 }): Promise<{ excerpt: string; title?: string }> {
   try {
-    const isoCode = extractIsoCode(params.specificRequirements || "") || "";
+    const isoCode = extractIsoFamilyKey(params.specificRequirements || "") || "";
     const titleBits = (params.documentTitle || "")
       .toLowerCase()
       .split(/\s+/)
@@ -112,7 +117,7 @@ export async function getNavigatorSupportingDocExcerpt(params: {
 
     const orFilters: Array<Record<string, unknown>> = [];
     if (isoCode) {
-      const codeDigits = isoCode.replace(/[^0-9]/g, "");
+      const codeDigits = isoCode.replace(/[^0-9]/g, "").slice(0, 5);
       if (codeDigits) {
         orFilters.push({ title: { contains: codeDigits } });
         orFilters.push({ description: { contains: codeDigits } });

@@ -11,8 +11,10 @@ import {
 } from "./navigatorGenerate.prompt";
 import {
   getNavigatorGroundingExcerpt,
+  findMatchingISOStandard,
   INSTRUCTIONS_GROUNDING_CAP,
 } from "./navigatorGenerate.grounding";
+import { applyLatestLibraryEditionsToPayload } from "./isoStandardVersion";
 import {
   hasRequiredNavigatorStructure,
   isValidNavigatorContent,
@@ -78,7 +80,14 @@ const generateISO = async (payload: any = {}) => {
       : structured || payload.organization_context,
   );
 
-  const specific_requirements = String(payload.specific_requirements || "").trim();
+  const specific_requirements_raw = String(payload.specific_requirements || "").trim();
+  const libraryMatch = await findMatchingISOStandard(specific_requirements_raw);
+  const specific_requirements = libraryMatch?.title || specific_requirements_raw;
+  if (libraryMatch && libraryMatch.title !== specific_requirements_raw) {
+    console.log(
+      `[Navigator] remapped selected standard "${specific_requirements_raw}" → "${libraryMatch.title}" (${libraryMatch.id})`,
+    );
+  }
   const output_type = String(payload.output_type || payload.document_title || "").trim();
   const document_title = String(
     payload.document_title || payload.output_type || "Documented Information",
@@ -839,7 +848,12 @@ const getISOSuggestions = async (payload: any = {}) => {
       payload,
       { timeout: ISO_SUGGESTIONS_TIMEOUT_MS },
     );
-    return response.data;
+    const library = await prisma.iSOStandard.findMany({
+      where: { status: "ACTIVE" },
+      select: { title: true },
+      take: 200,
+    });
+    return applyLatestLibraryEditionsToPayload(response.data, library);
   } catch (error: any) {
     if (error?.code === "ECONNABORTED") {
       throw new ApiError(

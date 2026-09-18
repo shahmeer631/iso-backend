@@ -78,6 +78,8 @@ ${input.orgContext}
 ${fiveW ? `\n${fiveW}\n` : ""}
 WHAT:
 - Standard: ${input.isoStandard}
+- Source: application's Standards Library (authoritative)
+- Version rule: Use this library edition only. Do not use an older edition, mix editions, or invent a newer edition.
 - Clause/Requirement: ${input.clause || "[Organization to define]"}
 - Document: ${input.documentTitle}
 - Type: ${input.outputType}
@@ -141,7 +143,7 @@ export function foldInstructionsIntoPayload(params: {
     params.clause ? `Clause: ${params.clause}` : null,
     `Document: ${params.documentTitle}`,
     params.taxonomy ? `Taxonomy: ${TAXONOMY_LABEL[params.taxonomy]}` : null,
-    "Output must include: (1) Documented Information Template (2) Implementation Guidance Package (3) Daily Usability & Operational Tools. Relevance over volume. No invented org facts—use placeholders. Do not claim compliance.",
+    "Output must include: (1) Documented Information Template (2) Implementation Guidance Package (3) Daily Usability & Operational Tools. Relevance over volume. No invented org facts—use placeholders. Do not claim compliance. Use only the Standards Library edition named in specific_requirements; do not fall back to an older edition.",
   ].filter(Boolean);
 
   return {
