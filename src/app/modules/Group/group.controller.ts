@@ -1,16 +1,15 @@
 import httpStatus from "http-status";
-
 import { GroupService } from "./group.service";
 import catchAsync from "../../../shared/catchAsync";
 import sendResponse from "../../../shared/sendResponse";
 
 const createGroup = catchAsync(async (req, res) => {
-  const result = await GroupService.createGroup(req.body);
+  const result = await GroupService.createGroup(req.body, req.user?.id);
 
   sendResponse(res, {
     success: true,
     statusCode: httpStatus.OK,
-    message: "Group created successfully",
+    message: "User group created successfully",
     data: result,
   });
 });
@@ -27,9 +26,7 @@ const getAllGroups = catchAsync(async (req, res) => {
 });
 
 const getSingleGroup = catchAsync(async (req, res) => {
-  const { id } = req.params;
-
-  const result = await GroupService.getSingleGroup(id);
+  const result = await GroupService.getSingleGroup(req.params.id);
 
   sendResponse(res, {
     success: true,
@@ -40,9 +37,7 @@ const getSingleGroup = catchAsync(async (req, res) => {
 });
 
 const updateGroup = catchAsync(async (req, res) => {
-  const { id } = req.params;
-
-  const result = await GroupService.updateGroup(id, req.body);
+  const result = await GroupService.updateGroup(req.params.id, req.body);
 
   sendResponse(res, {
     success: true,
@@ -53,8 +48,7 @@ const updateGroup = catchAsync(async (req, res) => {
 });
 
 const deleteGroup = catchAsync(async (req, res) => {
-  const { id } = req.params;
-  const result = await GroupService.deleteGroup(id);
+  const result = await GroupService.deleteGroup(req.params.id);
 
   sendResponse(res, {
     success: true,
@@ -65,7 +59,8 @@ const deleteGroup = catchAsync(async (req, res) => {
 });
 
 const addUsersToGroup = catchAsync(async (req, res) => {
-  const { groupId, userIds } = req.body;
+  const groupId = (req.params.id || req.body.groupId) as string;
+  const userIds = (req.body.userIds || []) as string[];
 
   const result = await GroupService.addUsersToGroup(groupId, userIds);
 
@@ -77,6 +72,20 @@ const addUsersToGroup = catchAsync(async (req, res) => {
   });
 });
 
+const removeUserFromGroup = catchAsync(async (req, res) => {
+  const result = await GroupService.removeUserFromGroup(
+    req.params.id,
+    req.params.userId,
+  );
+
+  sendResponse(res, {
+    statusCode: httpStatus.OK,
+    success: true,
+    message: "User removed from group successfully",
+    data: result,
+  });
+});
+
 export const GroupController = {
   createGroup,
   getAllGroups,
@@ -84,4 +93,5 @@ export const GroupController = {
   updateGroup,
   deleteGroup,
   addUsersToGroup,
+  removeUserFromGroup,
 };

@@ -8,7 +8,7 @@
     "build": "tsc && mkdir -p dist/app/modules/Certificate && cp -r src/app/modules/Certificate/templates dist/app/modules/Certificate/",
     "generate": "ts-node src/generate-module.ts",
     "postinstall": "prisma generate",
-    "test": "tsx --test src/app/modules/AIAssistant/isoStandardVersion.test.ts"
+    "test": "tsx --test src/app/modules/AIAssistant/isoStandardVersion.test.ts src/helpars/effectiveAccess.test.ts src/app/modules/AIAssistant/auditLens.normalize.test.ts"
   },
   "keywords": [],
   "author": "",

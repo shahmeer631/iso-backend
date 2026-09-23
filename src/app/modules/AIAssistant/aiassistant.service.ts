@@ -638,7 +638,7 @@ const mapAiProxyError = (error: any, fallbackMessage: string) => {
   return new ApiError(status, message);
 };
 
-// 🔥 AUDIT CONTEXT
+// 🔥 AUDIT CONTEXT — remap criteria editions to latest ACTIVE Standards Library
 const getAuditContext = async (payload: any = {}) => {
   try {
     const response = await axios.post(
@@ -646,7 +646,17 @@ const getAuditContext = async (payload: any = {}) => {
       payload,
       { timeout: 60000 },
     );
-    return normalizeAuditContextResponse(response.data);
+    const normalized = normalizeAuditContextResponse(response.data);
+    try {
+      const library = await prisma.iSOStandard.findMany({
+        where: { status: "ACTIVE" },
+        select: { title: true },
+        take: 200,
+      });
+      return applyLatestLibraryEditionsToPayload(normalized, library);
+    } catch {
+      return normalized;
+    }
   } catch (error: any) {
     throw mapAiProxyError(error, "Audit context generation");
   }
@@ -665,10 +675,23 @@ const getAuditStep = async (payload: any = {}) => {
   const meta = AUDIT_STEP_META[stepNumber];
   const stepTitle = String(payload.step_title || payload.stepTitle || meta?.title || "").trim();
   const stage = String(payload.stage || meta?.stage || "Plan").trim();
-  const lockedContext = payload.locked_context ?? payload.lockedContext ?? {};
+  let lockedContext = payload.locked_context ?? payload.lockedContext ?? {};
 
-  // Optional bounded library grounding (ISO standard + auditing guideline docs)
-  // Cap sizes for speed: ISO ~4k + guideline ~2.5k
+  // Align locked criteria/standard labels with latest ACTIVE library edition
+  try {
+    const library = await prisma.iSOStandard.findMany({
+      where: { status: "ACTIVE" },
+      select: { title: true },
+      take: 200,
+    });
+    if (library.length && lockedContext && typeof lockedContext === "object") {
+      lockedContext = applyLatestLibraryEditionsToPayload(lockedContext, library);
+    }
+  } catch {
+    // never block on edition remap
+  }
+
+  // Bounded library grounding — run ISO + guideline retrieval in parallel
   let groundingExcerpt = "";
   let guidelineExcerpt = "";
   try {
@@ -688,17 +711,20 @@ const getAuditStep = async (payload: any = {}) => {
         "",
     ).trim();
 
-    if (criteria.length >= 5) {
-      const grounding = await getNavigatorGroundingExcerpt({
-        specificRequirements: criteria,
-        clause: clause || undefined,
-      });
-      groundingExcerpt = (grounding.excerpt || "").slice(0, 4000);
-    }
-    const guideline = await getAuditGuidelineExcerpt({
-      criteria,
-      stepTitle: stepTitle || meta?.title,
-    });
+    const [grounding, guideline] = await Promise.all([
+      criteria.length >= 5
+        ? getNavigatorGroundingExcerpt({
+            specificRequirements: criteria,
+            clause: clause || undefined,
+          })
+        : Promise.resolve({ excerpt: "" }),
+      getAuditGuidelineExcerpt({
+        criteria,
+        stepTitle: stepTitle || meta?.title,
+      }),
+    ]);
+
+    groundingExcerpt = (grounding.excerpt || "").slice(0, 4000);
     guidelineExcerpt = (guideline.excerpt || "").slice(0, 2500);
   } catch {
     // never block step generation on grounding failure
@@ -756,7 +782,7 @@ const getAuditStep = async (payload: any = {}) => {
     raw = await callStep({
       ...aiPayload,
       retry: true,
-      generation_instructions: `${generation_instructions}\n\nIMPORTANT: Previous response was empty or invalid. Return non-empty markdown guidance with the required Audit Step / Auditor Guidance / Audit Paper / Template / Case Study sections. Do NOT simulate conducting the audit.`,
+      generation_instructions: `${generation_instructions}\n\nIMPORTANT: Previous response was empty or invalid. Return non-empty markdown guidance with the required Audit Step / Auditor Guidance / Audit Paper / Template / Case Study (Hypothetical) sections. Do NOT simulate conducting the audit or invent findings.`,
     });
     normalized = normalizeAuditStepResponse(raw, {
       stepNumber,

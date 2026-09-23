@@ -1,31 +1,11 @@
-import prisma from "../shared/prisma";
+import { userHasFeatureAccess } from "./effectiveAccess";
 
+/**
+ * Feature gate used by route middlewares.
+ * Considers paid UserAccess ∪ User Group plan access (additive).
+ */
 const hasAccess = async (userId: string, features: string | string[]) => {
-  if (!userId) return false;
-
-  const user = await prisma.user.findUnique({
-    where: { id: userId },
-    select: { role: true },
-  });
-
-  if (user?.role === "SUPER_ADMIN") {
-    return true;
-  }
-
-  const access = await prisma.userAccess.findFirst({
-    where: {
-      userId,
-      isActive: true,
-      OR: [{ expiresAt: null }, { expiresAt: { gt: new Date() } }],
-    },
-    include: { plan: true },
-  });
-
-  if (!access) return false;
-
-  const featureArray = Array.isArray(features) ? features : [features];
-
-  return featureArray.some((f) => access.plan.features.includes(f));
+  return userHasFeatureAccess(userId, features);
 };
 
 export default hasAccess;

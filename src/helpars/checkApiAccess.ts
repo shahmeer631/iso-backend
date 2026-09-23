@@ -1,5 +1,6 @@
 import { Request } from "express";
 import prisma from "../shared/prisma";
+import { getEffectiveAccess, userHasFeatureAccess } from "./effectiveAccess";
 
 export const checkApiAccess = async (
   req: Request,
@@ -10,7 +11,7 @@ export const checkApiAccess = async (
 
   let guestId = req.cookies?.guestId;
 
-  // 🔥 0. GET USER (for admin check)
+  // 0. GET USER (for admin check)
   let user: { role: string } | null = null;
 
   if (userId) {
@@ -20,19 +21,19 @@ export const checkApiAccess = async (
     });
   }
 
-  // 🔥 1. ADMIN BYPASS (VERY IMPORTANT)
+  // 1. ADMIN BYPASS
   if (user?.role === "SUPER_ADMIN") {
     return { guestId: null };
   }
 
-  // 🔥 2. generate guestId if not exists
+  // 2. generate guestId if not exists
   if (!userId && !guestId) {
     guestId = `guest_${Date.now()}_${Math.random()
       .toString(36)
       .substring(2, 10)}`;
   }
 
-  // 🔥 3. find usage
+  // 3. find usage
   let usage = await prisma.apiUsage.findFirst({
     where: userId
       ? { userId }
@@ -41,7 +42,7 @@ export const checkApiAccess = async (
         },
   });
 
-  // 🔥 4. create usage if not exists
+  // 4. create usage if not exists
   if (!usage) {
     usage = await prisma.apiUsage.create({
       data: {
@@ -53,32 +54,23 @@ export const checkApiAccess = async (
     });
   }
 
-  // 🔥 5. LIMIT LOGIC 
-  // Before creating an account: 3 free API calls. 
-  // After creating an account: 0 free API calls (must do payment).
+  // 5. LIMIT LOGIC
+  // Before creating an account: 3 free API calls.
+  // After creating an account: 0 free API calls (must have plan or group access).
   const limit = userId ? 0 : 3;
 
   if (usage.count >= limit) {
-    // 🔥 6. PLAN BYPASS (paid users = unlimited)
+    // 6. PLAN / GROUP BYPASS (subscription ∪ user groups)
     if (userId) {
-      const userAccess = await prisma.userAccess.findFirst({
-        where: {
-          userId,
-          isActive: true,
-          OR: [{ expiresAt: null }, { expiresAt: { gt: new Date() } }],
-        },
-        include: {
-          plan: true,
-        },
-      });
-      if (
-        userAccess &&
-        (!feature ||
-          userAccess.plan.features
-            .map((f) => f.toUpperCase())
-            .includes(feature.toUpperCase()))
-      ) {
-        return { guestId: null };
+      if (feature) {
+        if (await userHasFeatureAccess(userId, feature)) {
+          return { guestId: null };
+        }
+      } else {
+        const { features } = await getEffectiveAccess(userId);
+        if (features.length > 0) {
+          return { guestId: null };
+        }
       }
     }
 
@@ -89,7 +81,7 @@ export const checkApiAccess = async (
     );
   }
 
-  // 🔥 7. increment usage
+  // 7. increment usage
   await prisma.apiUsage.update({
     where: { id: usage.id },
     data: {

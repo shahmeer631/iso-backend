@@ -81,3 +81,18 @@ test("Test 7: suggestion payload is rewritten to latest library edition", () => 
   assert.equal(next.suggestions[0].standard, "ISO 9001:2026 Quality management systems");
   assert.equal(next.suggestions[1].standard, "ISO 14001:2015 Environmental management");
 });
+
+test("Test 8: Audit Lens criteria field is rewritten to latest library edition", () => {
+  const payload = {
+    options: [
+      {
+        criteria: "ISO 9001:2015",
+        scope: "Manufacturing QMS",
+        objective: "Internal audit planning",
+      },
+    ],
+  };
+  const next = applyLatestLibraryEditionsToPayload(payload, library);
+  assert.equal(next.options[0].criteria, "ISO 9001:2026 Quality management systems");
+  assert.equal(next.options[0].scope, "Manufacturing QMS");
+});

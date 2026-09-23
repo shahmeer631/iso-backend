@@ -387,23 +387,30 @@ model Group {
   id           String      @id @default(auto()) @map("_id") @db.ObjectId
   name         String
   description  String?
+  /// Canonical plan keys: PLUS | PRO | ULTRA (manual / promotional access)
   permissions  String[]
   status       GroupStatus @default(ACTIVE)
   totalMembers Int         @default(0)
+  createdBy    String?     @db.ObjectId
   createdAt    DateTime    @default(now())
   updatedAt    DateTime    @updatedAt
   groupUsers   GroupUser[]
+
+  @@index([name])
 }
 
 model GroupUser {
-  id      String @id @default(auto()) @map("_id") @db.ObjectId
-  userId  String @db.ObjectId
-  groupId String @db.ObjectId
+  id        String   @id @default(auto()) @map("_id") @db.ObjectId
+  userId    String   @db.ObjectId
+  groupId   String   @db.ObjectId
+  createdAt DateTime @default(now())
 
   user  User  @relation(fields: [userId], references: [id])
   group Group @relation(fields: [groupId], references: [id])
 
   @@unique([userId, groupId])
+  @@index([userId])
+  @@index([groupId])
 }
 
 // /////////////////////////////////////plan///////////////////////////

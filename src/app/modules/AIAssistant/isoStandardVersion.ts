@@ -112,11 +112,15 @@ function walkSuggestions(node: any, rewrite: (label: string) => string): any {
     return node.map((item) => walkSuggestions(item, rewrite));
   }
   const next = { ...node };
-  if (typeof next.standard === "string" && next.standard.trim()) {
-    next.standard = rewrite(next.standard);
+  // Rewrite any field that commonly holds an ISO edition label
+  const labelKeys = ["standard", "criteria", "iso", "iso_standard"] as const;
+  for (const key of labelKeys) {
+    if (typeof next[key] === "string" && next[key].trim()) {
+      next[key] = rewrite(next[key]);
+    }
   }
   for (const key of Object.keys(next)) {
-    if (key === "standard") continue;
+    if ((labelKeys as readonly string[]).includes(key)) continue;
     if (next[key] && typeof next[key] === "object") {
       next[key] = walkSuggestions(next[key], rewrite);
     }

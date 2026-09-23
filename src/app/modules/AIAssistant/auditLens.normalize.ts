@@ -210,7 +210,6 @@ export function isValidAuditGuidance(guidance: string): boolean {
   if (/^(null|undefined|n\/a|error)\s*$/i.test(cleaned)) return false;
 
   const lower = cleaned.toLowerCase();
-  // Soft required-structure check — at least guidance-like content
   const hasGuidanceCue =
     lower.includes("what to do") ||
     lower.includes("auditor guidance") ||
@@ -222,28 +221,67 @@ export function isValidAuditGuidance(guidance: string): boolean {
     lower.includes("template") ||
     lower.includes("## 2") ||
     lower.includes("## 3");
-  // Accept if either rich structure OR substantial practical content
   if (hasGuidanceCue || hasPaperOrTemplate) return true;
   return cleaned.length >= 400;
 }
 
-/** Soft cleanup of common simulation openers / claims. */
+/**
+ * Soft cleanup of simulation / fabricated-audit language.
+ * Prefer rewriting claims into guidance phrasing over deleting content wholesale.
+ */
 export function stripSimulationPhrases(guidance: string): string {
-  return guidance
-    .replace(
-      /^I have (initiated|conducted|performed|completed|carried out) (an |the )?audit[^.]*\.\s*/gim,
-      "",
-    )
-    .replace(/^As the auditor,? I (have |did |will )?[^.]*\.\s*/gim, "")
-    .replace(
-      /\bI (interviewed|inspected|reviewed|verified|found that|concluded that)\b[^.]*\./gi,
-      "[Guidance: auditor should verify — not an AI-performed audit activity.]",
-    )
-    .replace(
-      /\bThe organization (is|was) (fully )?(compliant|certified|non-compliant)\b[^.]*\./gi,
-      "Compliance status must be determined by the auditor based on objective evidence.",
-    )
-    .trim();
+  let text = guidance;
+
+  text = text.replace(
+    /^I have (initiated|conducted|performed|completed|carried out) (an |the )?audit[^.]*\.\s*/gim,
+    "",
+  );
+  text = text.replace(/^As the auditor,? I (have |did |will )?[^.]*\.\s*/gim, "");
+
+  text = text.replace(
+    /\bI (interviewed|inspected|reviewed|verified|observed|visited|found that|concluded that)\b[^.]*\./gi,
+    "The auditor should verify this using objective evidence (not an AI-performed audit activity).",
+  );
+  text = text.replace(
+    /\b(We|The AI|This system) (interviewed|inspected|reviewed|verified|observed|visited|found)\b[^.]*\./gi,
+    "The auditor should verify this using objective evidence.",
+  );
+  text = text.replace(
+    /\b(The )?employees? (confirmed|stated|said|reported) that\b[^.]*\./gi,
+    "Ask relevant personnel and record their responses as evidence.",
+  );
+  text = text.replace(
+    /\bThe (organization|company|client) (has|maintains|implements|follows|demonstrates)\b/gi,
+    "Verify whether the organization has/maintains",
+  );
+  text = text.replace(
+    /\bThe (organization|company) (is|was) (fully )?(compliant|certified|non-compliant|in conformity)\b[^.]*\./gi,
+    "Audit conclusion cannot be determined without reviewing objective evidence.",
+  );
+  text = text.replace(
+    /\b(No|Zero) non[- ]?conformit(y|ies) (were|was) (found|identified)\b[^.]*\./gi,
+    "Do not conclude conformity or nonconformity without objective evidence reviewed by the auditor.",
+  );
+  text = text.replace(
+    /\b(A |An )?(major |minor )?non[- ]?conformit(y|ies) (was|were) (found|identified|raised)\b[^.]*\./gi,
+    "If objective evidence shows a gap against criteria, the auditor may raise a finding using the organization's classification rules — do not invent findings here.",
+  );
+
+  return text.trim();
+}
+
+/** Ensure case-study section is explicitly labeled hypothetical. */
+export function ensureHypotheticalCaseStudyLabel(caseStudy: string | undefined): string | undefined {
+  if (!caseStudy || !caseStudy.trim()) return caseStudy;
+  const lower = caseStudy.toLowerCase();
+  const alreadyLabeled =
+    lower.includes("hypothetical") ||
+    lower.includes("not actual") ||
+    lower.includes("illustrative example") ||
+    lower.includes("educational only") ||
+    lower.includes("demonstrated case study");
+  if (alreadyLabeled) return caseStudy;
+  return `**Demonstrated Case Study — Hypothetical Example (Not Actual Audit Evidence)**\n\n${caseStudy}`;
 }
 
 function enrichStructuredFromGuidance(guidance: string, payload: Record<string, any>) {
@@ -308,6 +346,24 @@ export function normalizeAuditStepResponse(
     ? enrichStructuredFromGuidance(guidance, payload)
     : enrichStructuredFromGuidance(guidance, {});
 
+  // Re-apply soft cleanup + hypothetical label on structured fields
+  if (structured.auditor_guidance) {
+    structured.auditor_guidance = stripSimulationPhrases(structured.auditor_guidance);
+  }
+  if (structured.what_to_do) {
+    structured.what_to_do = stripSimulationPhrases(structured.what_to_do);
+  }
+  if (structured.evidence_to_look_for) {
+    structured.evidence_to_look_for = stripSimulationPhrases(
+      structured.evidence_to_look_for,
+    );
+  }
+  structured.case_study = ensureHypotheticalCaseStudyLabel(
+    structured.case_study
+      ? stripSimulationPhrases(structured.case_study)
+      : structured.case_study,
+  );
+
   // If guidance was empty but structured parts exist, rebuild
   if (!isValidAuditGuidance(guidance) && (structured.auditor_guidance || structured.audit_paper)) {
     guidance = synthesizeGuidance({
@@ -315,6 +371,10 @@ export function normalizeAuditStepResponse(
       stage,
       ...structured,
     });
+    guidance = stripSimulationPhrases(guidance);
+  } else if (structured.case_study && guidance && !/hypothetical|not actual/i.test(guidance)) {
+    // Keep full guidance consistent with labeled case study when we injected a label
+    guidance = stripSimulationPhrases(guidance);
   }
 
   const template_preview =
