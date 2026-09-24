@@ -2,6 +2,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
   ensureHypotheticalCaseStudyLabel,
+  ensureIntegratedManagementSystemsOptions,
   isValidAuditGuidance,
   normalizeAuditStepResponse,
   stripSimulationPhrases,
@@ -80,5 +81,93 @@ Document ID: [ID]
     assert.ok(normalized.audit_paper);
     assert.ok(normalized.case_study);
     assert.match(normalized.case_study!, /hypothetical/i);
+  });
+
+  it("relabels multi-standard criteria as Integrated Management Systems", () => {
+    const out = ensureIntegratedManagementSystemsOptions({
+      options: [
+        {
+          criteria: "ISO 9001:2015 / ISO 14001:2015 / ISO 45001:2018",
+          scope: "All departments",
+          objective: "Combined audit",
+        },
+      ],
+    });
+    assert.ok(
+      out.options.some((o: { criteria: string }) =>
+        /^Integrated Management Systems \(ISO 9001:2015, ISO 14001:2015, ISO 45001:2018\)$/.test(
+          o.criteria,
+        ),
+      ),
+    );
+    assert.ok(
+      out.options.some((o: { criteria: string }) => /^ISO 9001:2015$/.test(o.criteria)),
+    );
+    assert.ok(
+      out.options.some((o: { criteria: string }) => /^ISO 14001:2015$/.test(o.criteria)),
+    );
+    assert.ok(
+      out.options.some((o: { criteria: string }) => /^ISO 45001:2018$/.test(o.criteria)),
+    );
+  });
+
+  it("appends an IMS option when only single-ISO options are returned", () => {
+    const out = ensureIntegratedManagementSystemsOptions(
+      {
+        options: [
+          {
+            criteria: "ISO 9001:2015",
+            scope: "Production",
+            objective: "QMS audit",
+          },
+          {
+            criteria: "ISO 14001:2015",
+            scope: "Environmental processes",
+            objective: "EMS audit",
+          },
+        ],
+      },
+      "Company with QMS and EMS",
+    );
+    assert.ok(out.options.length >= 3);
+    assert.ok(
+      out.options.some((o: { criteria: string }) =>
+        /Integrated Management Systems \(ISO 9001:2015, ISO 14001:2015\)/.test(
+          o.criteria,
+        ),
+      ),
+    );
+    assert.ok(
+      out.options.some((o: { criteria: string }) => /^ISO 9001:2015$/.test(o.criteria)),
+    );
+    assert.ok(
+      out.options.some((o: { criteria: string }) => /^ISO 14001:2015$/.test(o.criteria)),
+    );
+  });
+
+  it("adds individual ISO options when AI returns only IMS", () => {
+    const out = ensureIntegratedManagementSystemsOptions({
+      options: [
+        {
+          criteria: "Integrated Management Systems (ISO 9001:2015, ISO 14001:2015, ISO 45001:2018)",
+          scope: "IMS audit",
+          objective: "Combined programme",
+        },
+      ],
+    });
+    assert.ok(
+      out.options.some((o: { criteria: string }) =>
+        /^Integrated Management Systems/.test(o.criteria),
+      ),
+    );
+    assert.ok(
+      out.options.some((o: { criteria: string }) => /^ISO 9001:2015$/.test(o.criteria)),
+    );
+    assert.ok(
+      out.options.some((o: { criteria: string }) => /^ISO 14001:2015$/.test(o.criteria)),
+    );
+    assert.ok(
+      out.options.some((o: { criteria: string }) => /^ISO 45001:2018$/.test(o.criteria)),
+    );
   });
 });

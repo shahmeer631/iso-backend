@@ -78,12 +78,30 @@ export function pickLatestStandardFromList<T extends { title: string }>(
     .map((s) => parseIsoEdition(s.title)?.year)
     .filter((y): y is number => typeof y === "number");
 
+  /** Prefer the actual requirements standard over guidance/companion PDFs. */
+  const titlePreference = (title: string): number => {
+    const t = title.toLowerCase();
+    if (/requirements/.test(t) && !/how to use|guidance|small enterprises|principles/.test(t)) {
+      return 4;
+    }
+    if (/quality management systems|environmental management|occupational/.test(t)) {
+      return 3;
+    }
+    if (/how to use|guidance|principles|small enterprises/.test(t)) return 1;
+    return 2;
+  };
+
   const dated = candidates
-    .map((s) => ({ std: s, year: parseIsoEdition(s.title)?.year ?? null }))
+    .map((s) => ({
+      std: s,
+      year: parseIsoEdition(s.title)?.year ?? null,
+      pref: titlePreference(s.title),
+    }))
     .sort((a, b) => {
       const ay = a.year ?? -1;
       const by = b.year ?? -1;
       if (by !== ay) return by - ay;
+      if (b.pref !== a.pref) return b.pref - a.pref;
       return b.std.title.localeCompare(a.std.title);
     });
 
@@ -102,7 +120,31 @@ export function rewriteStandardLabelToLatest(
   label: string,
   standards: Array<{ title: string }>,
 ): string {
-  const picked = pickLatestStandardFromList(standards, label);
+  const text = (label || "").trim();
+  if (!text || !standards.length) return label;
+
+  const globalRe = new RegExp(ISO_EDITION_RE.source, "gi");
+  const matches = [...text.matchAll(globalRe)];
+  const familyKeys = new Set(
+    matches
+      .map((m) => parseIsoEdition(m[0])?.familyKey)
+      .filter((k): k is string => !!k),
+  );
+
+  // Integrated / multi-standard criteria (e.g. ISO 9001 + ISO 14001 + ISO 45001):
+  // rewrite each ISO token in place — never replace the whole string with one standard.
+  if (familyKeys.size > 1) {
+    return text.replace(globalRe, (match) => {
+      const picked = pickLatestStandardFromList(standards, match);
+      if (!picked) return match;
+      const family = picked.family;
+      const year = picked.selectedYear;
+      return year ? `${family}:${year}` : family;
+    });
+  }
+
+  // Single-standard labels: map to latest ACTIVE library title when available
+  const picked = pickLatestStandardFromList(standards, text);
   return picked?.selected.title || label;
 }
 

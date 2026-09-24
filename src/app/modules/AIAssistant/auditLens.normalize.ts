@@ -427,3 +427,163 @@ export function normalizeAuditContextResponse(raw: any): any {
   }
   return payload;
 }
+
+const ISO_TOKEN_RE =
+  /\b((?:ISO(?:\s*\/\s*IEC)?|IEC)\s*\d+(?:\s*-\s*\d+)?)(?:\s*[:\-]\s*(\d{4}))?\b/gi;
+
+function collectIsoTokensFromText(text: string): string[] {
+  if (!text) return [];
+  const found: string[] = [];
+  const seen = new Set<string>();
+  const re = new RegExp(ISO_TOKEN_RE.source, "gi");
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(text)) !== null) {
+    const family = match[1].replace(/\s+/g, " ").replace(/\s*\/\s*/g, "/").trim();
+    const year = match[2] ? `:${match[2]}` : "";
+    const token = `${family}${year}`;
+    const key = family.toLowerCase().replace(/\s+/g, " ");
+    if (seen.has(key)) continue;
+    seen.add(key);
+    found.push(token);
+  }
+  return found;
+}
+
+function optionLooksLikeIms(opt: Record<string, unknown>): boolean {
+  const hay = `${opt.criteria || ""} ${opt.scope || ""} ${opt.objective || ""}`.toLowerCase();
+  if (/integrated\s+management/.test(hay) || /\bims\b/.test(hay)) return true;
+  const tokens = collectIsoTokensFromText(String(opt.criteria || ""));
+  return tokens.length >= 2;
+}
+
+function familyKeyFromToken(token: string): string {
+  return token.toLowerCase().replace(/:\d{4}$/, "").replace(/\s+/g, " ").trim();
+}
+
+function isSingleIsoOption(opt: Record<string, unknown>): boolean {
+  if (optionLooksLikeIms(opt)) return false;
+  return collectIsoTokensFromText(String(opt.criteria || "")).length === 1;
+}
+
+/**
+ * When IMS options list multiple standards, ensure each standard also has its own
+ * selectable single-ISO option (client expects both IMS + individual standards).
+ */
+function ensureIndividualIsoOptions(
+  options: Record<string, unknown>[],
+): Record<string, unknown>[] {
+  const existingFamilies = new Set(
+    options
+      .filter(isSingleIsoOption)
+      .map((opt) =>
+        familyKeyFromToken(
+          collectIsoTokensFromText(String(opt.criteria || ""))[0] || "",
+        ),
+      )
+      .filter(Boolean),
+  );
+
+  const individual: Record<string, unknown>[] = [];
+  for (const opt of options) {
+    if (!optionLooksLikeIms(opt)) continue;
+    const tokens = collectIsoTokensFromText(
+      `${opt.criteria || ""} ${opt.scope || ""} ${opt.objective || ""}`,
+    );
+    for (const token of tokens) {
+      const key = familyKeyFromToken(token);
+      if (!key || existingFamilies.has(key)) continue;
+      existingFamilies.add(key);
+      individual.push({
+        criteria: token,
+        scope: `Processes and departments covered by ${token}`,
+        objective: `To evaluate conformity and effectiveness against ${token} requirements.`,
+      });
+    }
+  }
+
+  if (!individual.length) return options;
+
+  // Keep existing single-ISO cards, then any other non-IMS cards, then IMS, then
+  // newly synthesized singles placed before IMS for a clear select list.
+  const singles = options.filter(isSingleIsoOption);
+  const ims = options.filter(optionLooksLikeIms);
+  const other = options.filter((o) => !isSingleIsoOption(o) && !optionLooksLikeIms(o));
+  return [...singles, ...individual, ...other, ...ims];
+}
+
+/**
+ * Ensure Audit Context options expose BOTH:
+ * - Integrated Management Systems (when multi-standard / IMS is relevant)
+ * - Individual ISO standard options for each standard involved
+ */
+export function ensureIntegratedManagementSystemsOptions(
+  payload: any,
+  sourceText?: string,
+): any {
+  if (!isPlainObject(payload) || !Array.isArray(payload.options)) return payload;
+
+  const options = payload.options.filter(isPlainObject) as Record<string, unknown>[];
+  if (!options.length) return payload;
+
+  let next = options.map((opt) => {
+    const criteria = String(opt.criteria || "").trim();
+    const tokens = collectIsoTokensFromText(criteria);
+    if (tokens.length >= 2 && !/integrated\s+management/i.test(criteria)) {
+      return {
+        ...opt,
+        criteria: `Integrated Management Systems (${tokens.join(", ")})`,
+      };
+    }
+    return opt;
+  });
+
+  const fromOptions = next.flatMap((opt) =>
+    collectIsoTokensFromText(
+      `${opt.criteria || ""} ${opt.scope || ""} ${opt.objective || ""}`,
+    ),
+  );
+  const fromSource = collectIsoTokensFromText(sourceText || "");
+  const combined: string[] = [];
+  const seen = new Set<string>();
+  for (const token of [...fromSource, ...fromOptions]) {
+    const key = familyKeyFromToken(token);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    combined.push(token);
+  }
+
+  const sourceImpliesIms =
+    /integrated\s+management|\bims\b|multi[- ]standard|combined\s+audit/i.test(
+      sourceText || "",
+    );
+
+  const hasIms = next.some(optionLooksLikeIms);
+
+  if (!hasIms && combined.length >= 2) {
+    next = [
+      ...next,
+      {
+        criteria: `Integrated Management Systems (${combined.slice(0, 5).join(", ")})`,
+        scope:
+          "Integrated Management Systems across the relevant processes and departments covered by the selected standards",
+        objective:
+          "To evaluate the effectiveness and integration of the combined management system requirements in a single audit programme.",
+      },
+    ];
+  } else if (!hasIms && sourceImpliesIms && combined.length >= 2) {
+    next = [
+      ...next,
+      {
+        criteria: `Integrated Management Systems (${combined.slice(0, 5).join(", ")})`,
+        scope:
+          "Integrated Management Systems across the relevant processes and departments covered by the selected standards",
+        objective:
+          "To evaluate the effectiveness and integration of the combined management system requirements in a single audit programme.",
+      },
+    ];
+  }
+
+  next = ensureIndividualIsoOptions(next);
+
+  return { ...payload, options: next };
+}

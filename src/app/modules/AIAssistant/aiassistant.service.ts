@@ -29,6 +29,7 @@ import {
   isValidAuditGuidance,
   normalizeAuditContextResponse,
   normalizeAuditStepResponse,
+  ensureIntegratedManagementSystemsOptions,
 } from "./auditLens.normalize";
 import { getAuditGuidelineExcerpt } from "./auditLens.grounding";
 
@@ -638,24 +639,43 @@ const mapAiProxyError = (error: any, fallbackMessage: string) => {
   return new ApiError(status, message);
 };
 
-// 🔥 AUDIT CONTEXT — remap criteria editions to latest ACTIVE Standards Library
+// 🔥 AUDIT CONTEXT — IMS options + latest Standards Library editions (e.g. 9001:2026)
 const getAuditContext = async (payload: any = {}) => {
   try {
+    const sourceText = String(payload?.text || payload?.url || "").trim();
+
+    // Ask the external AI for both individual ISO options and IMS when relevant
+    const aiPayload = {
+      ...payload,
+      prefer_integrated_management_systems: true,
+      context_instruction:
+        'Return BOTH: (1) separate options for each relevant individual ISO standard as their own criteria, AND (2) when Integrated Management Systems / multiple standards are relevant, also include one option whose criteria is explicitly labeled "Integrated Management Systems" listing those standards together. Keep individual ISO options — do not replace them with only an IMS option. Prefer the latest published edition year for each ISO family when known (do not default every option to 2015).',
+    };
+
     const response = await axios.post(
       `${process.env.AI_BASE_URL}/audit-lens/context`,
-      payload,
+      aiPayload,
       { timeout: 60000 },
     );
+
+    // 1) Normalize AI options
+    // 2) Ensure IMS + individual standards are both present
+    // 3) Remap edition years to latest ACTIVE Standards Library (IMS-safe rewrite)
     const normalized = normalizeAuditContextResponse(response.data);
+    const withIms = ensureIntegratedManagementSystemsOptions(
+      normalized,
+      sourceText,
+    );
+
     try {
       const library = await prisma.iSOStandard.findMany({
         where: { status: "ACTIVE" },
         select: { title: true },
         take: 200,
       });
-      return applyLatestLibraryEditionsToPayload(normalized, library);
+      return applyLatestLibraryEditionsToPayload(withIms, library);
     } catch {
-      return normalized;
+      return withIms;
     }
   } catch (error: any) {
     throw mapAiProxyError(error, "Audit context generation");
