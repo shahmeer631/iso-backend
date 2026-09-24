@@ -3,6 +3,7 @@
  * Run against the target Mongo (e.g. production):
  *   npx tsx src/scripts/repair-group-timestamps.ts
  */
+import { Prisma } from "@prisma/client";
 import prisma from "../shared/prisma";
 
 async function normalizeCollection(
@@ -38,7 +39,7 @@ async function normalizeCollection(
         multi: true,
       },
     ],
-  });
+  } as Prisma.InputJsonObject);
 }
 
 async function main() {
