@@ -1,29 +1,14 @@
 import ApiError from "../../../errors/ApiErrors";
 import prisma from "../../../shared/prisma";
+import { userHasFeatureAccess } from "../../../helpars/effectiveAccess";
 
 const createReview = async (payload: any) => {
   const { userId, courseId, rating, comment } = payload;
 
-  // Check if SUPER_ADMIN (Admin bypasses enrollment check for reviews)
-  const user = await prisma.user.findUnique({
-    where: { id: userId },
-    select: { role: true },
-  });
-
-  const isSuperAdmin = user?.role === "SUPER_ADMIN";
-
-  if (!isSuperAdmin) {
-    // 🔥 check access (user bought course)
-    const access = await prisma.userAccess.findFirst({
-      where: {
-        userId,
-        isActive: true,
-      },
-    });
-
-    if (!access) {
-      throw new ApiError(403, "You are not enrolled");
-    }
+  // COURSES access from subscription ∪ user groups (SUPER_ADMIN bypasses inside helper)
+  const canReview = await userHasFeatureAccess(userId, "COURSES");
+  if (!canReview) {
+    throw new ApiError(403, "Course access required to leave a review");
   }
 
   return prisma.review.create({

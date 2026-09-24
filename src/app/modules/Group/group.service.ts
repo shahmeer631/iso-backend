@@ -13,8 +13,124 @@ type CreateGroupPayload = {
   status?: "ACTIVE" | "INACTIVE";
 };
 
+function isPrismaDateFieldError(error: unknown): boolean {
+  if (typeof error !== "object" || error === null || !("code" in error)) {
+    return false;
+  }
+  const code = (error as { code?: string }).code;
+  // P2032: null in non-nullable DateTime; P2023: invalid/string DateTime
+  return code === "P2032" || code === "P2023";
+}
+
+/**
+ * Some legacy Group / GroupUser docs were written without createdAt/updatedAt,
+ * or with ISO strings instead of BSON Date. Prisma refuses to read them
+ * (P2032 / P2023). Repair via raw Mongo — Prisma updateMany cannot load those rows.
+ */
+async function repairNullGroupTimestamps(groupId?: string) {
+  const groupMatch = groupId ? { _id: { $oid: groupId } } : {};
+
+  // Normalize Group timestamps (null / missing / string → Date)
+  await prisma.$runCommandRaw({
+    update: "Group",
+    updates: [
+      {
+        q: groupMatch,
+        u: [
+          {
+            $set: {
+              createdAt: {
+                $switch: {
+                  branches: [
+                    {
+                      case: { $eq: [{ $type: "$createdAt" }, "date"] },
+                      then: "$createdAt",
+                    },
+                    {
+                      case: { $eq: [{ $type: "$createdAt" }, "string"] },
+                      then: { $toDate: "$createdAt" },
+                    },
+                  ],
+                  default: "$$NOW",
+                },
+              },
+              updatedAt: {
+                $switch: {
+                  branches: [
+                    {
+                      case: { $eq: [{ $type: "$updatedAt" }, "date"] },
+                      then: "$updatedAt",
+                    },
+                    {
+                      case: { $eq: [{ $type: "$updatedAt" }, "string"] },
+                      then: { $toDate: "$updatedAt" },
+                    },
+                  ],
+                  default: "$$NOW",
+                },
+              },
+            },
+          },
+        ],
+        multi: true,
+      },
+    ],
+  });
+
+  const memberMatch = groupId
+    ? { groupId: { $oid: groupId } }
+    : {};
+
+  await prisma.$runCommandRaw({
+    update: "GroupUser",
+    updates: [
+      {
+        q: memberMatch,
+        u: [
+          {
+            $set: {
+              createdAt: {
+                $switch: {
+                  branches: [
+                    {
+                      case: { $eq: [{ $type: "$createdAt" }, "date"] },
+                      then: "$createdAt",
+                    },
+                    {
+                      case: { $eq: [{ $type: "$createdAt" }, "string"] },
+                      then: { $toDate: "$createdAt" },
+                    },
+                  ],
+                  default: "$$NOW",
+                },
+              },
+            },
+          },
+        ],
+        multi: true,
+      },
+    ],
+  });
+}
+
+async function withGroupTimestampRepair<T>(
+  fn: () => Promise<T>,
+  groupId?: string,
+): Promise<T> {
+  try {
+    return await fn();
+  } catch (error) {
+    if (!isPrismaDateFieldError(error)) throw error;
+    await repairNullGroupTimestamps(groupId);
+    return await fn();
+  }
+}
+
 const assertGroupExists = async (id: string) => {
-  const group = await prisma.group.findUnique({ where: { id } });
+  const group = await withGroupTimestampRepair(
+    () => prisma.group.findUnique({ where: { id } }),
+    id,
+  );
   if (!group) {
     throw new ApiError(httpStatus.NOT_FOUND, "Group not found");
   }
@@ -125,18 +241,20 @@ const getAllGroups = async (query: Record<string, unknown>) => {
 
   const whereConditions = andConditions.length ? { AND: andConditions } : {};
 
-  const [groups, total] = await Promise.all([
-    prisma.group.findMany({
-      where: whereConditions,
-      skip,
-      take: limit,
-      orderBy: { createdAt: "desc" },
-      include: {
-        _count: { select: { groupUsers: true } },
-      },
-    }),
-    prisma.group.count({ where: whereConditions }),
-  ]);
+  const [groups, total] = await withGroupTimestampRepair(() =>
+    Promise.all([
+      prisma.group.findMany({
+        where: whereConditions,
+        skip,
+        take: limit,
+        orderBy: { createdAt: "desc" },
+        include: {
+          _count: { select: { groupUsers: true } },
+        },
+      }),
+      prisma.group.count({ where: whereConditions }),
+    ]),
+  );
 
   const result = groups.map((group) => ({
     ...group,
@@ -156,39 +274,45 @@ const getAllGroups = async (query: Record<string, unknown>) => {
 };
 
 const getSingleGroup = async (id: string) => {
-  const group = await prisma.group.findUnique({
-    where: { id },
-    include: {
-      groupUsers: {
-        orderBy: { createdAt: "desc" },
+  const group = await withGroupTimestampRepair(
+    () =>
+      prisma.group.findUnique({
+        where: { id },
         include: {
-          user: {
-            select: {
-              id: true,
-              firstName: true,
-              lastName: true,
-              email: true,
-              status: true,
-              currentPlan: true,
-              role: true,
+          groupUsers: {
+            orderBy: { createdAt: "desc" },
+            include: {
+              user: {
+                select: {
+                  id: true,
+                  firstName: true,
+                  lastName: true,
+                  email: true,
+                  status: true,
+                  currentPlan: true,
+                  role: true,
+                },
+              },
             },
           },
+          _count: { select: { groupUsers: true } },
         },
-      },
-      _count: { select: { groupUsers: true } },
-    },
-  });
+      }),
+    id,
+  );
 
   if (!group) {
     throw new ApiError(httpStatus.NOT_FOUND, "Group not found");
   }
 
-  const members = group.groupUsers.map((gu) => ({
-    id: gu.id,
-    userId: gu.userId,
-    dateAdded: gu.createdAt,
-    user: gu.user,
-  }));
+  const members = group.groupUsers
+    .filter((gu) => gu.user)
+    .map((gu) => ({
+      id: gu.id,
+      userId: gu.userId,
+      dateAdded: gu.createdAt,
+      user: gu.user,
+    }));
 
   return {
     ...group,

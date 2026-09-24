@@ -4,6 +4,7 @@ import stripe from "../../../shared/stripe";
 import { CouponService } from "../Coupon/coupon.service";
 import httpStatus from "http-status";
 import { CreatePaymentIntentDto } from "./payment.types";
+import { getEffectiveAccess } from "../../../helpars/effectiveAccess";
 
 const couponService = new CouponService();
 
@@ -213,16 +214,24 @@ const getAllPayments = async () => {
 };
 
 const getUserAccess = async (userId: string) => {
-  console.log("USER ID:", userId);
+  const [subscriptionAccesses, effectiveAccess] = await Promise.all([
+    prisma.userAccess.findMany({
+      where: {
+        userId,
+        isActive: true,
+      },
+      include: { plan: true },
+      orderBy: { createdAt: "desc" },
+    }),
+    getEffectiveAccess(userId),
+  ]);
 
-  return prisma.userAccess.findMany({
-    where: {
-      userId,
-      isActive: true,
-    },
-    include: { plan: true },
-    orderBy: { createdAt: "desc" },
-  });
+  return {
+    /** Paid / Stripe UserAccess rows only — never fabricated for group members */
+    subscriptionAccesses,
+    /** subscription ∪ user-group plan access */
+    effectiveAccess,
+  };
 };
 
 // ================= PAYMENT SUCCESS =================

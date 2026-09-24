@@ -1,6 +1,7 @@
 import prisma from "../../../shared/prisma";
 import ApiError from "../../../errors/ApiErrors";
 import httpStatus from "http-status";
+import { getEffectiveAccess, userHasFeatureAccess } from "../../../helpars/effectiveAccess";
 
 const enrollCourse = async (userId: string, courseId: string) => {
   // 1. course check
@@ -21,43 +22,13 @@ const enrollCourse = async (userId: string, courseId: string) => {
     throw new ApiError(httpStatus.BAD_REQUEST, "Already enrolled");
   }
 
-  // Check if SUPER_ADMIN (Admin bypasses subscription check)
-  const user = await prisma.user.findUnique({
-    where: { id: userId },
-    select: { role: true },
-  });
-
-  const isSuperAdmin = user?.role === "SUPER_ADMIN";
-
-  if (!isSuperAdmin) {
-    // 3. get active plan
-    const userAccess = await prisma.userAccess.findFirst({
-      where: {
-        userId,
-        isActive: true,
-        OR: [{ expiresAt: null }, { expiresAt: { gt: new Date() } }],
-      },
-      include: {
-        plan: true,
-      },
-      orderBy: { createdAt: "desc" },
-    });
-
-    if (!userAccess) {
-      throw new ApiError(httpStatus.FORBIDDEN, "No active plan found or expired");
-    }
-
-    // 🔥 4. FEATURE CHECK (SAFE VERSION)
-    const hasCourseAccess =
-      Array.isArray(userAccess.plan.features) &&
-      userAccess.plan.features.includes("COURSES");
-
-    if (!hasCourseAccess) {
-      throw new ApiError(
-        httpStatus.FORBIDDEN,
-        "Your plan does not include course access. Please upgrade.",
-      );
-    }
+  // 3. COURSES access from subscription ∪ user groups (no fake subscription required)
+  const canEnroll = await userHasFeatureAccess(userId, "COURSES");
+  if (!canEnroll) {
+    throw new ApiError(
+      httpStatus.FORBIDDEN,
+      "Your plan does not include course access. Please upgrade.",
+    );
   }
 
   // 🔥 5. enroll + count update (IMPORTANT)
@@ -393,7 +364,7 @@ const getMyCertificates = async (userId: string) => {
 };
 
 const getUserBillingOverview = async (userId: string) => {
-  // 🔥 1. current active plan
+  // 🔥 1. current active subscription plan (UserAccess only — not group grants)
   const currentAccess = await prisma.userAccess.findFirst({
     where: {
       userId,
@@ -407,6 +378,8 @@ const getUserBillingOverview = async (userId: string) => {
       createdAt: "desc",
     },
   });
+
+  const effectiveAccess = await getEffectiveAccess(userId);
 
   // 🔥 2. order history (payments)
   const payments = await prisma.payment.findMany({
@@ -442,8 +415,12 @@ const getUserBillingOverview = async (userId: string) => {
 
           expiresAt: currentAccess.expiresAt,
           isActive: currentAccess.isActive,
+          source: "subscription" as const,
         }
       : null,
+
+    /** Group + subscription union — cash/offline access shows up here */
+    effectiveAccess,
 
     orderHistory,
   };

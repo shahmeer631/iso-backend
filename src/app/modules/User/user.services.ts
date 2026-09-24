@@ -7,6 +7,8 @@ import { sendOTPEmail } from "../../../helpars/sendOtp";
 import { OTPPurpose } from "@prisma/client";
 import stripe from "../../../shared/stripe";
 import { startEmailSequence } from "../../jobs/campaignEmail";
+import { getEffectiveAccess } from "../../../helpars/effectiveAccess";
+import { planKeyFromName } from "../../../helpars/groupPlanKeys";
 
 const OTP_EXPIRY_MINUTES = 5;
 
@@ -185,6 +187,11 @@ const deleteUser = async (id: string) => {
   }
 
   await prisma.$transaction([
+    // 🔥 delete group memberships (access only — no subscription side effects)
+    prisma.groupUser.deleteMany({
+      where: { userId: id },
+    }),
+
     // 🔥 delete enrollments
     prisma.enrollment.deleteMany({
       where: { userId: id },
@@ -219,24 +226,50 @@ const deleteUser = async (id: string) => {
 };
 
 const getMyProfile = async (userId: string) => {
-  const user = await prisma.user.findUnique({ where: { id: userId } });
+  const [user, accessCount, effectiveAccess, activePlans] = await Promise.all([
+    prisma.user.findUnique({ where: { id: userId } }),
+    prisma.userAccess.count({ where: { userId } }),
+    getEffectiveAccess(userId),
+    prisma.plan.findMany({
+      where: { isActive: true },
+      select: { id: true, name: true },
+    }),
+  ]);
 
   if (!user) {
     throw new ApiError(httpStatus.NOT_FOUND, "User not found");
   }
 
-  const accessCount = await prisma.userAccess.count({
-    where: { userId },
-  });
+  // Map effective plan keys → active Plan ids so clients that key off planId
+  // also recognize group-granted access without inventing a UserAccess row.
+  const grantedPlanIds = activePlans
+    .filter((p) => {
+      const key = planKeyFromName(p.name);
+      return key && effectiveAccess.effectivePlans.includes(key);
+    })
+    .map((p) => p.id);
 
   return {
     ...user,
     hasSubscriptionHistory: accessCount > 0,
+    effectiveAccess,
+    features: effectiveAccess.features,
+    effectivePlans: effectiveAccess.effectivePlans,
+    groupPlans: effectiveAccess.groupPlans,
+    subscriptionPlans: effectiveAccess.subscriptionPlans,
+    purchasedPlanIds: grantedPlanIds,
   };
 };
 
 const bulkDeleteUsers = async (userIds: string[]) => {
   await prisma.$transaction([
+    // 🔥 delete group memberships first
+    prisma.groupUser.deleteMany({
+      where: {
+        userId: { in: userIds },
+      },
+    }),
+
     // 🔥 delete enrollments first
     prisma.enrollment.deleteMany({
       where: {
