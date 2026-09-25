@@ -226,6 +226,28 @@ export function isValidAuditGuidance(guidance: string): boolean {
 }
 
 /**
+ * True when Case Study exists as a structured field or as a real section heading
+ * in guidance. The bare word "hypothetical" alone is NOT enough (work papers
+ * often say "hypothetical transaction path").
+ */
+export function hasAuditCaseStudyContent(step: {
+  case_study?: string;
+  guidance?: string;
+}): boolean {
+  if (step.case_study && step.case_study.trim().length >= 40) return true;
+  const g = step.guidance || "";
+  if (
+    /^#{1,3}\s*\d*\.?\s*demonstrated\s+case\s+study\b/im.test(g) ||
+    /^#{1,3}\s*\d*\.?\s*case\s+study\b/im.test(g) ||
+    /^\*\*\s*demonstrated\s+case\s+study\b/im.test(g) ||
+    /\*\*\s*demonstrated\s+case\s+study\s*[—\-].*hypothetical/im.test(g)
+  ) {
+    return true;
+  }
+  return false;
+}
+
+/**
  * Soft cleanup of simulation / fabricated-audit language.
  * Prefer rewriting claims into guidance phrasing over deleting content wholesale.
  */

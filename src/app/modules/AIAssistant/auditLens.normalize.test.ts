@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   ensureHypotheticalCaseStudyLabel,
   ensureIntegratedManagementSystemsOptions,
+  hasAuditCaseStudyContent,
   isValidAuditGuidance,
   normalizeAuditStepResponse,
   stripSimulationPhrases,
@@ -81,6 +82,35 @@ Document ID: [ID]
     assert.ok(normalized.audit_paper);
     assert.ok(normalized.case_study);
     assert.match(normalized.case_study!, /hypothetical/i);
+  });
+
+  it("detects missing Case Study when guidance only mentions hypothetical in work-paper prose", () => {
+    const guidance = `## Upstream linkage
+Link to prior steps.
+
+## Downstream linkage
+Trace at least one end-to-end hypothetical or available transaction path.`;
+    assert.equal(
+      hasAuditCaseStudyContent({ guidance, case_study: undefined }),
+      false,
+    );
+  });
+
+  it("detects Case Study from heading or structured field", () => {
+    assert.equal(
+      hasAuditCaseStudyContent({
+        guidance: `## 4. Demonstrated Case Study
+**Hypothetical example** of evidence review.`,
+      }),
+      true,
+    );
+    assert.equal(
+      hasAuditCaseStudyContent({
+        case_study:
+          "**Demonstrated Case Study — Hypothetical Example**\n\nA clerk omitted a control check and the auditor requested objective evidence.",
+      }),
+      true,
+    );
   });
 
   it("relabels multi-standard criteria as Integrated Management Systems", () => {

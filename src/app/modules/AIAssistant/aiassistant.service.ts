@@ -27,6 +27,8 @@ import {
 } from "./auditLens.prompt";
 import {
   isValidAuditGuidance,
+  hasAuditCaseStudyContent,
+  ensureHypotheticalCaseStudyLabel,
   normalizeAuditContextResponse,
   normalizeAuditStepResponse,
   ensureIntegratedManagementSystemsOptions,
@@ -818,7 +820,107 @@ const getAuditStep = async (payload: any = {}) => {
     );
   }
 
+  // Runtime evidence (2026-09-25): /audit-lens/step returns only
+  // {guidance, template_preview, ...} work-paper content — never case_study and
+  // never a "## 4. Demonstrated Case Study" heading (even on retry). The /chat
+  // endpoint does return a real Case Study when asked. Fill only when missing.
+  if (!hasAuditCaseStudyContent(normalized)) {
+    try {
+      const caseMarkdown = await generateAuditCaseStudyViaChat({
+        stepNumber,
+        stepTitle: stepTitle || meta.title,
+        stage,
+        lockedContext,
+      });
+      if (caseMarkdown.trim().length >= 40) {
+        let body = caseMarkdown.trim();
+        const sectionMatch = body.match(
+          /##\s*\d*\.?\s*demonstrated\s+case\s+study\b[^\n]*\n+([\s\S]*)/i,
+        );
+        if (sectionMatch?.[1]?.trim()) body = sectionMatch[1].trim();
+        const labeled = ensureHypotheticalCaseStudyLabel(body) || body;
+        normalized = {
+          ...normalized,
+          case_study: labeled,
+          guidance: /demonstrated\s+case\s+study/i.test(normalized.guidance || "")
+            ? normalized.guidance
+            : `${normalized.guidance}\n\n## 4. Demonstrated Case Study\n\n${labeled}`,
+        };
+      }
+    } catch (err: any) {
+      // Do not fail the whole step — Working Paper / Template remain usable.
+      console.warn(
+        "[AuditLens] Case Study /chat fill failed:",
+        err?.message || err,
+      );
+    }
+  }
+
   return normalized;
+};
+
+/**
+ * /audit-lens/step is locked to work-paper output. Use /chat to obtain the
+ * Demonstrated Case Study when the step response omits it.
+ */
+const generateAuditCaseStudyViaChat = async (params: {
+  stepNumber: number;
+  stepTitle: string;
+  stage: string;
+  lockedContext: any;
+}): Promise<string> => {
+  const ctx = params.lockedContext || {};
+  const org =
+    ctx.organization ||
+    ctx.organization_name ||
+    ctx.client ||
+    "the audited organization";
+  const criteria = ctx.criteria || ctx.standard || "the applicable ISO standard";
+  const scope = ctx.scope || "the defined audit scope";
+
+  const prompt = [
+    `Write an educational Demonstrated Case Study for Audit Lens step ${params.stepNumber}: ${params.stepTitle} (${params.stage}).`,
+    `Setting only (do not invent real findings): organization=${org}; criteria=${criteria}; scope=${scope}.`,
+    "Use this exact markdown structure:",
+    "## 4. Demonstrated Case Study",
+    "**Demonstrated Case Study — Hypothetical Example (Not Actual Audit Evidence)**",
+    "### The Situation",
+    "### The Complication",
+    "### The Auditor's Action",
+    "Keep it educational and hypothetical. Do not claim real interviews, inspections, or compliance outcomes.",
+  ].join("\n");
+
+  const formData = new FormData();
+  formData.append("messages", prompt);
+  formData.append(
+    "context",
+    JSON.stringify({
+      purpose: "audit_lens_case_study",
+      step_number: params.stepNumber,
+      step_title: params.stepTitle,
+      stage: params.stage,
+    }),
+  );
+
+  const response = await axios.post(
+    `${process.env.AI_BASE_URL}/chat`,
+    formData,
+    {
+      headers: formData.getHeaders(),
+      timeout: 90000,
+    },
+  );
+  const data = response.data;
+  return String(
+    data?.response ||
+      data?.reply ||
+      data?.message ||
+      data?.content ||
+      data?.guidance ||
+      data?.data?.response ||
+      data?.data?.content ||
+      "",
+  ).trim();
 };
 
 const analyzeBenchmarkFile = async (file: any, payload: any = {}) => {
