@@ -1,5 +1,6 @@
 import slugify from "slugify";
 import prisma from "../../../shared/prisma";
+import { parseIsoEdition } from "../AIAssistant/isoStandardVersion";
 
 const createCourse = async (payload: any) => {
   const slug = slugify(payload.title, { lower: true, strict: true });
@@ -167,17 +168,29 @@ const getSingleCourse = async (id: string) => {
         // We suppress the error so it doesn't break the course API
       }
 
-      // 2. Title matching (case insensitive) fallback
+      // 2. Exact ISO family + year from course title (respects 2015 vs 2026; no latest swap)
+      if (!matchedStandard) {
+        const courseEdition = parseIsoEdition(result.title);
+        if (courseEdition?.familyKey && courseEdition.year != null) {
+          matchedStandard = categoryStandards.find((standard) => {
+            const parsed = parseIsoEdition(standard.title);
+            return (
+              parsed?.familyKey === courseEdition.familyKey &&
+              parsed?.year === courseEdition.year
+            );
+          }) || null;
+        }
+      }
+
+      // 3. Title substring match (case insensitive)
       if (!matchedStandard) {
         matchedStandard = categoryStandards.find((standard) =>
-          result.title.toLowerCase().includes(standard.title.toLowerCase())
+          result.title.toLowerCase().includes(standard.title.toLowerCase()),
         );
       }
 
-      // 3. Fallback: take the latest one if no match found
-      if (!matchedStandard) {
-        matchedStandard = categoryStandards[0];
-      }
+      // Do NOT fall back to "latest created" standard — that silently swaps ISO editions
+      // (e.g. 2015 vs 2026). Leave unmatched when bundle/title/edition resolution fails.
     }
 
     // Attach it to the result object

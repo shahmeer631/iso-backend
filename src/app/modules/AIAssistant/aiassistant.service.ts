@@ -34,6 +34,15 @@ import {
   ensureIntegratedManagementSystemsOptions,
 } from "./auditLens.normalize";
 import { getAuditGuidelineExcerpt } from "./auditLens.grounding";
+import {
+  enrichCourseLearningContext,
+  excerptLockedIsoFromBuffer,
+  LEARNING_BRIEF_HEADER,
+} from "./courseLearning.grounding";
+import {
+  LIBRARY_BRIEF_HEADER,
+  buildLibraryAvailableSources,
+} from "./libraryStandards.grounding";
 
 const NAVIGATOR_GENERATE_TIMEOUT_MS = 120000;
 // Remote /discovery/iso-suggestions often exceeds 60s (LLM + ranking).
@@ -281,6 +290,25 @@ const chat = async (userId: string, payload: any = {}) => {
     finalContext = payload.context || {};
   }
 
+  // 🔥 1b. Course / Learning AI enrichment (reuse shared chat + ISO attach)
+  const questionText =
+    typeof messages === "string"
+      ? messages
+      : messages?.[0]?.content || payload.question || "";
+
+  try {
+    const enriched = await enrichCourseLearningContext({
+      userId,
+      context: finalContext,
+      question: questionText,
+    });
+    finalContext = enriched.context;
+  } catch (error) {
+    // Preserve ApiError (auth/enrollment); soft-fail unexpected enrichment errors.
+    if (error instanceof ApiError) throw error;
+    console.error("Course learning context enrichment failed:", error);
+  }
+
   const isoStandardId = finalContext?.isoStandardId;
 
   // 🔥 2. ONLY logged user → session logic
@@ -290,6 +318,10 @@ const chat = async (userId: string, payload: any = {}) => {
       session = await prisma.chatSession.findUnique({
         where: { id: session_id },
       });
+      // Tenant/user isolation: never reuse another user's session
+      if (session && session.userId !== userId) {
+        throw new ApiError(httpStatus.FORBIDDEN, "Forbidden chat session");
+      }
     }
 
     // create new session
@@ -300,7 +332,11 @@ const chat = async (userId: string, payload: any = {}) => {
             connect: { id: userId }, // ✅ FIXED
           },
           title:
-            typeof messages === "string" ? generateTitle(messages) : "New Chat",
+            typeof messages === "string"
+              ? generateTitle(messages)
+              : typeof questionText === "string" && questionText
+                ? generateTitle(questionText)
+                : "New Chat",
           isoStandardId: isoStandardId || null,
         },
       });
@@ -308,12 +344,13 @@ const chat = async (userId: string, payload: any = {}) => {
 
     // invalid session
     if (!session) {
-      throw new Error("Invalid or expired session");
+      throw new ApiError(httpStatus.BAD_REQUEST, "Invalid or expired session");
     }
   }
 
-  // 🔥 3. inject ISO data
+  // 🔥 3. inject ISO data (exact selected standard — no edition substitution)
   let downloadedFile = null;
+  let isoFileAttachFailed = false;
 
   if (isoStandardId && isValidObjectId(isoStandardId)) {
     const iso = await prisma.iSOStandard.findUnique({
@@ -325,49 +362,250 @@ const chat = async (userId: string, payload: any = {}) => {
         title: iso.title,
       };
 
-      finalContext.instruction =
-        "Answer based on the provided ISO document content. Be specific and avoid generic answers.";
+      // Library Ask AI: mark purpose when not already course_learning
+      if (finalContext.purpose !== "course_learning") {
+        finalContext.purpose = "library_standards";
+        finalContext.available_sources = buildLibraryAvailableSources(iso.title);
+      }
 
-      // 🔥 Download file from DB if not provided by client
+      // Preserve Course Learning instruction when already set by enrichment.
+      if (!finalContext.instruction) {
+        finalContext.instruction =
+          "Answer based on the provided ISO document content. Be specific and avoid generic answers. Do not invent clauses or editions.";
+      }
+
+      // Download file from DB if not provided by client
       if (!payload.file && iso.fileUrl) {
         try {
           const fileRes = await axios.get(iso.fileUrl, {
             responseType: "arraybuffer",
+            timeout: 60000,
           });
-          const fileName = iso.fileUrl.split('/').pop() || "document.pdf";
+          const fileName = iso.fileUrl.split("/").pop() || "document.pdf";
 
           downloadedFile = {
             buffer: fileRes.data,
             originalname: fileName,
           };
-        } catch (error) {
-          console.error("Failed to download ISO file:", error);
+          finalContext.iso_file_attached = true;
+        } catch (error: any) {
+          isoFileAttachFailed = true;
+          finalContext.iso_file_attached = false;
+          console.error(
+            `[AIChat] ISO PDF download failed id=${isoStandardId} status=${error?.response?.status || "n/a"} message=${error?.message || error}`,
+          );
         }
+      } else if (payload.file) {
+        finalContext.iso_file_attached = true;
       }
+    } else {
+      console.error(`[AIChat] ISO standard not found id=${isoStandardId}`);
     }
   }
 
-  // 🔥 4. prepare AI payload
+  console.log(
+    `[AIChat] purpose=${finalContext?.purpose || "general"} iso=${isoStandardId || "n/a"} fileAttached=${Boolean(downloadedFile || payload.file)} session=${session?.id || "n/a"}`,
+  );
+
+  // Course / Library: focused ISO clause/keyword excerpt from the same buffer (no second download).
+  const isoBufferForExcerpt =
+    downloadedFile?.buffer || payload.file?.buffer || null;
+  const wantsClauseExcerpt =
+    (finalContext?.purpose === "course_learning" ||
+      finalContext?.purpose === "library_standards") &&
+    isoBufferForExcerpt &&
+    !finalContext.iso_clause_excerpt &&
+    /\b(?:clause|cl\.?|section)\s*\d|\b\d+\.\d+/.test(questionText || "");
+  if (wantsClauseExcerpt) {
+    try {
+      const excerpt = await excerptLockedIsoFromBuffer(
+        isoBufferForExcerpt,
+        questionText,
+      );
+      if (excerpt) {
+        finalContext.iso_clause_excerpt = excerpt;
+      }
+    } catch (error) {
+      console.error("ISO clause excerpt failed:", error);
+    }
+  }
+
+  // Normalize message field for callAI (academy historically sent `question`)
+  if (!payload.messages && questionText) {
+    payload.messages = questionText;
+  }
+
+  // Course Learning: lean remote contract (remote /chat 400s on large/unknown context).
+  let remoteContext = finalContext;
+  if (finalContext?.purpose === "course_learning") {
+    const userQ =
+      typeof payload.messages === "string"
+        ? payload.messages
+        : payload.messages?.[0]?.content || questionText || "";
+
+    const lockedIso =
+      finalContext.isoStandard?.title ||
+      (typeof finalContext.isoStandardId === "string"
+        ? `id:${finalContext.isoStandardId}`
+        : "");
+
+    const sourcesList = Array.isArray(finalContext.available_sources)
+      ? finalContext.available_sources.join("; ")
+      : "";
+
+    const brief = [
+      LEARNING_BRIEF_HEADER,
+      lockedIso ? `LOCKED ISO EDITION: ${lockedIso}` : "",
+      sourcesList
+        ? `AVAILABLE SOURCES (cite only these if needed): ${sourcesList}`
+        : "",
+      finalContext.course?.title
+        ? `COURSE: ${finalContext.course.title}`
+        : "",
+      finalContext.lesson?.title
+        ? `LESSON: ${finalContext.lesson.title}`
+        : "",
+      finalContext.course_grounding
+        ? `MATERIAL:\n${String(finalContext.course_grounding).slice(0, 2400)}`
+        : finalContext.course_grounding_note
+          ? String(finalContext.course_grounding_note)
+          : "",
+      finalContext.iso_clause_excerpt
+        ? `RELEVANT ISO EXCERPT (locked edition only):\n${String(finalContext.iso_clause_excerpt).slice(0, 1800)}`
+        : "",
+      `QUESTION: ${userQ}`,
+    ]
+      .filter(Boolean)
+      .join("\n\n");
+
+    payload.messages = brief;
+
+    remoteContext = {
+      isoStandardId: finalContext.isoStandardId || undefined,
+      purpose: "course_learning",
+      instruction:
+        "Answer as a course learning assistant. Use only the learning context and attached locked ISO document. Prefer Answer / Why it matters / Example / Related requirement / From your course. Never invent clauses, editions, or org facts.",
+    };
+  } else if (finalContext?.purpose === "library_standards") {
+    // Library / Standards Ask AI — lean grounded contract on the same engine
+    const userQ =
+      typeof payload.messages === "string"
+        ? payload.messages
+        : payload.messages?.[0]?.content || questionText || "";
+
+    const lockedIso =
+      finalContext.isoStandard?.title ||
+      (typeof finalContext.isoStandardId === "string"
+        ? `id:${finalContext.isoStandardId}`
+        : "");
+
+    const sourcesList = Array.isArray(finalContext.available_sources)
+      ? finalContext.available_sources.join("; ")
+      : "";
+
+    const brief = [
+      LIBRARY_BRIEF_HEADER,
+      lockedIso ? `LOCKED ISO EDITION: ${lockedIso}` : "",
+      sourcesList
+        ? `AVAILABLE SOURCES (cite only these if needed): ${sourcesList}`
+        : "",
+      finalContext.iso_clause_excerpt
+        ? `RELEVANT ISO EXCERPT (locked edition only):\n${String(finalContext.iso_clause_excerpt).slice(0, 1800)}`
+        : "",
+      isoFileAttachFailed || finalContext.iso_file_attached === false
+        ? "NOTE: The locked ISO PDF could not be attached for this request. Do not invent clause text; say information is unavailable if you cannot ground the answer."
+        : "",
+      `QUESTION: ${userQ}`,
+    ]
+      .filter(Boolean)
+      .join("\n\n");
+
+    payload.messages = brief;
+
+    remoteContext = {
+      isoStandardId: finalContext.isoStandardId || undefined,
+      purpose: "library_standards",
+      instruction:
+        "Answer as a Standards Library assistant using the locked ISO edition and any attached ISO document. Do not invent clauses or substitute editions. If evidence is missing, say so.",
+    };
+  }
+
+  // 🔥 4. prepare AI payload — always forward DB session to remote /chat for follow-ups
   const finalPayload = {
     ...payload,
-    context: finalContext,
+    context: remoteContext,
+    session_id: session?.id || payload.session_id || undefined,
   };
 
   if (downloadedFile) {
     finalPayload.file = downloadedFile;
+  } else if (
+    (finalContext?.purpose === "course_learning" ||
+      finalContext?.purpose === "library_standards") &&
+    finalContext.isoStandardId &&
+    !payload.file &&
+    isoFileAttachFailed
+  ) {
+    if (typeof finalPayload.messages === "string") {
+      finalPayload.messages +=
+        "\n\nNOTE: Locked ISO PDF could not be attached for this request. Do not invent clause text; say information is unavailable if the learning/library context is insufficient.";
+    }
   }
 
   // 🔥 5. call AI
-  const aiResponse = await callAI(finalPayload);
+  let aiResponse = await callAI(finalPayload);
+
+  // Empty / missing AI response — controlled fallback (no fabrication)
+  if (
+    !aiResponse ||
+    typeof aiResponse.response !== "string" ||
+    !String(aiResponse.response).trim()
+  ) {
+    const fallback =
+      finalContext?.purpose === "course_learning" ||
+      finalContext?.purpose === "library_standards"
+        ? "I couldn't find sufficient information in the connected ISO standards or knowledge documents to answer that confidently."
+        : "I could not generate an answer at this time.";
+    aiResponse = {
+      ...(aiResponse || {}),
+      response: fallback,
+      sources: aiResponse?.sources || [],
+    };
+  }
+
+  // Prefer / merge platform sources for grounded assistants
+  if (
+    (finalContext?.purpose === "course_learning" ||
+      finalContext?.purpose === "library_standards") &&
+    Array.isArray(finalContext.available_sources) &&
+    finalContext.available_sources.length
+  ) {
+    const remoteSources = Array.isArray(aiResponse.sources)
+      ? aiResponse.sources.filter((s: unknown) => typeof s === "string")
+      : [];
+    const merged = [
+      ...finalContext.available_sources,
+      ...remoteSources.filter(
+        (s: string) => !finalContext.available_sources.includes(s),
+      ),
+    ];
+    aiResponse.sources = merged.slice(0, 8);
+  }
 
   // 🔥 6. ONLY logged user → save messages
   if (userId && session) {
+    const userMessageForStore =
+      typeof messages === "string"
+        ? messages
+        : typeof questionText === "string" && questionText
+          ? questionText
+          : JSON.stringify(messages ?? "");
+
     await prisma.chatMessage.create({
       data: {
         sessionId: session.id,
         role: "user",
-        message:
-          typeof messages === "string" ? messages : JSON.stringify(messages),
+        message: userMessageForStore,
       },
     });
 
@@ -542,16 +780,20 @@ const callAI = async (payload: any = {}) => {
     formData.append("file", payload.file.buffer, payload.file.originalname);
   }
 
-  const response = await axios.post(
-    `${process.env.AI_BASE_URL}/chat`,
-    formData,
-    {
-      headers: formData.getHeaders(),
-      maxBodyLength: Infinity,
-    },
-  );
-
-  return response.data;
+  try {
+    const response = await axios.post(
+      `${process.env.AI_BASE_URL}/chat`,
+      formData,
+      {
+        headers: formData.getHeaders(),
+        maxBodyLength: Infinity,
+        timeout: 120000,
+      },
+    );
+    return response.data;
+  } catch (error: any) {
+    throw mapAiProxyError(error, "AI chat");
+  }
 };
 
 // 🔥 GET ALL SESSIONS

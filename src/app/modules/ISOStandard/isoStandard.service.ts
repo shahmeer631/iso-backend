@@ -2,6 +2,36 @@ import prisma from "../../../shared/prisma";
 import axios from "axios";
 import FormData from "form-data";
 
+/** AI_BASE_URL already includes /api/v1 — do not append another /api/v1. */
+async function ingestIsoStandardToAI(params: {
+  id: string;
+  title: string;
+  fileUrl: string;
+}) {
+  const fileRes = await axios.get(params.fileUrl, {
+    responseType: "arraybuffer",
+    timeout: 60000,
+  });
+  const fileName = params.fileUrl.split("/").pop() || "document.pdf";
+
+  const formData = new FormData();
+  formData.append("file", Buffer.from(fileRes.data), fileName);
+  formData.append(
+    "metadata",
+    JSON.stringify({
+      isoStandardId: params.id,
+      title: params.title,
+      sourceType: "ISO_STANDARD",
+    }),
+  );
+
+  await axios.post(`${process.env.AI_BASE_URL}/ingest`, formData, {
+    headers: formData.getHeaders(),
+    maxBodyLength: Infinity,
+    timeout: 120000,
+  });
+}
+
 const createISOStandard = async (payload: any) => {
   const result = await prisma.iSOStandard.create({
     data: {
@@ -19,27 +49,21 @@ const createISOStandard = async (payload: any) => {
     },
   });
 
-  // 🔥 Ingest to AI endpoint
+  // Ingest to remote AI knowledge index (best-effort; never block create)
   if (payload.fileUrl) {
     try {
-      const fileRes = await axios.get(payload.fileUrl, {
-        responseType: "arraybuffer",
+      await ingestIsoStandardToAI({
+        id: result.id,
+        title: result.title,
+        fileUrl: payload.fileUrl,
       });
-      const fileName = payload.fileUrl.split("/").pop() || "document.pdf";
-
-      const formData = new FormData();
-      formData.append("file", fileRes.data, fileName);
-      formData.append(
-        "metadata",
-        JSON.stringify({ isoStandardId: result.id, title: result.title }),
+      console.log(
+        `[ISOIngest] ok id=${result.id} title=${JSON.stringify(result.title)}`,
       );
-
-      await axios.post(`${process.env.AI_BASE_URL}/api/v1/ingest`, formData, {
-        headers: formData.getHeaders(),
-        maxBodyLength: Infinity,
-      });
-    } catch (error) {
-      console.error("Failed to ingest ISO standard to AI:", error);
+    } catch (error: any) {
+      console.error(
+        `[ISOIngest] failed id=${result.id} status=${error?.response?.status || "n/a"} message=${error?.message || error}`,
+      );
     }
   }
 
@@ -117,6 +141,11 @@ const updateISOStandard = async (id: string, payload: any) => {
     data.fileSize = Number(payload.fileSize);
   }
 
+  const previous = await prisma.iSOStandard.findUnique({
+    where: { id },
+    select: { fileUrl: true, title: true },
+  });
+
   const result = await prisma.iSOStandard.update({
     where: { id },
     data,
@@ -124,6 +153,27 @@ const updateISOStandard = async (id: string, payload: any) => {
       category: true,
     },
   });
+
+  // Re-ingest when file changes so remote RAG stays aligned with the locked edition PDF
+  const fileChanged =
+    typeof payload.fileUrl === "string" &&
+    payload.fileUrl &&
+    payload.fileUrl !== previous?.fileUrl;
+
+  if (fileChanged) {
+    try {
+      await ingestIsoStandardToAI({
+        id: result.id,
+        title: result.title,
+        fileUrl: result.fileUrl,
+      });
+      console.log(`[ISOIngest] update-ok id=${result.id}`);
+    } catch (error: any) {
+      console.error(
+        `[ISOIngest] update-failed id=${result.id} status=${error?.response?.status || "n/a"} message=${error?.message || error}`,
+      );
+    }
+  }
 
   return result;
 };
