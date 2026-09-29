@@ -45,6 +45,10 @@ export function buildGenerationInstructions(input: {
   language: string;
   groundingExcerpt?: string;
   instructionsGroundingCap?: number;
+  isIms?: boolean;
+  imsGuideTitle?: string;
+  imsGuideAvailable?: boolean;
+  missingEditions?: string[];
 }): string {
   const taxonomyLine = input.taxonomy
     ? TAXONOMY_LABEL[input.taxonomy]
@@ -71,6 +75,27 @@ export function buildGenerationInstructions(input: {
     ? `GROUNDING (primary source; do not invent beyond this + org context):\n${groundingPreview}`
     : "No library excerpt. Ground only on ISO requirement + organization context. Do not invent clause text or company facts.";
 
+  const imsGuideNote =
+    input.isIms && input.imsGuideAvailable === false
+      ? `\n- IMS Practical Guide was not found in the Library for this tenant/environment. Do NOT invent IMS methodology; ground only on the listed ISO standards + organization context.`
+      : "";
+
+  const missingEditionsNote =
+    input.missingEditions && input.missingEditions.length > 0
+      ? `\n- The following selected editions were NOT available in the Standards Library and must NOT be invented or substituted: ${input.missingEditions.join("; ")}. Ground only on editions present in the grounding excerpt.`
+      : "";
+
+  const imsBlock = input.isIms
+    ? `
+IMS FRAMEWORK (overarching context — not a label-only mode):
+- Treat Integrated Management System as the combined management-system framework.
+- Use the IMS Practical Guide${input.imsGuideTitle ? ` ("${input.imsGuideTitle}")` : ""} when present in grounding, together with the listed ISO standards.
+- Align the document so requirements from the selected standards work as one integrated system (shared processes, roles, documented information) — do not write isolated single-standard silos.
+- Do not invent IMS methodology beyond the grounding excerpt + listed standards.${imsGuideNote}${missingEditionsNote}`
+    : missingEditionsNote
+      ? `\nUNAVAILABLE EDITIONS:${missingEditionsNote}`
+      : "";
+
   return `ISOBrain Navigator — generate documented information for organizational use.
 
 WHO (write for this organization by name when known; never invent company facts):
@@ -84,6 +109,7 @@ WHAT:
 - Document: ${input.documentTitle}
 - Type: ${input.outputType}
 - Taxonomy: ${taxonomyLine}
+${imsBlock}
 
 WHY: Usable documented-information for THIS standard, clause, and organization—not a textbook.
 FOR WHOM: Implementers (section 2), process users (section 3), auditors (clear criteria/evidence fields in the template).

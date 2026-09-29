@@ -4,6 +4,7 @@ import {
   applyLatestLibraryEditionsToPayload,
   parseIsoEdition,
   pickLatestStandardFromList,
+  resolveLibraryStandardEdition,
   rewriteStandardLabelToLatest,
 } from "./isoStandardVersion";
 
@@ -165,4 +166,45 @@ test("Test 11: prefers Requirements document over guidance PDF at same year", ()
   const picked = pickLatestStandardFromList(mixed, "ISO 9001:2015");
   assert.equal(picked?.selected.id, "r");
   assert.equal(picked?.selectedYear, 2026);
+});
+
+test("Navigator generation locks exact year when present", () => {
+  const exact = resolveLibraryStandardEdition(library, "ISO 9001:2026");
+  assert.equal(exact.ok, true);
+  if (exact.ok) {
+    assert.equal(exact.selectedYear, 2026);
+    assert.equal(exact.exactYearMatched, true);
+  }
+});
+
+test("Navigator generation refuses missing edition (no silent older fallback)", () => {
+  const only2015 = [{ id: "a", title: "ISO 9001:2015 Quality management systems" }];
+  const missing = resolveLibraryStandardEdition(only2015, "ISO 9001:2026");
+  assert.equal(missing.ok, false);
+  if (!missing.ok) {
+    assert.equal(missing.reason, "edition_unavailable");
+    assert.equal(missing.requestedYear, 2026);
+    assert.deepEqual(missing.availableYears, [2015]);
+  }
+});
+
+test("Suggestions drop IMS families not present in Standards Library", () => {
+  const library = [
+    { title: "ISO 9001:2026 Quality management systems — Requirements" },
+    { title: "ISO/IEC 27001:2022 Information security" },
+  ];
+  const payload = {
+    suggestions: [
+      {
+        standard:
+          "Integrated Management Systems (ISO 9001:2026, ISO/IEC 27001:2022, ISO/IEC 27701:2019)",
+      },
+    ],
+  };
+  const next = applyLatestLibraryEditionsToPayload(payload, library, {
+    dropUnavailableFamilies: true,
+  });
+  assert.match(next.suggestions[0].standard, /ISO 9001:2026/i);
+  assert.match(next.suggestions[0].standard, /27001:2022/i);
+  assert.doesNotMatch(next.suggestions[0].standard, /27701/);
 });

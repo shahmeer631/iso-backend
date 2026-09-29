@@ -11,10 +11,15 @@ import {
 } from "./navigatorGenerate.prompt";
 import {
   getNavigatorGroundingExcerpt,
-  findMatchingISOStandard,
+  resolveNavigatorISOStandard,
+  looksLikeImsRequirement,
   INSTRUCTIONS_GROUNDING_CAP,
 } from "./navigatorGenerate.grounding";
-import { applyLatestLibraryEditionsToPayload } from "./isoStandardVersion";
+import {
+  applyLatestLibraryEditionsToPayload,
+  rewriteStandardLabelToLatest,
+} from "./isoStandardVersion";
+import { ensureNavigatorImsSuggestions } from "./navigatorIms";
 import {
   hasRequiredNavigatorStructure,
   isValidNavigatorContent,
@@ -93,12 +98,48 @@ const generateISO = async (payload: any = {}) => {
   );
 
   const specific_requirements_raw = String(payload.specific_requirements || "").trim();
-  const libraryMatch = await findMatchingISOStandard(specific_requirements_raw);
-  const specific_requirements = libraryMatch?.title || specific_requirements_raw;
-  if (libraryMatch && libraryMatch.title !== specific_requirements_raw) {
-    console.log(
-      `[Navigator] remapped selected standard "${specific_requirements_raw}" → "${libraryMatch.title}" (${libraryMatch.id})`,
+  const isIms = looksLikeImsRequirement(specific_requirements_raw);
+
+  // IMS labels must stay multi-standard — never collapse to a single ISO title.
+  // Single standards: lock to the selected library edition (exact year when specified).
+  let specific_requirements = specific_requirements_raw;
+  if (isIms) {
+    const libraryTitles = await prisma.iSOStandard.findMany({
+      where: { status: "ACTIVE" },
+      select: { title: true },
+      take: 200,
+    });
+    specific_requirements = rewriteStandardLabelToLatest(
+      specific_requirements_raw,
+      libraryTitles,
     );
+    console.log(
+      `[Navigator] IMS context preserved "${specific_requirements_raw}" → "${specific_requirements}"`,
+    );
+  } else {
+    const resolved = await resolveNavigatorISOStandard(specific_requirements_raw);
+    if (!resolved.ok) {
+      if (resolved.reason === "edition_unavailable") {
+        const avail =
+          resolved.availableYears.length > 0
+            ? resolved.availableYears.join(", ")
+            : "none";
+        throw new ApiError(
+          httpStatus.BAD_REQUEST,
+          `Selected edition ${resolved.family}:${resolved.requestedYear} is not available in the Standards Library (available: ${avail}). No silent fallback was applied.`,
+        );
+      }
+      throw new ApiError(
+        httpStatus.BAD_REQUEST,
+        "Selected ISO standard is not available in the Standards Library.",
+      );
+    }
+    specific_requirements = resolved.selected.title;
+    if (resolved.selected.title !== specific_requirements_raw) {
+      console.log(
+        `[Navigator] remapped selected standard "${specific_requirements_raw}" → "${resolved.selected.title}" (${resolved.selected.id}) exact=${resolved.exactYearMatched}`,
+      );
+    }
   }
   const output_type = String(payload.output_type || payload.document_title || "").trim();
   const document_title = String(
@@ -134,6 +175,20 @@ const generateISO = async (payload: any = {}) => {
     documentTitle: document_title,
   });
 
+  if (isIms && grounding.missingEditions && grounding.missingEditions.length > 0) {
+    // IMS may list several standards — do not block the whole generate when one
+    // edition is absent. Continue with available standards; never silently swap years.
+    if (!grounding.standardId && !(grounding.excerpt || "").trim()) {
+      throw new ApiError(
+        httpStatus.BAD_REQUEST,
+        `None of the selected ISO editions are available in the Standards Library: ${grounding.missingEditions.join("; ")}. No silent fallback was applied.`,
+      );
+    }
+    console.log(
+      `[Navigator] IMS proceeding without unavailable editions: ${grounding.missingEditions.join("; ")}`,
+    );
+  }
+
   const generation_instructions = buildGenerationInstructions({
     orgContext: organization_context,
     structured,
@@ -146,6 +201,10 @@ const generateISO = async (payload: any = {}) => {
     language,
     groundingExcerpt: grounding.excerpt || undefined,
     instructionsGroundingCap: INSTRUCTIONS_GROUNDING_CAP,
+    isIms: grounding.isIms || isIms,
+    imsGuideTitle: grounding.imsGuideTitle,
+    imsGuideAvailable: grounding.imsGuideAvailable,
+    missingEditions: grounding.missingEditions,
   });
 
   const folded = foldInstructionsIntoPayload({
@@ -187,6 +246,12 @@ const generateISO = async (payload: any = {}) => {
     document_taxonomy,
     iso_standard: specific_requirements,
     grounded_standard: grounding.standardTitle,
+    ims_guide_title: grounding.imsGuideTitle,
+    ims_guide_available: isIms ? grounding.imsGuideAvailable === true : undefined,
+    missing_editions:
+      grounding.missingEditions && grounding.missingEditions.length > 0
+        ? grounding.missingEditions
+        : undefined,
     fallbackTitle: document_title,
   };
 
@@ -1243,7 +1308,24 @@ const getISOSuggestions = async (payload: any = {}) => {
       select: { title: true },
       take: 200,
     });
-    return applyLatestLibraryEditionsToPayload(response.data, library);
+    const sourceText = [
+      payload.category,
+      payload.organization_context,
+      payload.context,
+      typeof payload.organization_context === "object"
+        ? JSON.stringify(payload.organization_context)
+        : "",
+    ]
+      .filter(Boolean)
+      .join(" ");
+    // 1) Remap editions to latest ACTIVE library (IMS-safe multi-token rewrite)
+    // 2) Ensure IMS suggestion is present when multiple standards apply
+    const withEditions = applyLatestLibraryEditionsToPayload(
+      response.data,
+      library,
+      { dropUnavailableFamilies: true },
+    );
+    return ensureNavigatorImsSuggestions(withEditions, sourceText, library);
   } catch (error: any) {
     if (error?.code === "ECONNABORTED") {
       throw new ApiError(

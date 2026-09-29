@@ -22,6 +22,9 @@ export type NormalizedNavigatorDocument = {
     document_taxonomy?: string;
     iso_standard?: string;
     grounded_standard?: string;
+    ims_guide_title?: string;
+    ims_guide_available?: boolean;
+    missing_editions?: string[];
   };
   iso_clauses_referenced: string[];
   generation_timestamp: string;
@@ -370,6 +373,9 @@ export function normalizeNavigatorResponse(
     document_taxonomy?: string;
     iso_standard?: string;
     grounded_standard?: string;
+    ims_guide_title?: string;
+    ims_guide_available?: boolean;
+    missing_editions?: string[];
     fallbackTitle: string;
   },
 ): NormalizedNavigatorDocument {
@@ -457,6 +463,9 @@ export function normalizeNavigatorResponse(
       document_taxonomy: meta.document_taxonomy,
       iso_standard: meta.iso_standard,
       grounded_standard: meta.grounded_standard,
+      ims_guide_title: meta.ims_guide_title,
+      ims_guide_available: meta.ims_guide_available,
+      missing_editions: meta.missing_editions,
     },
     iso_clauses_referenced: extractClauses(payload, meta.clause),
     generation_timestamp:

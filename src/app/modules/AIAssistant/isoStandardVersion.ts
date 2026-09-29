@@ -47,10 +47,23 @@ export function extractIsoFamilyKey(value: string): string | null {
   return parseIsoEdition(value)?.familyKey || null;
 }
 
-export function pickLatestStandardFromList<T extends { title: string }>(
+/** Prefer the actual requirements standard over guidance/companion PDFs. */
+function titlePreference(title: string): number {
+  const t = title.toLowerCase();
+  if (/requirements/.test(t) && !/how to use|guidance|small enterprises|principles/.test(t)) {
+    return 4;
+  }
+  if (/quality management systems|environmental management|occupational/.test(t)) {
+    return 3;
+  }
+  if (/how to use|guidance|principles|small enterprises/.test(t)) return 1;
+  return 2;
+}
+
+function familyCandidates<T extends { title: string }>(
   standards: T[],
   needle: string,
-): { selected: T; family: string; availableYears: number[]; selectedYear: number | null } | null {
+): { candidates: T[]; needleParsed: ParsedIsoEdition | null; availableYears: number[] } {
   const needleParsed = parseIsoEdition(needle);
   const needleKey = normalizeStandardKey(needle);
 
@@ -72,26 +85,21 @@ export function pickLatestStandardFromList<T extends { title: string }>(
         );
       });
 
-  if (!candidates.length) return null;
-
   const availableYears = candidates
     .map((s) => parseIsoEdition(s.title)?.year)
     .filter((y): y is number => typeof y === "number");
 
-  /** Prefer the actual requirements standard over guidance/companion PDFs. */
-  const titlePreference = (title: string): number => {
-    const t = title.toLowerCase();
-    if (/requirements/.test(t) && !/how to use|guidance|small enterprises|principles/.test(t)) {
-      return 4;
-    }
-    if (/quality management systems|environmental management|occupational/.test(t)) {
-      return 3;
-    }
-    if (/how to use|guidance|principles|small enterprises/.test(t)) return 1;
-    return 2;
+  return {
+    candidates,
+    needleParsed,
+    availableYears: [...new Set(availableYears)].sort((a, b) => a - b),
   };
+}
 
-  const dated = candidates
+function pickPreferredFromCandidates<T extends { title: string }>(
+  candidates: T[],
+): T {
+  return [...candidates]
     .map((s) => ({
       std: s,
       year: parseIsoEdition(s.title)?.year ?? null,
@@ -103,26 +111,124 @@ export function pickLatestStandardFromList<T extends { title: string }>(
       if (by !== ay) return by - ay;
       if (b.pref !== a.pref) return b.pref - a.pref;
       return b.std.title.localeCompare(a.std.title);
-    });
+    })[0].std;
+}
 
-  const selected = dated[0].std;
-  const family = parseIsoEdition(selected.title)?.familyLabel || needleParsed?.familyLabel || selected.title;
+export type LibraryEditionResolve<T extends { title: string }> =
+  | {
+      ok: true;
+      selected: T;
+      family: string;
+      availableYears: number[];
+      selectedYear: number | null;
+      exactYearMatched: boolean;
+    }
+  | {
+      ok: false;
+      reason: "not_found" | "edition_unavailable";
+      family?: string;
+      requestedYear?: number;
+      availableYears: number[];
+    };
+
+/**
+ * Resolve a library ISO document for Navigator generation.
+ * When the needle includes an explicit year (e.g. ISO 9001:2026), that year
+ * must exist — never silently substitute an older/newer edition.
+ * When no year is given, the newest library edition for the family is used.
+ */
+export function resolveLibraryStandardEdition<T extends { title: string }>(
+  standards: T[],
+  needle: string,
+): LibraryEditionResolve<T> {
+  const { candidates, needleParsed, availableYears } = familyCandidates(
+    standards,
+    needle,
+  );
+
+  if (!candidates.length) {
+    return {
+      ok: false,
+      reason: "not_found",
+      family: needleParsed?.familyLabel,
+      requestedYear: needleParsed?.year ?? undefined,
+      availableYears: [],
+    };
+  }
+
+  const family =
+    needleParsed?.familyLabel ||
+    parseIsoEdition(candidates[0].title)?.familyLabel ||
+    candidates[0].title;
+
+  if (needleParsed?.year != null) {
+    const exact = candidates.filter(
+      (s) => parseIsoEdition(s.title)?.year === needleParsed.year,
+    );
+    if (!exact.length) {
+      return {
+        ok: false,
+        reason: "edition_unavailable",
+        family,
+        requestedYear: needleParsed.year,
+        availableYears,
+      };
+    }
+    const selected = pickPreferredFromCandidates(exact);
+    return {
+      ok: true,
+      selected,
+      family,
+      availableYears,
+      selectedYear: needleParsed.year,
+      exactYearMatched: true,
+    };
+  }
+
+  const selected = pickPreferredFromCandidates(candidates);
+  return {
+    ok: true,
+    selected,
+    family,
+    availableYears,
+    selectedYear: parseIsoEdition(selected.title)?.year ?? null,
+    exactYearMatched: false,
+  };
+}
+
+export function pickLatestStandardFromList<T extends { title: string }>(
+  standards: T[],
+  needle: string,
+): { selected: T; family: string; availableYears: number[]; selectedYear: number | null } | null {
+  const { candidates, needleParsed, availableYears } = familyCandidates(
+    standards,
+    needle,
+  );
+  if (!candidates.length) return null;
+
+  const selected = pickPreferredFromCandidates(candidates);
+  const family =
+    parseIsoEdition(selected.title)?.familyLabel ||
+    needleParsed?.familyLabel ||
+    selected.title;
 
   return {
     selected,
     family,
-    availableYears: [...new Set(availableYears)].sort((a, b) => a - b),
-    selectedYear: dated[0].year,
+    availableYears,
+    selectedYear: parseIsoEdition(selected.title)?.year ?? null,
   };
 }
 
 export function rewriteStandardLabelToLatest(
   label: string,
   standards: Array<{ title: string }>,
+  options?: { dropUnavailableFamilies?: boolean },
 ): string {
   const text = (label || "").trim();
   if (!text || !standards.length) return label;
 
+  const dropUnavailable = options?.dropUnavailableFamilies === true;
   const globalRe = new RegExp(ISO_EDITION_RE.source, "gi");
   const matches = [...text.matchAll(globalRe)];
   const familyKeys = new Set(
@@ -134,6 +240,33 @@ export function rewriteStandardLabelToLatest(
   // Integrated / multi-standard criteria (e.g. ISO 9001 + ISO 14001 + ISO 45001):
   // rewrite each ISO token in place — never replace the whole string with one standard.
   if (familyKeys.size > 1) {
+    if (dropUnavailable) {
+      const kept: string[] = [];
+      for (const m of matches) {
+        const picked = pickLatestStandardFromList(standards, m[0]);
+        if (!picked) continue;
+        const year = picked.selectedYear;
+        kept.push(year ? `${picked.family}:${year}` : picked.family);
+      }
+      if (!kept.length) return label;
+      if (/integrated\s+management|\bims\b/i.test(text)) {
+        return `Integrated Management Systems (${kept.join(", ")})`;
+      }
+      // Rebuild a parenthetical / comma list when the original was multi-token prose
+      return text.replace(globalRe, (match) => {
+        const picked = pickLatestStandardFromList(standards, match);
+        if (!picked) return "";
+        const year = picked.selectedYear;
+        return year ? `${picked.family}:${year}` : picked.family;
+      })
+        .replace(/\(\s*,/g, "(")
+        .replace(/,\s*,+/g, ",")
+        .replace(/,\s*\)/g, ")")
+        .replace(/\(\s*\)/g, "")
+        .replace(/\s{2,}/g, " ")
+        .trim();
+    }
+
     return text.replace(globalRe, (match) => {
       const picked = pickLatestStandardFromList(standards, match);
       if (!picked) return match;
@@ -173,8 +306,12 @@ function walkSuggestions(node: any, rewrite: (label: string) => string): any {
 export function applyLatestLibraryEditionsToPayload(
   payload: any,
   standards: Array<{ title: string }>,
+  options?: { dropUnavailableFamilies?: boolean },
 ): any {
   if (!payload || typeof payload !== "object" || !standards.length) return payload;
-  const rewrite = (label: string) => rewriteStandardLabelToLatest(label, standards);
+  const rewrite = (label: string) =>
+    rewriteStandardLabelToLatest(label, standards, {
+      dropUnavailableFamilies: options?.dropUnavailableFamilies === true,
+    });
   return walkSuggestions(payload, rewrite);
 }
