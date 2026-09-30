@@ -48,15 +48,36 @@ const extractPdfTextFromUrl = async (
   url: string,
   options?: { timeoutMs?: number; maxChars?: number },
 ) => {
+  const timeoutMs = options?.timeoutMs ?? 25000;
+  const maxChars = options?.maxChars ?? 4000;
   try {
-    const response = await axios.get(url, {
-      responseType: "arraybuffer",
-      timeout: options?.timeoutMs,
-    });
+    const work = (async () => {
+      const response = await axios.get(url, {
+        responseType: "arraybuffer",
+        timeout: timeoutMs,
+        // Bound download size — full ISO PDFs can be tens of MB
+        maxContentLength: 8 * 1024 * 1024,
+        maxBodyLength: 8 * 1024 * 1024,
+      });
 
-    const text = await extractPdfTextFromBuffer(Buffer.from(response.data));
-    const maxChars = options?.maxChars ?? 4000;
-    return text.slice(0, maxChars);
+      const text = await extractPdfTextFromBuffer(Buffer.from(response.data));
+      return text.slice(0, maxChars);
+    })();
+
+    // Hard ceiling includes parse time (axios timeout only covers download).
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const raced = await Promise.race([
+      work,
+      new Promise<string>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`PDF extract timed out after ${timeoutMs}ms`)),
+          timeoutMs,
+        );
+      }),
+    ]).finally(() => {
+      if (timer) clearTimeout(timer);
+    });
+    return raced;
   } catch (error) {
     console.log("PDF parse failed", error);
     return "";

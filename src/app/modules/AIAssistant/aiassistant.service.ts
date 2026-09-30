@@ -1001,12 +1001,35 @@ const getAuditStep = async (payload: any = {}) => {
     );
   }
 
+  const t0 = Date.now();
+  const mark = (phase: string, startedAt: number) => {
+    console.log(
+      `[AuditLens][timing] step=${stepNumber} ${phase}=${Date.now() - startedAt}ms elapsed=${Date.now() - t0}ms`,
+    );
+  };
+
   const meta = AUDIT_STEP_META[stepNumber];
   const stepTitle = String(payload.step_title || payload.stepTitle || meta?.title || "").trim();
   const stage = String(payload.stage || meta?.stage || "Plan").trim();
   let lockedContext = payload.locked_context ?? payload.lockedContext ?? {};
 
+  // Case Study is independent of edition remap + PDF grounding — start immediately
+  // so it overlaps remap, grounding, and /audit-lens/step.
+  const casePromise = generateAuditCaseStudyViaChat({
+    stepNumber,
+    stepTitle: stepTitle || meta.title,
+    stage,
+    lockedContext,
+  }).catch((err: any) => {
+    console.warn(
+      "[AuditLens] Case Study /chat fill failed:",
+      err?.message || err,
+    );
+    return "";
+  });
+
   // Align locked criteria/standard labels with latest ACTIVE library edition
+  const tLib = Date.now();
   try {
     const library = await prisma.iSOStandard.findMany({
       where: { status: "ACTIVE" },
@@ -1019,10 +1042,12 @@ const getAuditStep = async (payload: any = {}) => {
   } catch {
     // never block on edition remap
   }
+  mark("library_remap", tLib);
 
   // Bounded library grounding — run ISO + guideline retrieval in parallel
   let groundingExcerpt = "";
   let guidelineExcerpt = "";
+  const tGround = Date.now();
   try {
     const criteria = String(
       (typeof lockedContext === "object" &&
@@ -1040,11 +1065,14 @@ const getAuditStep = async (payload: any = {}) => {
         "",
     ).trim();
 
-    const [grounding, guideline] = await Promise.all([
+    const groundingWork = Promise.all([
       criteria.length >= 5
         ? getNavigatorGroundingExcerpt({
             specificRequirements: criteria,
             clause: clause || undefined,
+            // Audit Lens already pulls ISO + 19011 guideline in parallel —
+            // skip extra supporting-doc PDF download on the hot path.
+            skipSupporting: true,
           })
         : Promise.resolve({ excerpt: "" }),
       getAuditGuidelineExcerpt({
@@ -1053,11 +1081,13 @@ const getAuditStep = async (payload: any = {}) => {
       }),
     ]);
 
+    const [grounding, guideline] = await groundingWork;
     groundingExcerpt = (grounding.excerpt || "").slice(0, 4000);
     guidelineExcerpt = (guideline.excerpt || "").slice(0, 2500);
   } catch {
     // never block step generation on grounding failure
   }
+  mark("grounding", tGround);
 
   const generation_instructions = buildAuditStepInstructions({
     stepNumber,
@@ -1096,11 +1126,22 @@ const getAuditStep = async (payload: any = {}) => {
       );
       return response.data;
     } catch (error: any) {
+      const detailRaw = error?.response?.data;
+      const detail =
+        typeof detailRaw === "string"
+          ? detailRaw.slice(0, 400)
+          : JSON.stringify(detailRaw ?? {}).slice(0, 400);
+      console.warn(
+        `[AuditLens] /audit-lens/step failed status=${error?.response?.status} detail=${detail}`,
+      );
       throw mapAiProxyError(error, "Audit step generation");
     }
   };
 
+  const tStep = Date.now();
   let raw = await callStep(aiPayload);
+  mark("ai_step", tStep);
+
   let normalized = normalizeAuditStepResponse(raw, {
     stepNumber,
     stepTitle: stepTitle || meta.title,
@@ -1108,11 +1149,13 @@ const getAuditStep = async (payload: any = {}) => {
   });
 
   if (!isValidAuditGuidance(normalized.guidance)) {
+    const tRetry = Date.now();
     raw = await callStep({
       ...aiPayload,
       retry: true,
       generation_instructions: `${generation_instructions}\n\nIMPORTANT: Previous response was empty or invalid. Return non-empty markdown guidance with the required Audit Step / Auditor Guidance / Audit Paper / Template / Case Study (Hypothetical) sections. Do NOT simulate conducting the audit or invent findings.`,
     });
+    mark("ai_step_retry", tRetry);
     normalized = normalizeAuditStepResponse(raw, {
       stepNumber,
       stepTitle: stepTitle || meta.title,
@@ -1121,6 +1164,8 @@ const getAuditStep = async (payload: any = {}) => {
   }
 
   if (!isValidAuditGuidance(normalized.guidance)) {
+    // Still await/cancel work — don't leave hanging promise unhandled beyond catch
+    void casePromise;
     throw new ApiError(
       httpStatus.BAD_GATEWAY,
       "Audit Lens returned empty or invalid step guidance. Please try again.",
@@ -1131,14 +1176,12 @@ const getAuditStep = async (payload: any = {}) => {
   // {guidance, template_preview, ...} work-paper content — never case_study and
   // never a "## 4. Demonstrated Case Study" heading (even on retry). The /chat
   // endpoint does return a real Case Study when asked. Fill only when missing.
+  // Case Study was started in parallel above — await residual time only.
   if (!hasAuditCaseStudyContent(normalized)) {
+    const tCase = Date.now();
     try {
-      const caseMarkdown = await generateAuditCaseStudyViaChat({
-        stepNumber,
-        stepTitle: stepTitle || meta.title,
-        stage,
-        lockedContext,
-      });
+      const caseMarkdown = await casePromise;
+      mark("ai_case_await", tCase);
       if (caseMarkdown.trim().length >= 40) {
         let body = caseMarkdown.trim();
         const sectionMatch = body.match(
@@ -1161,8 +1204,11 @@ const getAuditStep = async (payload: any = {}) => {
         err?.message || err,
       );
     }
+  } else {
+    void casePromise;
   }
 
+  mark("total", t0);
   return normalized;
 };
 

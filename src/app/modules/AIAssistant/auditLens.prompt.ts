@@ -316,6 +316,32 @@ export function sanitizeLockedContext(lockedContext: any): any {
       cleaned[key] = value;
     }
   }
+
+  // External /audit-lens/step requires these fields (422 if missing).
+  const asText = (v: unknown) =>
+    typeof v === "string" && v.trim() ? v.trim() : "";
+  if (!asText(cleaned.scope)) {
+    cleaned.scope =
+      asText(cleaned.audit_scope) ||
+      asText(cleaned.organization) ||
+      "Defined audit scope";
+  }
+  if (!asText(cleaned.objective)) {
+    cleaned.objective =
+      asText(cleaned.audit_objective) ||
+      asText(cleaned.purpose) ||
+      "Assess conformity against the selected criteria";
+  }
+  if (!asText(cleaned.criteria) && asText(cleaned.standard)) {
+    cleaned.criteria = cleaned.standard;
+  }
+  if (!asText(cleaned.organization)) {
+    cleaned.organization =
+      asText(cleaned.organization_name) ||
+      asText(cleaned.client) ||
+      "Audited organization";
+  }
+
   return cleaned;
 }
 

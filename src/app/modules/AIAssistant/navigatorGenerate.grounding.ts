@@ -102,8 +102,30 @@ function selectClauseAwareExcerpt(fullText: string, clause?: string): string {
   return text.slice(0, GROUNDING_CHAR_CAP).trim();
 }
 
+/** Process-local PDF text cache (shared library docs; not tenant-scoped). */
+const PDF_TEXT_CACHE = new Map<string, { text: string; expiresAt: number }>();
+const PDF_TEXT_CACHE_TTL_MS = 10 * 60 * 1000;
+const PDF_TEXT_CACHE_MAX = 40;
+
 async function extractPdfTextCapped(url: string, maxChars = 40000): Promise<string> {
-  return extractPdfTextFromUrl(url, { timeoutMs: 25000, maxChars });
+  const key = `${url}::${maxChars}`;
+  const hit = PDF_TEXT_CACHE.get(key);
+  if (hit && hit.expiresAt > Date.now()) {
+    return hit.text;
+  }
+  // Keep Audit/Navigator grounding responsive — fall back to description if slow.
+  const text = await extractPdfTextFromUrl(url, { timeoutMs: 8000, maxChars });
+  if (text) {
+    if (PDF_TEXT_CACHE.size >= PDF_TEXT_CACHE_MAX) {
+      const oldest = PDF_TEXT_CACHE.keys().next().value;
+      if (oldest) PDF_TEXT_CACHE.delete(oldest);
+    }
+    PDF_TEXT_CACHE.set(key, {
+      text,
+      expiresAt: Date.now() + PDF_TEXT_CACHE_TTL_MS,
+    });
+  }
+  return text;
 }
 
 /** Skip known placeholder / broken demo URLs that always 403. */
@@ -381,54 +403,74 @@ async function getMultiIsoGroundingExcerpts(params: {
   const missingEditions: string[] = [];
   let firstId: string | undefined;
 
-  for (const token of tokens.slice(0, 6)) {
-    const resolved = resolveLibraryStandardEdition(standards, token);
-    if (!resolved.ok) {
-      const label =
-        resolved.reason === "edition_unavailable" && resolved.family && resolved.requestedYear
-          ? `${resolved.family}:${resolved.requestedYear}`
-          : token;
-      const avail =
-        resolved.availableYears?.length > 0
-          ? ` (library has: ${resolved.availableYears.join(", ")})`
-          : "";
-      missingEditions.push(`${label}${avail}`);
-      console.log(
-        `[Navigator] IMS multi-ISO: unavailable "${label}" available=[${(resolved.availableYears || []).join(", ")}]`,
-      );
-      continue;
-    }
-    const match = resolved.selected;
-    if (!firstId) firstId = match.id;
-    titles.push(match.title);
-    console.log(
-      `[Navigator] IMS multi-ISO family=${resolved.family} selected=${resolved.selectedYear ?? "n/a"} exact=${resolved.exactYearMatched} id=${match.id} title=${match.title}`,
-    );
-
-    let body = "";
-    if (match.fileUrl && !isPlaceholderFileUrl(match.fileUrl)) {
-      const raw = await extractPdfTextCapped(match.fileUrl);
-      if (raw) {
-        body = selectClauseAwareExcerpt(raw, params.clause).slice(
-          0,
-          IMS_PER_STANDARD_CAP,
-        );
-      } else {
+  // Resolve + extract each standard in parallel (was sequential PDF downloads).
+  const settled = await Promise.all(
+    tokens.slice(0, 6).map(async (token) => {
+      const resolved = resolveLibraryStandardEdition(standards, token);
+      if (!resolved.ok) {
+        const label =
+          resolved.reason === "edition_unavailable" &&
+          resolved.family &&
+          resolved.requestedYear
+            ? `${resolved.family}:${resolved.requestedYear}`
+            : token;
+        const avail =
+          resolved.availableYears?.length > 0
+            ? ` (library has: ${resolved.availableYears.join(", ")})`
+            : "";
         console.log(
-          `[Navigator] IMS multi-ISO PDF extract empty for id=${match.id}; using description fallback`,
+          `[Navigator] IMS multi-ISO: unavailable "${label}" available=[${(resolved.availableYears || []).join(", ")}]`,
+        );
+        return {
+          ok: false as const,
+          missing: `${label}${avail}`,
+        };
+      }
+
+      const match = resolved.selected;
+      console.log(
+        `[Navigator] IMS multi-ISO family=${resolved.family} selected=${resolved.selectedYear ?? "n/a"} exact=${resolved.exactYearMatched} id=${match.id} title=${match.title}`,
+      );
+
+      let body = "";
+      if (match.fileUrl && !isPlaceholderFileUrl(match.fileUrl)) {
+        const raw = await extractPdfTextCapped(match.fileUrl);
+        if (raw) {
+          body = selectClauseAwareExcerpt(raw, params.clause).slice(
+            0,
+            IMS_PER_STANDARD_CAP,
+          );
+        } else {
+          console.log(
+            `[Navigator] IMS multi-ISO PDF extract empty for id=${match.id}; using description fallback`,
+          );
+        }
+      } else if (match.fileUrl && isPlaceholderFileUrl(match.fileUrl)) {
+        console.log(
+          `[Navigator] IMS multi-ISO placeholder fileUrl for id=${match.id}; using description fallback`,
         );
       }
-    } else if (match.fileUrl && isPlaceholderFileUrl(match.fileUrl)) {
-      console.log(
-        `[Navigator] IMS multi-ISO placeholder fileUrl for id=${match.id}; using description fallback`,
-      );
+      if (!body) {
+        body = (match.description || "").trim().slice(0, IMS_PER_STANDARD_CAP);
+      }
+
+      return {
+        ok: true as const,
+        id: match.id,
+        title: match.title,
+        block: body ? `ISO STANDARD (${match.title}):\n${body}` : "",
+      };
+    }),
+  );
+
+  for (const item of settled) {
+    if (!item.ok) {
+      missingEditions.push(item.missing);
+      continue;
     }
-    if (!body) {
-      body = (match.description || "").trim().slice(0, IMS_PER_STANDARD_CAP);
-    }
-    if (body) {
-      blocks.push(`ISO STANDARD (${match.title}):\n${body}`);
-    }
+    if (!firstId) firstId = item.id;
+    titles.push(item.title);
+    if (item.block) blocks.push(item.block);
   }
 
   return {
@@ -448,6 +490,8 @@ export async function getNavigatorGroundingExcerpt(params: {
   specificRequirements: string;
   clause?: string;
   documentTitle?: string;
+  /** When true, skip optional supporting Library doc PDF (faster for Audit Lens). */
+  skipSupporting?: boolean;
 }): Promise<{
   excerpt: string;
   standardTitle?: string;
@@ -460,6 +504,7 @@ export async function getNavigatorGroundingExcerpt(params: {
 }> {
   try {
     const isIms = looksLikeImsRequirement(params.specificRequirements);
+    const skipSupporting = Boolean(params.skipSupporting);
 
     if (isIms) {
       const [imsGuide, multiIso, supporting] = await Promise.all([
@@ -468,11 +513,13 @@ export async function getNavigatorGroundingExcerpt(params: {
           specificRequirements: params.specificRequirements,
           clause: params.clause,
         }),
-        getNavigatorSupportingDocExcerpt({
-          specificRequirements: params.specificRequirements,
-          documentTitle: params.documentTitle,
-          clause: params.clause,
-        }),
+        skipSupporting
+          ? Promise.resolve({ excerpt: "", title: undefined as string | undefined })
+          : getNavigatorSupportingDocExcerpt({
+              specificRequirements: params.specificRequirements,
+              documentTitle: params.documentTitle,
+              clause: params.clause,
+            }),
       ]);
 
       const imsGuideAvailable = Boolean(imsGuide.excerpt && imsGuide.title);
@@ -559,11 +606,13 @@ export async function getNavigatorGroundingExcerpt(params: {
           missingEditions: [] as string[],
         };
       })(),
-      getNavigatorSupportingDocExcerpt({
-        specificRequirements: params.specificRequirements,
-        documentTitle: params.documentTitle,
-        clause: params.clause,
-      }),
+      skipSupporting
+        ? Promise.resolve({ excerpt: "", title: undefined as string | undefined })
+        : getNavigatorSupportingDocExcerpt({
+            specificRequirements: params.specificRequirements,
+            documentTitle: params.documentTitle,
+            clause: params.clause,
+          }),
     ]);
 
     let excerpt = isoPart.excerpt || "";

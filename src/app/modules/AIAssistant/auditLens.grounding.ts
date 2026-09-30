@@ -3,9 +3,25 @@ import extractPdfTextFromUrl from "../../../helpars/pdf-parser";
 
 const EXCERPT_CAP = 3500;
 
+/** Process-local cache for shared library guideline PDFs (not tenant-scoped). */
+const GUIDELINE_PDF_CACHE = new Map<string, { text: string; expiresAt: number }>();
+const GUIDELINE_PDF_TTL_MS = 10 * 60 * 1000;
+
 async function extractPdfTextCapped(url: string, maxChars = 12000): Promise<string> {
-  const text = await extractPdfTextFromUrl(url, { timeoutMs: 20000, maxChars: maxChars * 2 });
-  return (text || "").replace(/\s+/g, " ").trim().slice(0, maxChars);
+  const key = `${url}::${maxChars}`;
+  const hit = GUIDELINE_PDF_CACHE.get(key);
+  if (hit && hit.expiresAt > Date.now()) {
+    return hit.text;
+  }
+  const raw = await extractPdfTextFromUrl(url, { timeoutMs: 8000, maxChars: maxChars * 2 });
+  const text = (raw || "").replace(/\s+/g, " ").trim().slice(0, maxChars);
+  if (text) {
+    GUIDELINE_PDF_CACHE.set(key, {
+      text,
+      expiresAt: Date.now() + GUIDELINE_PDF_TTL_MS,
+    });
+  }
+  return text;
 }
 
 /**
