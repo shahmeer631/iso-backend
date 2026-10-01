@@ -46,7 +46,14 @@ import {
 } from "./courseLearning.grounding";
 import {
   LIBRARY_BRIEF_HEADER,
+  LIBRARY_FLASHCARD_INSTRUCTION,
   buildLibraryAvailableSources,
+  buildLibraryTaskInstructions,
+  excerptIsoOverviewFromBuffer,
+  getLibraryRelatedDocumentExcerpt,
+  normalizeLibraryFlashcardDeck,
+  resolveLibraryTask,
+  sanitizeLibraryAssistantText,
 } from "./libraryStandards.grounding";
 
 const NAVIGATOR_GENERATE_TIMEOUT_MS = 120000;
@@ -473,26 +480,91 @@ const chat = async (userId: string, payload: any = {}) => {
   );
 
   // Course / Library: focused ISO clause/keyword excerpt from the same buffer (no second download).
+  const tLibraryGround = Date.now();
   const isoBufferForExcerpt =
     downloadedFile?.buffer || payload.file?.buffer || null;
+  const libraryTaskPreview =
+    finalContext?.purpose === "library_standards"
+      ? resolveLibraryTask(finalContext, questionText || "")
+      : "chat";
+  const wantsStudyOverview =
+    finalContext?.purpose === "library_standards" &&
+    libraryTaskPreview !== "chat";
+  // Library: always try a focused excerpt when PDF is available (not only when clause # mentioned).
   const wantsClauseExcerpt =
-    (finalContext?.purpose === "course_learning" ||
-      finalContext?.purpose === "library_standards") &&
-    isoBufferForExcerpt &&
-    !finalContext.iso_clause_excerpt &&
-    /\b(?:clause|cl\.?|section)\s*\d|\b\d+\.\d+/.test(questionText || "");
-  if (wantsClauseExcerpt) {
-    try {
-      const excerpt = await excerptLockedIsoFromBuffer(
-        isoBufferForExcerpt,
-        questionText,
-      );
-      if (excerpt) {
-        finalContext.iso_clause_excerpt = excerpt;
+    (finalContext?.purpose === "course_learning" &&
+      isoBufferForExcerpt &&
+      !finalContext.iso_clause_excerpt &&
+      /\b(?:clause|cl\.?|section)\s*\d|\b\d+\.\d+/.test(questionText || "")) ||
+    (finalContext?.purpose === "library_standards" &&
+      isoBufferForExcerpt &&
+      !finalContext.iso_clause_excerpt);
+
+  const isoExcerptPromise = wantsClauseExcerpt
+    ? (async () => {
+        try {
+          let excerpt = await excerptLockedIsoFromBuffer(
+            isoBufferForExcerpt,
+            questionText,
+          );
+          if (
+            !excerpt &&
+            (wantsStudyOverview || finalContext?.purpose === "library_standards")
+          ) {
+            excerpt = await excerptIsoOverviewFromBuffer(isoBufferForExcerpt);
+            if (excerpt && !wantsStudyOverview) {
+              excerpt = excerpt.slice(0, 1600);
+            }
+          }
+          return excerpt || "";
+        } catch (error) {
+          console.error("ISO clause excerpt failed:", error);
+          return "";
+        }
+      })()
+    : Promise.resolve("");
+
+  const relatedDocPromise =
+    finalContext?.purpose === "library_standards" &&
+    finalContext.isoStandard?.title &&
+    !finalContext.library_doc_excerpt
+      ? getLibraryRelatedDocumentExcerpt({
+          isoTitle: String(finalContext.isoStandard.title),
+          question: questionText,
+        }).catch((error) => {
+          console.error("Library related document excerpt failed:", error);
+          return { excerpt: "", title: undefined as string | undefined };
+        })
+      : Promise.resolve({ excerpt: "", title: undefined as string | undefined });
+
+  // Run ISO excerpt + Documents Library retrieval in parallel on Library path.
+  const [isoExcerpt, relatedDoc] = await Promise.all([
+    isoExcerptPromise,
+    relatedDocPromise,
+  ]);
+
+  if (isoExcerpt) {
+    finalContext.iso_clause_excerpt = isoExcerpt;
+  }
+  if (relatedDoc.excerpt) {
+    finalContext.library_doc_excerpt = relatedDoc.excerpt;
+    if (relatedDoc.title) {
+      const sources = Array.isArray(finalContext.available_sources)
+        ? finalContext.available_sources
+        : [];
+      if (!sources.includes(relatedDoc.title)) {
+        finalContext.available_sources = [...sources, relatedDoc.title].slice(
+          0,
+          6,
+        );
       }
-    } catch (error) {
-      console.error("ISO clause excerpt failed:", error);
     }
+  }
+
+  if (finalContext?.purpose === "library_standards") {
+    console.log(
+      `[Library][timing] grounding=${Date.now() - tLibraryGround}ms task=${libraryTaskPreview} isoExcerpt=${Boolean(finalContext.iso_clause_excerpt)} docExcerpt=${Boolean(finalContext.library_doc_excerpt)}`,
+    );
   }
 
   // Normalize message field for callAI (academy historically sent `question`)
@@ -558,11 +630,17 @@ const chat = async (userId: string, payload: any = {}) => {
         ? payload.messages
         : payload.messages?.[0]?.content || questionText || "";
 
-    const lockedIso =
+    const standardTitle =
       finalContext.isoStandard?.title ||
       (typeof finalContext.isoStandardId === "string"
-        ? `id:${finalContext.isoStandardId}`
-        : "");
+        ? "the selected ISO standard"
+        : "the selected ISO standard");
+
+    const libraryTask = resolveLibraryTask(finalContext, userQ);
+    const taskInstructions = buildLibraryTaskInstructions(
+      libraryTask,
+      standardTitle,
+    );
 
     const sourcesList = Array.isArray(finalContext.available_sources)
       ? finalContext.available_sources.join("; ")
@@ -570,17 +648,19 @@ const chat = async (userId: string, payload: any = {}) => {
 
     const brief = [
       LIBRARY_BRIEF_HEADER,
-      lockedIso ? `LOCKED ISO EDITION: ${lockedIso}` : "",
-      sourcesList
-        ? `AVAILABLE SOURCES (cite only these if needed): ${sourcesList}`
-        : "",
+      `SELECTED STANDARD: ${standardTitle}`,
+      sourcesList ? `Sources to prefer: ${sourcesList}` : "",
+      taskInstructions,
       finalContext.iso_clause_excerpt
-        ? `RELEVANT ISO EXCERPT (locked edition only):\n${String(finalContext.iso_clause_excerpt).slice(0, 1800)}`
+        ? `Source material from the selected standard:\n${String(finalContext.iso_clause_excerpt).slice(0, 1800)}`
+        : "",
+      finalContext.library_doc_excerpt
+        ? `Related reference material:\n${String(finalContext.library_doc_excerpt).slice(0, 1200)}`
         : "",
       isoFileAttachFailed || finalContext.iso_file_attached === false
-        ? "NOTE: The locked ISO PDF could not be attached for this request. Do not invent clause text; say information is unavailable if you cannot ground the answer."
+        ? "NOTE: The selected ISO PDF could not be attached for this request. Do not invent clause text; say the available source material is insufficient if you cannot ground the answer."
         : "",
-      `QUESTION: ${userQ}`,
+      `USER REQUEST: ${userQ}`,
     ]
       .filter(Boolean)
       .join("\n\n");
@@ -591,7 +671,7 @@ const chat = async (userId: string, payload: any = {}) => {
       isoStandardId: finalContext.isoStandardId || undefined,
       purpose: "library_standards",
       instruction:
-        "Answer as a Standards Library assistant using the locked ISO edition and any attached ISO document. Do not invent clauses or substitute editions. If evidence is missing, say so.",
+        "Answer as an ISO consultant using the selected ISO standard and any attached ISO document. Do not invent clauses or substitute editions. If evidence is missing, say the available source material is insufficient. Never use internal system terminology.",
     };
   }
 
@@ -613,7 +693,7 @@ const chat = async (userId: string, payload: any = {}) => {
   ) {
     if (typeof finalPayload.messages === "string") {
       finalPayload.messages +=
-        "\n\nNOTE: Locked ISO PDF could not be attached for this request. Do not invent clause text; say information is unavailable if the learning/library context is insufficient.";
+        "\n\nNOTE: The selected ISO PDF could not be attached for this request. Do not invent clause text; say the available source material is insufficient if you cannot ground the answer.";
     }
   }
 
@@ -629,13 +709,21 @@ const chat = async (userId: string, payload: any = {}) => {
     const fallback =
       finalContext?.purpose === "course_learning" ||
       finalContext?.purpose === "library_standards"
-        ? "I couldn't find sufficient information in the connected ISO standards or knowledge documents to answer that confidently."
+        ? "The available source material does not provide enough information to answer this reliably."
         : "I could not generate an answer at this time.";
     aiResponse = {
       ...(aiResponse || {}),
       response: fallback,
       sources: aiResponse?.sources || [],
     };
+  }
+
+  if (
+    typeof aiResponse?.response === "string" &&
+    (finalContext?.purpose === "library_standards" ||
+      finalContext?.purpose === "course_learning")
+  ) {
+    aiResponse.response = sanitizeLibraryAssistantText(aiResponse.response);
   }
 
   // Prefer / merge platform sources for grounded assistants
@@ -702,7 +790,6 @@ const generateFlashcards = async (userId: string | undefined, payload: any) => {
 
   let finalContext: any = {};
 
-  // 🔥 parse context
   if (typeof context === "string") {
     try {
       finalContext = JSON.parse(context);
@@ -714,27 +801,41 @@ const generateFlashcards = async (userId: string | undefined, payload: any) => {
   }
 
   const isoStandardId = finalContext?.isoStandardId;
-  let iso = null;
+  let iso: { id: string; title: string; fileUrl: string | null } | null = null;
 
-  // 🔥 fetch ISO standard info if exists
   if (isoStandardId && isValidObjectId(isoStandardId)) {
     iso = await prisma.iSOStandard.findUnique({
       where: { id: isoStandardId },
+      select: { id: true, title: true, fileUrl: true },
     });
   }
 
+  if (!iso && isoStandardId) {
+    throw new ApiError(
+      httpStatus.BAD_REQUEST,
+      "Selected ISO standard was not found for flashcard generation.",
+    );
+  }
+
+  finalContext.purpose = "library_standards";
+  if (iso?.title) {
+    finalContext.isoStandard = { title: iso.title };
+    finalContext.available_sources = buildLibraryAvailableSources(iso.title);
+  }
+  finalContext.instruction = LIBRARY_FLASHCARD_INSTRUCTION;
+
   let session = null;
 
-  // 🔥 ONLY logged user → session logic
   if (userId) {
-    // find existing session
     if (session_id && isValidObjectId(session_id)) {
       session = await prisma.chatSession.findUnique({
         where: { id: session_id },
       });
+      if (session && session.userId !== userId) {
+        throw new ApiError(httpStatus.FORBIDDEN, "Forbidden chat session");
+      }
     }
 
-    // create new session if not found
     if (!session && !session_id) {
       session = await prisma.chatSession.create({
         data: {
@@ -747,67 +848,140 @@ const generateFlashcards = async (userId: string | undefined, payload: any) => {
       });
     }
 
-    // invalid session
     if (!session) {
-      throw new Error("Invalid or expired session");
+      throw new ApiError(httpStatus.BAD_REQUEST, "Invalid or expired session");
     }
   }
 
-  // 🔥 form data
+  const difficulty = String(payload.difficulty || "advanced");
+  const numCards = String(payload.num_cards || 12);
+
+  // Related Documents Library excerpt (parallel with PDF attach prep)
+  const relatedPromise = iso?.title
+    ? getLibraryRelatedDocumentExcerpt({
+        isoTitle: iso.title,
+        question: "flashcards requirements evidence documented information",
+      }).catch(() => ({ excerpt: "", title: undefined as string | undefined }))
+    : Promise.resolve({ excerpt: "", title: undefined as string | undefined });
+
   const formData = new FormData();
+  const relatedDoc = await relatedPromise;
+  if (relatedDoc.excerpt && relatedDoc.title) {
+    finalContext.library_doc_excerpt = relatedDoc.excerpt;
+    finalContext.available_sources = [
+      ...(Array.isArray(finalContext.available_sources)
+        ? finalContext.available_sources
+        : []),
+      relatedDoc.title,
+    ].slice(0, 6);
+  }
 
-  formData.append("context", JSON.stringify(finalContext));
-  formData.append("num_cards", payload.num_cards || 8);
-  formData.append("difficulty", payload.difficulty || "intermediate");
+  formData.append(
+    "context",
+    JSON.stringify({
+      ...finalContext,
+      purpose: "library_standards",
+      isoStandardId: isoStandardId || undefined,
+      instruction: LIBRARY_FLASHCARD_INSTRUCTION,
+    }),
+  );
+  formData.append("num_cards", numCards);
+  formData.append("difficulty", difficulty);
+  formData.append(
+    "messages",
+    [
+      LIBRARY_FLASHCARD_INSTRUCTION,
+      iso?.title ? `SELECTED STANDARD: ${iso.title}` : "",
+      buildLibraryTaskInstructions("flashcards", iso?.title || "the selected ISO standard"),
+      relatedDoc.excerpt
+        ? `Related reference material:\n${relatedDoc.excerpt.slice(0, 1000)}`
+        : "",
+      `Generate ${numCards} ${difficulty} flashcards grounded in the attached standard PDF.`,
+      "Front = exam-style question; Back = concise answer; put clause/requirement in back.title only when supported by sources.",
+    ]
+      .filter(Boolean)
+      .join("\n\n"),
+  );
 
-  // 🔥 file handling (uploaded file prioritized, fallback to downloading ISO)
+  let attachedFile = false;
   if (file) {
     formData.append("file", file.buffer, {
       filename: file.originalname,
       contentType: file.mimetype,
     });
+    attachedFile = true;
   } else if (iso?.fileUrl) {
-    const fileRes = await axios.get(iso.fileUrl, {
-      responseType: "arraybuffer",
-    });
-
-    formData.append("file", Buffer.from(fileRes.data), {
-      filename: `${iso.title}.pdf`,
-    });
+    try {
+      const fileRes = await axios.get(iso.fileUrl, {
+        responseType: "arraybuffer",
+        timeout: 60000,
+        maxContentLength: 8 * 1024 * 1024,
+      });
+      formData.append("file", Buffer.from(fileRes.data), {
+        filename: `${iso.title || "standard"}.pdf`,
+      });
+      attachedFile = true;
+    } catch (error: any) {
+      console.error(
+        `[Flashcards] ISO PDF download failed id=${isoStandardId} message=${error?.message || error}`,
+      );
+    }
   }
 
-  // 🔥 AI call
-  const response = await axios.post(
-    `${process.env.AI_BASE_URL}/quiz/flashcards`,
-    formData,
-    {
-      headers: formData.getHeaders(),
-      maxBodyLength: Infinity,
-      maxContentLength: Infinity,
-    },
+  if (!attachedFile) {
+    throw new ApiError(
+      httpStatus.BAD_REQUEST,
+      "Flashcards require the selected ISO standard PDF. The file could not be loaded.",
+    );
+  }
+
+  let responseData: any;
+  try {
+    const response = await axios.post(
+      `${process.env.AI_BASE_URL}/quiz/flashcards`,
+      formData,
+      {
+        headers: formData.getHeaders(),
+        maxBodyLength: Infinity,
+        maxContentLength: Infinity,
+        timeout: 120000,
+      },
+    );
+    responseData = response.data;
+  } catch (error: any) {
+    throw mapAiProxyError(error, "Flashcard generation");
+  }
+
+  const deck = normalizeLibraryFlashcardDeck(
+    responseData,
+    iso?.title || "ISO Standard",
+    difficulty,
   );
 
-  // 🔥 save history
+  if (!deck) {
+    throw new ApiError(
+      httpStatus.BAD_GATEWAY,
+      "Flashcard generation returned an empty or invalid deck. Please try again.",
+    );
+  }
+
   if (userId && session) {
-    // Save User Request Prompt
     await prisma.chatMessage.create({
       data: {
         sessionId: session.id,
         role: "user",
-        message: `Generate ${payload.num_cards || 8} ${payload.difficulty || "intermediate"} flashcards.`,
+        message: `Generate ${numCards} ${difficulty} flashcards.`,
       },
     });
 
-    // Save Assistant Response
     await prisma.chatMessage.create({
       data: {
         sessionId: session.id,
         role: "assistant",
-        message: JSON.stringify(response.data),
+        message: JSON.stringify(deck),
       },
     });
 
-    // Update Session
     await prisma.chatSession.update({
       where: { id: session.id },
       data: { updatedAt: new Date() },
@@ -815,8 +989,8 @@ const generateFlashcards = async (userId: string | undefined, payload: any) => {
   }
 
   return {
-    ...response.data,
-    session_id: session?.id || null,
+    ...deck,
+    session_id: session?.id || deck.session_id || null,
   };
 };
 
@@ -1431,12 +1605,76 @@ const getBenchmarkAISuggestions = async (
 };
 
 const generateFollowup = async (payload: any = {}) => {
-  const response = await axios.post(
-    `${process.env.AI_BASE_URL}/quiz/followup`,
-    payload,
-  );
+  const context =
+    payload?.context && typeof payload.context === "object"
+      ? { ...payload.context }
+      : typeof payload?.context === "string"
+        ? (() => {
+            try {
+              return JSON.parse(payload.context);
+            } catch {
+              return {};
+            }
+          })()
+        : {};
 
-  return response.data;
+  const topic = String(context.topic || payload?.topic || "the selected ISO standard");
+  const enriched = {
+    ...payload,
+    context: {
+      ...context,
+      topic,
+      details: [
+        String(context.details || ""),
+        `Generate difficult exam-style follow-up questions specifically about ${topic}.`,
+        "Each question must be direct, technical, and answerable from the standard (purpose, evidence, responsibilities, documented information, implementation).",
+        "Do NOT generate open-ended coaching prompts such as: What is your scope?, What do you know about…, Can you explain…, How would you define…, What is ISO…?",
+        "Return only exam-style questions.",
+      ]
+        .filter(Boolean)
+        .join("\n"),
+    },
+    num_questions: payload?.num_questions || 5,
+  };
+
+  try {
+    const response = await axios.post(
+      `${process.env.AI_BASE_URL}/quiz/followup`,
+      enriched,
+      { timeout: 60000 },
+    );
+
+    const data = response.data;
+    const questionsRaw =
+      data?.data?.questions ||
+      data?.questions ||
+      data?.data?.followups ||
+      [];
+    if (Array.isArray(questionsRaw)) {
+      const filtered = questionsRaw
+        .map((q: any) => String(q || "").trim())
+        .filter((q: string) => {
+          if (q.length < 12) return false;
+          const lower = q.toLowerCase();
+          if (/^what is your scope\b/.test(lower)) return false;
+          if (/^what do you know\b/.test(lower)) return false;
+          if (/^can you explain\b/.test(lower)) return false;
+          if (/^how would you define\b/.test(lower)) return false;
+          if (/^tell me about\b/.test(lower)) return false;
+          if (/^what is iso\b/.test(lower)) return false;
+          return true;
+        })
+        .slice(0, 5);
+
+      if (data?.data && typeof data.data === "object") {
+        return { ...data, data: { ...data.data, questions: filtered } };
+      }
+      return { ...data, questions: filtered, data: { questions: filtered } };
+    }
+    return data;
+  } catch (error: any) {
+    throw mapAiProxyError(error, "Follow-up question generation");
+  }
 };
 
 export const AIAssistantService = {
