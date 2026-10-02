@@ -244,11 +244,26 @@ const generateFollowup = catchAsync(async (req, res) => {
   });
 });
 
+const warmLibraryIsoPdf = catchAsync(async (req, res) => {
+  const isoStandardId = String(
+    req.body?.isoStandardId || req.params?.isoStandardId || "",
+  ).trim();
+  const result = await AIAssistantService.warmLibraryIsoPdf(isoStandardId);
+
+  sendResponse(res, {
+    statusCode: 200,
+    success: true,
+    message: result.warmed ? "ISO PDF warmed" : "ISO PDF warm skipped",
+    data: result,
+  });
+});
+
 export const AIAssistantController = {
   generateISO,
   simpleChat,
   chat,
   generateFlashcards,
+  warmLibraryIsoPdf,
   getChatSessions,
   getChatHistory,
   getSessionsByISO,

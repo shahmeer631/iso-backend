@@ -2,7 +2,10 @@ import prisma from "../../../shared/prisma";
 import ApiError from "../../../errors/ApiErrors";
 import httpStatus from "http-status";
 import { userHasFeatureAccess } from "../../../helpars/effectiveAccess";
-import { extractPdfTextFromBuffer } from "../../../helpars/pdf-parser";
+import {
+  extractCachedIsoPdfText,
+  isoPdfBufferCacheKey,
+} from "./isoPdfCache";
 import { parseIsoEdition } from "./isoStandardVersion";
 
 /** Prefer lesson text; keep prompt focused and cheap. */
@@ -85,55 +88,147 @@ export function selectRelevantLessonExcerpt(
 }
 
 export function extractClauseKeyFromQuestion(question: string): string | null {
-  const m = (question || "").match(
-    /\b(?:clause|cl\.?|section)\s*(\d+(?:\.\d+){0,4})\b/i,
+  const q = question || "";
+  const m = q.match(
+    /\b(?:clause|cl\.?|section)\s*(\d+(?:\s*[.\u00B7•]\s*\d+){0,4})\b/i,
   );
-  if (m?.[1]) return m[1];
-  const bare = (question || "").match(/\b(\d+\.\d+(?:\.\d+){0,3})\b/);
-  return bare?.[1] || null;
+  if (m?.[1]) {
+    return m[1].replace(/\s*[.\u00B7•]\s*/g, ".").replace(/\s+/g, "");
+  }
+  const bare = q.match(/\b(\d+\s*[.\u00B7•]\s*\d+(?:\s*[.\u00B7•]\s*\d+){0,3})\b/);
+  if (bare?.[1]) {
+    return bare[1].replace(/\s*[.\u00B7•]\s*/g, ".").replace(/\s+/g, "");
+  }
+  return null;
+}
+
+function buildFlexibleClauseRegex(clauseKey: string): RegExp {
+  const parts = clauseKey
+    .split(".")
+    .map((p) => p.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+    .filter(Boolean);
+  const body = parts.join("\\s*[.\\u00B7•]?\\s*");
+  return new RegExp(`(?:clause\\s*)?${body}\\b`, "gi");
+}
+
+/**
+ * Prefer normative clause body over TOC / contents listings.
+ * Exported for unit verification and reuse.
+ */
+export function selectBestIsoClauseWindow(
+  text: string,
+  clauseKey: string,
+  windowCap = ISO_CLAUSE_CAP,
+): string {
+  const re = buildFlexibleClauseRegex(clauseKey);
+  const hits: number[] = [];
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) {
+    hits.push(m.index);
+    if (hits.length >= 12) break;
+  }
+  if (!hits.length) return "";
+
+  let bestStart = hits[0];
+  let bestScore = -Infinity;
+  for (const idx of hits) {
+    // Small lookback — large negative offsets pull TOC/contents into the window
+    const start = Math.max(0, idx - 120);
+    const window = text.slice(start, start + windowCap);
+    const lower = window.toLowerCase();
+    let score = 0;
+    if (/\bshall\b/.test(lower)) score += 6;
+    if (/\bshould\b/.test(lower)) score += 2;
+    if (
+      /\brequirement\b|\bdocumented information\b|\bscope\b|\bapplicab/.test(
+        lower,
+      )
+    ) {
+      score += 3;
+    }
+    // TOC / contents pages: many short numeric headings, little prose
+    const numericHits = (lower.match(/\b\d+(?:\.\d+)+\b/g) || []).length;
+    if (numericHits > 12 && !/\bshall\b/.test(lower)) score -= 10;
+    if (
+      /\bcontents\b|\btable of contents\b|\bforeword\b/.test(lower) &&
+      !/\bshall\b/.test(lower)
+    ) {
+      score -= 8;
+    }
+    // Prefer later hits slightly (body usually after TOC)
+    score += Math.min(4, hits.indexOf(idx) * 0.5);
+    // Prefer windows that start near a clause heading with surrounding prose
+    const head = lower.slice(0, 180);
+    if (/\bshall\b/.test(head) || /\bthe organization\b/.test(head)) score += 2;
+    if (score > bestScore) {
+      bestScore = score;
+      bestStart = start;
+    }
+  }
+  return text.slice(bestStart, bestStart + windowCap).trim();
+}
+
+function pickBestClauseWindow(text: string, clauseKey: string): string {
+  return selectBestIsoClauseWindow(text, clauseKey, ISO_CLAUSE_CAP);
 }
 
 /**
  * Clause-aware excerpt from already-downloaded ISO PDF buffer (no extra download).
+ * @param question user question (clause may be embedded in text)
+ * @param explicitClause optional structured clause from client context (e.g. "4.3")
  */
 export async function excerptLockedIsoFromBuffer(
   buffer: Buffer | Uint8Array,
   question: string,
+  explicitClause?: string,
+  options?: { cacheKey?: string },
 ): Promise<string> {
   try {
-    const raw = await extractPdfTextFromBuffer(buffer);
+    const cacheKey = options?.cacheKey || isoPdfBufferCacheKey(buffer);
+    const { text: raw } = await extractCachedIsoPdfText(cacheKey, buffer);
     const text = (raw || "").replace(/\s+/g, " ").trim();
     if (!text) return "";
 
-    const clauseKey = extractClauseKeyFromQuestion(question);
+    const clauseKey =
+      (explicitClause || "").replace(/[^\d.]/g, "").replace(/^\.+|\.+$/g, "") ||
+      extractClauseKeyFromQuestion(question) ||
+      "";
+
     if (clauseKey) {
-      const re = new RegExp(
-        `(?:clause\\s*)?${clauseKey.replace(/\./g, "\\.")}\\b`,
-        "i",
-      );
-      const idx = text.search(re);
-      if (idx >= 0) {
-        const start = Math.max(0, idx - 350);
-        return text.slice(start, start + ISO_CLAUSE_CAP).trim();
-      }
+      const window = pickBestClauseWindow(text, clauseKey);
+      if (window) return window;
     }
 
     // Keyword window when no clause number — keep short to avoid noise.
     const tokens = (question || "")
       .toLowerCase()
       .split(/[^a-z0-9]+/)
-      .filter((t) => t.length > 4)
-      .slice(0, 5);
-    if (tokens.length) {
+      .filter((t) => t.length > 3)
+      .slice(0, 8);
+    // Boost common requirement language so documented-evidence questions still hit body text
+    const boost = [
+      "documented",
+      "evidence",
+      "requirement",
+      "shall",
+      "scope",
+      "boundaries",
+      "applicability",
+      "information",
+    ];
+    const scoredTokens = [...new Set([...tokens, ...boost.filter((b) => (question || "").toLowerCase().includes(b))])];
+
+    if (scoredTokens.length) {
       let bestIdx = 0;
       let bestScore = 0;
-      const step = 800;
-      for (let i = 0; i < Math.min(text.length, 60000); i += step) {
+      const step = 600;
+      for (let i = 0; i < Math.min(text.length, 120000); i += step) {
         const window = text.slice(i, i + ISO_CLAUSE_CAP).toLowerCase();
         let score = 0;
-        for (const t of tokens) {
-          if (window.includes(t)) score += 1;
+        for (const t of scoredTokens) {
+          if (window.includes(t)) score += t.length >= 5 ? 1.5 : 1;
         }
+        if (/\bshall\b/.test(window)) score += 2;
         if (score > bestScore) {
           bestScore = score;
           bestIdx = i;

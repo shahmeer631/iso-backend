@@ -2,6 +2,8 @@
  * Audit Lens step metadata (must match frontend AUDIT_STEPS).
  * Do not reorder — client sequence is fixed.
  */
+import { INSTRUCTIONS_GROUNDING_CAP } from "./navigatorGenerate.grounding";
+
 export const AUDIT_STEP_META: Record<
   number,
   { title: string; stage: string; focus: string }
@@ -187,12 +189,15 @@ export function buildAuditStepInstructions(input: {
   const focus = meta?.focus || "Provide auditor guidance for this step only.";
   const ctx = summarizeLockedContext(input.lockedContext);
 
+  const groundingCap = Math.max(INSTRUCTIONS_GROUNDING_CAP, 2800);
+  const guidelineCap = 1600;
+
   const groundingBlock = input.groundingExcerpt
-    ? `STANDARD REQUIREMENT SOURCE (library edition — full text also in grounding_excerpt):\n${input.groundingExcerpt.slice(0, 1200)}`
-    : "No ISO library excerpt. Ground only on selected criteria. Do NOT invent clause numbers or editions not present in context.";
+    ? `STANDARD REQUIREMENT SOURCE (library edition — use as primary evidence for clauses/requirements):\n${input.groundingExcerpt.slice(0, groundingCap)}`
+    : "No ISO library excerpt was attached. Ground only on selected criteria labels. Do NOT invent clause numbers or editions not present in context. Prefer actionable auditor guidance over saying material is unavailable.";
 
   const guidelineBlock = input.guidelineExcerpt
-    ? `CLIENT / PLATFORM AUDITING GUIDELINE (also in guideline_excerpt — prefer this methodology over generic audit theory):\n${input.guidelineExcerpt.slice(0, 900)}`
+    ? `CLIENT / PLATFORM AUDITING GUIDELINE (prefer this methodology over generic audit theory):\n${input.guidelineExcerpt.slice(0, guidelineCap)}`
     : "No auditing-guideline excerpt. Use recognized audit practice for this step only; do not invent proprietary methodology claims.";
 
   return `ISOBrain Audit Lens — Intelligent Audit Guidance Assistant
@@ -202,6 +207,7 @@ SYSTEM ROLE (non-negotiable)
 ============================================================
 You equip a HUMAN auditor with professional, standard-grounded guidance.
 You are NOT an AI auditor. You do NOT perform, simulate, or complete the audit.
+You tell the auditor WHAT TO DO, WHEN, WHY, WHAT TO LOOK FOR, and WHICH REQUIREMENT applies.
 
 FORBIDDEN (unless the user explicitly supplied objective evidence and asked you to analyze it):
 - Claiming you interviewed employees, inspected records, visited departments, or observed processes
@@ -209,12 +215,14 @@ FORBIDDEN (unless the user explicitly supplied objective evidence and asked you 
 - Claiming documents/systems/records "exist" or "are maintained" at the organization
 - Presenting a hypothetical example as real organizational evidence
 - Inventing clause numbers or ISO editions not supported by context/grounding
+- Saying "the source material does not provide enough information" when STANDARD REQUIREMENT SOURCE or criteria are present — use them
+- Reviewing a user document as if you already audited it (unless that evidence was supplied)
 
 REQUIRED VOICE:
-- "Review… / Verify… / Check… / Ask… / Look for…"
+- "Review… / Verify… / Check… / Ask… / Look for… / Confirm whether…"
 - NEVER "We reviewed… / The organization has… / The auditor found… / Employees confirmed…"
 
-If no objective evidence was supplied: state that an audit conclusion cannot be determined without reviewing objective evidence. Do not invent a conclusion.
+If no objective evidence was supplied: state that an audit conclusion cannot be determined without reviewing objective evidence. Still provide full guidance for WHAT the auditor should do. Do not invent a conclusion.
 
 ============================================================
 DYNAMIC CONTEXT
@@ -239,6 +247,8 @@ ${guidelineBlock}
 OUTPUT REQUIREMENTS (concise — relevance over volume)
 ============================================================
 Every section must help THIS step. Prefer bullets, checklists, and short tables. No textbook filler. No repetition.
+Ground Specification / Requirement and Documented Information in the STANDARD REQUIREMENT SOURCE when present.
+Distinguish mandatory documented information vs records vs recommended evidence when the source supports that distinction.
 
 Produce markdown in the "guidance" field with EXACT H2 / H3 headings:
 
@@ -267,7 +277,8 @@ Produce markdown in the "guidance" field with EXACT H2 / H3 headings:
 Pre-fill structure; use placeholders like [Enter evidence reviewed], [Record auditor observation]. Do NOT invent findings.)
 
 ## 3. Documented Information Template
-(Only if this step needs a policy/procedure/checklist/record/form/register. Relevant to the requirement. Use placeholders for org-specific values — never fabricate names/IDs/dates.)
+(Only if this step needs a policy/procedure/checklist/record/form/register. Relevant to the requirement. Use placeholders for org-specific values — never fabricate names/IDs/dates.
+Label mandatory vs recommended where the standard supports it.)
 
 ## 4. Demonstrated Case Study
 **Demonstrated Case Study — Hypothetical Example (Not Actual Audit Evidence)**
@@ -351,6 +362,12 @@ export function foldAuditInstructionsIntoPayload(params: {
   stepTitle: string;
   stage: string;
   instructions: string;
+  /** Must be embedded in locked_context — external /audit-lens/step often ignores top-level grounding fields. */
+  groundingExcerpt?: string;
+  guidelineExcerpt?: string;
+  standardTitle?: string;
+  standardId?: string;
+  guidelineTitle?: string;
 }) {
   const locked = sanitizeLockedContext(params.lockedContext);
 
@@ -359,13 +376,46 @@ export function foldAuditInstructionsIntoPayload(params: {
     `STEP ${params.stepNumber}: ${params.stepTitle} (${params.stage})`,
     "Required: Auditor Guidance (What/When/Why/Specification/Evidence/Questions); Audit Work Paper; Documented Information Template; Demonstrated Case Study labeled Hypothetical — Not Actual Audit Evidence.",
     "Evidence phrasing: seek/verify — never invent records, interviews, findings, or compliance.",
+    "Use iso_library_excerpt / audit_guideline_excerpt inside locked_context as primary grounding when present.",
     "No unsupported certification/compliance claims. Relevance over volume.",
   ].join(" | ");
+
+  // Caps keep locked_context usable by the external service without exploding tokens.
+  const isoExcerpt = (params.groundingExcerpt || "").trim().slice(0, 3500);
+  const guideExcerpt = (params.guidelineExcerpt || "").trim().slice(0, 1800);
 
   return {
     locked_context: {
       ...locked,
       auditor_output_directive: compactDirective,
+      // Runtime-critical: external service reads locked_context more reliably than
+      // generation_instructions / grounding_excerpt top-level fields.
+      ...(params.standardTitle
+        ? { resolved_iso_standard: String(params.standardTitle).slice(0, 240) }
+        : {}),
+      ...(params.standardId
+        ? { resolved_iso_standard_id: String(params.standardId).slice(0, 64) }
+        : {}),
+      ...(isoExcerpt
+        ? {
+            iso_library_excerpt: isoExcerpt,
+            grounding_excerpt: isoExcerpt,
+          }
+        : {}),
+      ...(guideExcerpt
+        ? {
+            audit_guideline_excerpt: guideExcerpt,
+            guideline_excerpt: guideExcerpt,
+            ...(params.guidelineTitle
+              ? {
+                  audit_guideline_title: String(params.guidelineTitle).slice(
+                    0,
+                    180,
+                  ),
+                }
+              : {}),
+          }
+        : {}),
       _audit_lens_brief: {
         role: "audit_guidance_assistant_not_auditor",
         step_number: params.stepNumber,
@@ -373,6 +423,8 @@ export function foldAuditInstructionsIntoPayload(params: {
         stage: params.stage,
         must_not_simulate_audit: true,
         must_not_fabricate_evidence_or_findings: true,
+        has_iso_library_excerpt: Boolean(isoExcerpt),
+        has_guideline_excerpt: Boolean(guideExcerpt),
         required_sections: [
           "Auditor Guidance (What/When/Why/Specification/Evidence/Questions)",
           "Audit Paper",

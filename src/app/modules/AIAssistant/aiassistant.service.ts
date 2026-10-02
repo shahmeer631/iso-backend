@@ -42,6 +42,7 @@ import { getAuditGuidelineExcerpt } from "./auditLens.grounding";
 import {
   enrichCourseLearningContext,
   excerptLockedIsoFromBuffer,
+  extractClauseKeyFromQuestion,
   LEARNING_BRIEF_HEADER,
 } from "./courseLearning.grounding";
 import {
@@ -49,9 +50,12 @@ import {
   LIBRARY_FLASHCARD_INSTRUCTION,
   buildLibraryAvailableSources,
   buildLibraryTaskInstructions,
+  excerptExamStudyGroundingFromBuffer,
   excerptIsoOverviewFromBuffer,
+  filterExamStyleQuestions,
   getLibraryRelatedDocumentExcerpt,
   normalizeLibraryFlashcardDeck,
+  parseGeneratedExamQuestions,
   resolveLibraryTask,
   sanitizeLibraryAssistantText,
 } from "./libraryStandards.grounding";
@@ -62,6 +66,10 @@ import {
   sanitizeUniversalAskClientContext,
   UNIVERSAL_ASK_GREETING_REPLY,
 } from "./universalAsk.grounding";
+import {
+  getCachedIsoPdfBuffer,
+  isoPdfUrlCacheKey,
+} from "./isoPdfCache";
 
 const NAVIGATOR_GENERATE_TIMEOUT_MS = 120000;
 // Remote /discovery/iso-suggestions often exceeds 60s (LLM + ranking).
@@ -510,6 +518,28 @@ const generateTitle = (text: string) => {
     .join(" ");
 };
 
+/** User-visible session / chat labels for Expert Studio library tasks (never expose internal prompts). */
+const libraryTaskVisibleLabel = (task: string): string | null => {
+  switch (task) {
+    case "notes":
+      return "Generating notes…";
+    case "summary":
+      return "Creating summary…";
+    case "exam_questions":
+      return "Generating questions…";
+    case "quiz":
+      return "Generating quiz…";
+    case "eli5":
+      return "Explaining simply…";
+    case "flashcards":
+      return "Generating flashcards…";
+    case "starter_questions":
+      return "Suggested study questions";
+    default:
+      return null;
+  }
+};
+
 // Validate ObjectId
 const isValidObjectId = (id: string) => {
   return /^[a-fA-F0-9]{24}$/.test(id);
@@ -518,6 +548,8 @@ const isValidObjectId = (id: string) => {
 
 
 const chat = async (userId: string, payload: any = {}) => {
+  const tReq = Date.now();
+  const latency: Record<string, number> = {};
   const { messages, session_id } = payload;
 
   let session = null;
@@ -554,10 +586,35 @@ const chat = async (userId: string, payload: any = {}) => {
     console.error("Course learning context enrichment failed:", error);
   }
 
+  // Preserve / recover clause focus for Library chat (built-in chips often omit structured clause)
+  if (
+    finalContext?.purpose === "library_standards" ||
+    finalContext?.isoStandardId
+  ) {
+    const fromContext = String(
+      finalContext.clause || finalContext.clauseId || "",
+    ).trim();
+    const fromQuestion = extractClauseKeyFromQuestion(questionText || "");
+    if (!fromContext && fromQuestion) {
+      finalContext.clause = fromQuestion;
+    } else if (fromContext) {
+      finalContext.clause = fromContext.replace(/[^\d.]/g, "");
+    }
+  }
+
   const isoStandardId = finalContext?.isoStandardId;
 
+  // Resolve library task early so session title / persistence can stay user-facing
+  const earlyLibraryTask =
+    finalContext?.purpose === "library_standards"
+      ? resolveLibraryTask(finalContext, questionText || "")
+      : "chat";
+  const skipSessionPersistence =
+    earlyLibraryTask === "starter_questions" && !session_id;
+  const libraryVisibleLabel = libraryTaskVisibleLabel(earlyLibraryTask);
+
   // 🔥 2. ONLY logged user → session logic
-  if (userId) {
+  if (userId && !skipSessionPersistence) {
     // find existing session
     if (session_id && isValidObjectId(session_id)) {
       session = await prisma.chatSession.findUnique({
@@ -577,11 +634,12 @@ const chat = async (userId: string, payload: any = {}) => {
             connect: { id: userId }, // ✅ FIXED
           },
           title:
-            typeof messages === "string"
+            libraryVisibleLabel ||
+            (typeof messages === "string"
               ? generateTitle(messages)
               : typeof questionText === "string" && questionText
                 ? generateTitle(questionText)
-                : "New Chat",
+                : "New Chat"),
           isoStandardId: isoStandardId || null,
         },
       });
@@ -594,9 +652,13 @@ const chat = async (userId: string, payload: any = {}) => {
   }
 
   // 🔥 3. inject ISO data (exact selected standard — no edition substitution)
-  let downloadedFile = null;
+  let downloadedFile: { buffer: Buffer; originalname: string } | null = null;
   let isoFileAttachFailed = false;
+  let pdfCacheHit = false;
+  let pdfCacheKey: string | undefined;
+  let attachMode: "full_pdf" | "excerpt_only" | "none" = "none";
 
+  const tIso = Date.now();
   if (isoStandardId && isValidObjectId(isoStandardId)) {
     const iso = await prisma.iSOStandard.findUnique({
       where: { id: isoStandardId },
@@ -628,37 +690,38 @@ const chat = async (userId: string, payload: any = {}) => {
           "Answer based on the provided ISO document content. Be specific and avoid generic answers. Do not invent clauses or editions.";
       }
 
-      // Download file from DB if not provided by client
+      // Download file from DB if not provided by client (process-local URL cache)
       if (!payload.file && iso.fileUrl) {
-        try {
-          const fileRes = await axios.get(iso.fileUrl, {
-            responseType: "arraybuffer",
-            timeout: 60000,
-          });
-          const fileName = iso.fileUrl.split("/").pop() || "document.pdf";
-
+        const tDl = Date.now();
+        const cached = await getCachedIsoPdfBuffer(iso.fileUrl);
+        latency.pdfDownloadMs = Date.now() - tDl;
+        if (cached) {
           downloadedFile = {
-            buffer: fileRes.data,
-            originalname: fileName,
+            buffer: cached.buffer,
+            originalname: cached.originalname,
           };
+          pdfCacheHit = cached.cacheHit;
+          pdfCacheKey = isoPdfUrlCacheKey(iso.fileUrl);
           finalContext.iso_file_attached = true;
-        } catch (error: any) {
+        } else {
           isoFileAttachFailed = true;
           finalContext.iso_file_attached = false;
-          console.error(
-            `[AIChat] ISO PDF download failed id=${isoStandardId} status=${error?.response?.status || "n/a"} message=${error?.message || error}`,
-          );
         }
       } else if (payload.file) {
+        downloadedFile = payload.file;
+        pdfCacheKey = isoPdfUrlCacheKey(
+          String(iso.fileUrl || payload.file.originalname || "upload"),
+        );
         finalContext.iso_file_attached = true;
       }
     } else {
       console.error(`[AIChat] ISO standard not found id=${isoStandardId}`);
     }
   }
+  latency.isoResolveMs = Date.now() - tIso;
 
   console.log(
-    `[AIChat] purpose=${finalContext?.purpose || "general"} iso=${isoStandardId || "n/a"} fileAttached=${Boolean(downloadedFile || payload.file)} session=${session?.id || "n/a"}`,
+    `[AIChat] purpose=${finalContext?.purpose || "general"} iso=${isoStandardId || "n/a"} fileAttached=${Boolean(downloadedFile || payload.file)} session=${session?.id || "n/a"} pdfCache=${pdfCacheHit ? "hit" : "miss"}`,
   );
 
   // Course / Library: focused ISO clause/keyword excerpt from the same buffer (no second download).
@@ -682,20 +745,59 @@ const chat = async (userId: string, payload: any = {}) => {
       isoBufferForExcerpt &&
       !finalContext.iso_clause_excerpt);
 
+  const excerptOpts = pdfCacheKey ? { cacheKey: pdfCacheKey } : undefined;
+
   const isoExcerptPromise = wantsClauseExcerpt
     ? (async () => {
         try {
+          const explicitClause = String(
+            finalContext?.clause ||
+              finalContext?.clauseId ||
+              finalContext?.relevant_clause ||
+              "",
+          )
+            .replace(/[^\d.]/g, "")
+            .replace(/^\.+|\.+$/g, "");
+
+          // Exam / starter / quiz / flashcards: multi-theme requirement windows
+          if (
+            wantsStudyOverview &&
+            (libraryTaskPreview === "exam_questions" ||
+              libraryTaskPreview === "starter_questions" ||
+              libraryTaskPreview === "quiz" ||
+              libraryTaskPreview === "flashcards")
+          ) {
+            const study = await excerptExamStudyGroundingFromBuffer(
+              isoBufferForExcerpt,
+              excerptOpts,
+            );
+            if (study && study.length > 200) return study;
+          }
+
           let excerpt = await excerptLockedIsoFromBuffer(
             isoBufferForExcerpt,
             questionText,
+            explicitClause || undefined,
+            excerptOpts,
           );
           if (
             !excerpt &&
             (wantsStudyOverview || finalContext?.purpose === "library_standards")
           ) {
-            excerpt = await excerptIsoOverviewFromBuffer(isoBufferForExcerpt);
+            if (wantsStudyOverview) {
+              excerpt = await excerptExamStudyGroundingFromBuffer(
+                isoBufferForExcerpt,
+                excerptOpts,
+              );
+            }
+            if (!excerpt) {
+              excerpt = await excerptIsoOverviewFromBuffer(
+                isoBufferForExcerpt,
+                excerptOpts,
+              );
+            }
             if (excerpt && !wantsStudyOverview) {
-              excerpt = excerpt.slice(0, 1600);
+              excerpt = excerpt.slice(0, 2400);
             }
           }
           return excerpt || "";
@@ -709,14 +811,22 @@ const chat = async (userId: string, payload: any = {}) => {
   const relatedDocPromise =
     finalContext?.purpose === "library_standards" &&
     finalContext.isoStandard?.title &&
-    !finalContext.library_doc_excerpt
-      ? getLibraryRelatedDocumentExcerpt({
-          isoTitle: String(finalContext.isoStandard.title),
-          question: questionText,
-        }).catch((error) => {
-          console.error("Library related document excerpt failed:", error);
-          return { excerpt: "", title: undefined as string | undefined };
-        })
+    !finalContext.library_doc_excerpt &&
+    // Study/studio tasks rely on the selected ISO excerpt — skip secondary
+    // Documents Library PDF fetch (often 100ms–several seconds on Promise.all).
+    libraryTaskPreview === "chat"
+      ? Promise.race([
+          getLibraryRelatedDocumentExcerpt({
+            isoTitle: String(finalContext.isoStandard.title),
+            question: questionText,
+          }).catch((error) => {
+            console.error("Library related document excerpt failed:", error);
+            return { excerpt: "", title: undefined as string | undefined };
+          }),
+          new Promise<{ excerpt: string; title?: string }>((resolve) =>
+            setTimeout(() => resolve({ excerpt: "" }), 900),
+          ),
+        ])
       : Promise.resolve({ excerpt: "", title: undefined as string | undefined });
 
   // Run ISO excerpt + Documents Library retrieval in parallel on Library path.
@@ -744,10 +854,17 @@ const chat = async (userId: string, payload: any = {}) => {
   }
 
   if (finalContext?.purpose === "library_standards") {
+    const clauseHint = String(
+      finalContext?.clause ||
+        finalContext?.clauseId ||
+        extractClauseKeyFromQuestion(questionText || "") ||
+        "",
+    );
     console.log(
-      `[Library][timing] grounding=${Date.now() - tLibraryGround}ms task=${libraryTaskPreview} isoExcerpt=${Boolean(finalContext.iso_clause_excerpt)} docExcerpt=${Boolean(finalContext.library_doc_excerpt)}`,
+      `[Library][timing] grounding=${Date.now() - tLibraryGround}ms task=${libraryTaskPreview} isoExcerpt=${Boolean(finalContext.iso_clause_excerpt)} isoExcerptChars=${String(finalContext.iso_clause_excerpt || "").length} docExcerpt=${Boolean(finalContext.library_doc_excerpt)} clause=${clauseHint || "n/a"} fileAttached=${Boolean(downloadedFile || payload.file)} attachFailed=${isoFileAttachFailed} pdfCache=${pdfCacheHit ? "hit" : "miss"} downloadMs=${latency.pdfDownloadMs ?? 0}`,
     );
   }
+  latency.groundingMs = Date.now() - tLibraryGround;
 
   // Normalize message field for callAI (academy historically sent `question`)
   if (!payload.messages && questionText) {
@@ -828,20 +945,65 @@ const chat = async (userId: string, payload: any = {}) => {
       ? finalContext.available_sources.join("; ")
       : "";
 
+    const hasIsoExcerpt = Boolean(
+      finalContext.iso_clause_excerpt &&
+        String(finalContext.iso_clause_excerpt).trim().length > 40,
+    );
+    const excerptChars = String(finalContext.iso_clause_excerpt || "").trim()
+      .length;
+    // Strong excerpt already embeds the needed ISO text in the brief — skip
+    // re-uploading the full PDF to the remote AI (major latency win).
+    const excerptSufficientForAttachSkip =
+      libraryTask === "exam_questions" ||
+      libraryTask === "starter_questions" ||
+      libraryTask === "quiz" ||
+      libraryTask === "flashcards" ||
+      libraryTask === "notes" ||
+      libraryTask === "summary"
+        ? excerptChars >= 1200
+        : excerptChars >= 700;
+    const willAttachPdf =
+      Boolean(downloadedFile || payload.file) && !excerptSufficientForAttachSkip;
+    const pdfAttached = willAttachPdf || Boolean(payload.file);
+    attachMode = willAttachPdf
+      ? "full_pdf"
+      : hasIsoExcerpt
+        ? "excerpt_only"
+        : downloadedFile || payload.file
+          ? "full_pdf"
+          : "none";
+    const clauseForBrief =
+      String(finalContext.clause || finalContext.clauseId || "").trim() ||
+      extractClauseKeyFromQuestion(userQ) ||
+      "";
+
+    const excerptCap =
+      libraryTask === "exam_questions" ||
+      libraryTask === "starter_questions" ||
+      libraryTask === "quiz" ||
+      libraryTask === "flashcards"
+        ? 3600
+        : 2400;
+
     const brief = [
       LIBRARY_BRIEF_HEADER,
       `SELECTED STANDARD: ${standardTitle}`,
+      clauseForBrief ? `CLAUSE FOCUS: ${clauseForBrief}` : "",
       sourcesList ? `Sources to prefer: ${sourcesList}` : "",
       taskInstructions,
-      finalContext.iso_clause_excerpt
-        ? `Source material from the selected standard:\n${String(finalContext.iso_clause_excerpt).slice(0, 1800)}`
+      hasIsoExcerpt
+        ? `Source material from the selected standard (use this to answer — do not claim it is insufficient):\n${String(finalContext.iso_clause_excerpt).slice(0, excerptCap)}`
         : "",
       finalContext.library_doc_excerpt
         ? `Related reference material:\n${String(finalContext.library_doc_excerpt).slice(0, 1200)}`
         : "",
       isoFileAttachFailed || finalContext.iso_file_attached === false
         ? "NOTE: The selected ISO PDF could not be attached for this request. Do not invent clause text; say the available source material is insufficient if you cannot ground the answer."
-        : "",
+        : attachMode === "excerpt_only"
+          ? "NOTE: Use the source material from the selected standard provided above. Do not invent clauses."
+          : pdfAttached && !hasIsoExcerpt
+            ? "NOTE: The selected ISO standard PDF is attached. Use the attached PDF content for the selected standard/clause. Only say the source is insufficient if the PDF truly lacks the requested topic."
+            : "",
       `USER REQUEST: ${userQ}`,
     ]
       .filter(Boolean)
@@ -849,11 +1011,22 @@ const chat = async (userId: string, payload: any = {}) => {
 
     payload.messages = brief;
 
+    // Stash task for post-response validation
+    finalContext.library_task_resolved = libraryTask;
+    finalContext._attachMode = attachMode;
+
     remoteContext = {
       isoStandardId: finalContext.isoStandardId || undefined,
       purpose: "library_standards",
+      ...(clauseForBrief ? { clause: clauseForBrief } : {}),
       instruction:
-        "Answer as an ISO consultant using the selected ISO standard and any attached ISO document. Do not invent clauses or substitute editions. If evidence is missing, say the available source material is insufficient. Never use internal system terminology.",
+        libraryTask === "exam_questions" || libraryTask === "starter_questions"
+          ? `Generate difficult exam-style questions grounded ONLY in ${standardTitle} and the provided source material. No open-ended coaching prompts. No invented clauses. Never use internal system terminology.`
+          : hasIsoExcerpt
+            ? "Answer as an ISO consultant using the SELECTED STANDARD source material below. Answer the user's specific question. Do not invent clauses or substitute editions. Do not claim the source is insufficient when source material from the selected standard is provided. Never use internal system terminology."
+            : pdfAttached
+              ? "Answer as an ISO consultant using the attached selected ISO PDF. Answer the user's specific question. Do not invent clauses or substitute editions. Only say the available source material is insufficient if the attached PDF truly lacks the topic. Never use internal system terminology."
+              : "Answer as an ISO consultant using the selected ISO standard and any attached ISO document. Do not invent clauses or substitute editions. If evidence is missing, say the available source material is insufficient. Never use internal system terminology.",
     };
   }
 
@@ -864,8 +1037,23 @@ const chat = async (userId: string, payload: any = {}) => {
     session_id: session?.id || payload.session_id || undefined,
   };
 
-  if (downloadedFile) {
+  // Attach full PDF only when excerpt is weak/missing (Library), or always for course when present.
+  const libraryAttachMode = String(finalContext?._attachMode || "");
+  const shouldAttachFullPdf =
+    Boolean(downloadedFile) &&
+    (finalContext?.purpose !== "library_standards" ||
+      libraryAttachMode === "full_pdf" ||
+      !libraryAttachMode);
+
+  if (shouldAttachFullPdf && downloadedFile) {
     finalPayload.file = downloadedFile;
+    attachMode = "full_pdf";
+  } else if (
+    finalContext?.purpose === "library_standards" &&
+    downloadedFile &&
+    libraryAttachMode === "excerpt_only"
+  ) {
+    attachMode = "excerpt_only";
   } else if (
     (finalContext?.purpose === "course_learning" ||
       finalContext?.purpose === "library_standards") &&
@@ -880,7 +1068,9 @@ const chat = async (userId: string, payload: any = {}) => {
   }
 
   // 🔥 5. call AI
+  const tAi = Date.now();
   let aiResponse = await callAI(finalPayload);
+  latency.aiMs = Date.now() - tAi;
 
   // Empty / missing AI response — controlled fallback (no fabrication)
   if (
@@ -908,6 +1098,45 @@ const chat = async (userId: string, payload: any = {}) => {
     aiResponse.response = sanitizeLibraryAssistantText(aiResponse.response);
   }
 
+  // Validate / normalize exam & starter question lists (drop coaching filler)
+  if (
+    finalContext?.purpose === "library_standards" &&
+    typeof aiResponse?.response === "string"
+  ) {
+    const taskDone =
+      finalContext.library_task_resolved ||
+      resolveLibraryTask(finalContext, questionText || "");
+    if (taskDone === "starter_questions") {
+      const qs = parseGeneratedExamQuestions(aiResponse.response, 5);
+      if (qs.length >= 3) {
+        aiResponse.response = qs.map((q, i) => `${i + 1}. ${q}`).join("\n");
+        aiResponse.suggested_followups = qs;
+      }
+      console.log(
+        `[Library] starter_questions validated count=${qs.length} standard=${finalContext.isoStandard?.title || finalContext.isoStandardId || "n/a"}`,
+      );
+    } else if (taskDone === "exam_questions") {
+      const qs = parseGeneratedExamQuestions(aiResponse.response, 5);
+      if (qs.length >= 3) {
+        // Keep markdown structure but ensure suggested chips are clean
+        aiResponse.suggested_followups = qs;
+      }
+      console.log(
+        `[Library] exam_questions validated count=${qs.length} standard=${finalContext.isoStandard?.title || finalContext.isoStandardId || "n/a"}`,
+      );
+    } else {
+      // Normal Library chat: strip static/generic remote follow-up chips
+      const remoteChips = Array.isArray(aiResponse.suggested_followups)
+        ? aiResponse.suggested_followups
+        : [];
+      const cleaned = filterExamStyleQuestions(
+        remoteChips.map((q: unknown) => String(q || "")),
+        5,
+      );
+      aiResponse.suggested_followups = cleaned;
+    }
+  }
+
   // Prefer / merge platform sources for grounded assistants
   if (
     (finalContext?.purpose === "course_learning" ||
@@ -927,14 +1156,16 @@ const chat = async (userId: string, payload: any = {}) => {
     aiResponse.sources = merged.slice(0, 8);
   }
 
-  // 🔥 6. ONLY logged user → save messages
-  if (userId && session) {
+  // 🔥 6. ONLY logged user → save messages (never persist starter chip generation as a chat)
+  const tSave = Date.now();
+  if (userId && session && !skipSessionPersistence) {
     const userMessageForStore =
-      typeof messages === "string"
+      libraryVisibleLabel ||
+      (typeof messages === "string"
         ? messages
         : typeof questionText === "string" && questionText
           ? questionText
-          : JSON.stringify(messages ?? "");
+          : JSON.stringify(messages ?? ""));
 
     await prisma.chatMessage.create({
       data: {
@@ -959,6 +1190,12 @@ const chat = async (userId: string, payload: any = {}) => {
       data: { updatedAt: new Date() },
     });
   }
+  latency.saveMs = Date.now() - tSave;
+  latency.totalMs = Date.now() - tReq;
+
+  console.log(
+    `[AI LATENCY] purpose=${finalContext?.purpose || "general"} task=${finalContext?.library_task_resolved || earlyLibraryTask || "n/a"} total=${latency.totalMs}ms isoResolve=${latency.isoResolveMs || 0}ms pdfDownload=${latency.pdfDownloadMs || 0}ms pdfCache=${pdfCacheHit ? "hit" : "miss"} grounding=${latency.groundingMs || 0}ms ai=${latency.aiMs || 0}ms save=${latency.saveMs || 0}ms attach=${attachMode} excerptChars=${String(finalContext?.iso_clause_excerpt || "").length} promptChars=${String(payload.messages || "").length}`,
+  );
 
   return {
     ...aiResponse,
@@ -1094,15 +1331,13 @@ const generateFlashcards = async (userId: string | undefined, payload: any) => {
     attachedFile = true;
   } else if (iso?.fileUrl) {
     try {
-      const fileRes = await axios.get(iso.fileUrl, {
-        responseType: "arraybuffer",
-        timeout: 60000,
-        maxContentLength: 8 * 1024 * 1024,
-      });
-      formData.append("file", Buffer.from(fileRes.data), {
-        filename: `${iso.title || "standard"}.pdf`,
-      });
-      attachedFile = true;
+      const cached = await getCachedIsoPdfBuffer(iso.fileUrl);
+      if (cached) {
+        formData.append("file", cached.buffer, {
+          filename: cached.originalname || `${iso.title || "standard"}.pdf`,
+        });
+        attachedFile = true;
+      }
     } catch (error: any) {
       console.error(
         `[Flashcards] ISO PDF download failed id=${isoStandardId} message=${error?.message || error}`,
@@ -1369,21 +1604,6 @@ const getAuditStep = async (payload: any = {}) => {
   const stage = String(payload.stage || meta?.stage || "Plan").trim();
   let lockedContext = payload.locked_context ?? payload.lockedContext ?? {};
 
-  // Case Study is independent of edition remap + PDF grounding — start immediately
-  // so it overlaps remap, grounding, and /audit-lens/step.
-  const casePromise = generateAuditCaseStudyViaChat({
-    stepNumber,
-    stepTitle: stepTitle || meta.title,
-    stage,
-    lockedContext,
-  }).catch((err: any) => {
-    console.warn(
-      "[AuditLens] Case Study /chat fill failed:",
-      err?.message || err,
-    );
-    return "";
-  });
-
   // Align locked criteria/standard labels with latest ACTIVE library edition
   const tLib = Date.now();
   try {
@@ -1403,6 +1623,9 @@ const getAuditStep = async (payload: any = {}) => {
   // Bounded library grounding — run ISO + guideline retrieval in parallel
   let groundingExcerpt = "";
   let guidelineExcerpt = "";
+  let groundingStandardTitle = "";
+  let groundingStandardId = "";
+  let guidelineTitle = "";
   const tGround = Date.now();
   try {
     const criteria = String(
@@ -1420,17 +1643,37 @@ const getAuditStep = async (payload: any = {}) => {
           lockedContext.relevant_clause)) ||
         "",
     ).trim();
+    const objective = String(
+      (typeof lockedContext === "object" &&
+        (lockedContext.objective || lockedContext.objectives)) ||
+        "",
+    ).trim();
+    const queryHints = [
+      stepTitle || meta?.title || "",
+      meta?.focus || "",
+      objective,
+      clause,
+      criteria,
+    ]
+      .filter(Boolean)
+      .join(" ");
 
     const groundingWork = Promise.all([
       criteria.length >= 5
         ? getNavigatorGroundingExcerpt({
             specificRequirements: criteria,
             clause: clause || undefined,
+            documentTitle: stepTitle || meta?.title,
+            queryHints,
             // Audit Lens already pulls ISO + 19011 guideline in parallel —
             // skip extra supporting-doc PDF download on the hot path.
             skipSupporting: true,
           })
-        : Promise.resolve({ excerpt: "" }),
+        : Promise.resolve({
+            excerpt: "",
+            standardTitle: undefined as string | undefined,
+            standardId: undefined as string | undefined,
+          }),
       getAuditGuidelineExcerpt({
         criteria,
         stepTitle: stepTitle || meta?.title,
@@ -1439,11 +1682,37 @@ const getAuditStep = async (payload: any = {}) => {
 
     const [grounding, guideline] = await groundingWork;
     groundingExcerpt = (grounding.excerpt || "").slice(0, 4000);
+    groundingStandardTitle = String(grounding.standardTitle || "").trim();
+    groundingStandardId = String(grounding.standardId || "").trim();
     guidelineExcerpt = (guideline.excerpt || "").slice(0, 2500);
-  } catch {
-    // never block step generation on grounding failure
+    guidelineTitle = String(guideline.title || "").trim();
+
+    console.log(
+      `[AuditLens] grounding step=${stepNumber} criteria=${criteria.slice(0, 80)} clause=${clause || "n/a"} standardId=${groundingStandardId || "n/a"} standardTitle=${(groundingStandardTitle || "n/a").slice(0, 100)} isoChars=${groundingExcerpt.length} guidelineChars=${guidelineExcerpt.length} guidelineTitle=${(guidelineTitle || "n/a").slice(0, 80)}`,
+    );
+  } catch (error: any) {
+    console.warn(
+      `[AuditLens] grounding failed step=${stepNumber} message=${error?.message || error}`,
+    );
   }
   mark("grounding", tGround);
+
+  // Case Study overlaps /audit-lens/step — started AFTER grounding so it can use excerpts
+  const casePromise = generateAuditCaseStudyViaChat({
+    stepNumber,
+    stepTitle: stepTitle || meta.title,
+    stage,
+    lockedContext,
+    groundingExcerpt: groundingExcerpt || undefined,
+    guidelineExcerpt: guidelineExcerpt || undefined,
+    standardTitle: groundingStandardTitle || undefined,
+  }).catch((err: any) => {
+    console.warn(
+      "[AuditLens] Case Study /chat fill failed:",
+      err?.message || err,
+    );
+    return "";
+  });
 
   const generation_instructions = buildAuditStepInstructions({
     stepNumber,
@@ -1460,18 +1729,34 @@ const getAuditStep = async (payload: any = {}) => {
     stepTitle: stepTitle || meta.title,
     stage,
     instructions: generation_instructions,
+    groundingExcerpt: groundingExcerpt || undefined,
+    guidelineExcerpt: guidelineExcerpt || undefined,
+    standardTitle: groundingStandardTitle || undefined,
+    standardId: groundingStandardId || undefined,
+    guidelineTitle: guidelineTitle || undefined,
   });
 
   const aiPayload: Record<string, unknown> = {
     ...folded,
+    // Keep top-level copies for any external service that does read them
     grounding_excerpt: groundingExcerpt || undefined,
     guideline_excerpt: guidelineExcerpt || undefined,
+    resolved_iso_standard: groundingStandardTitle || undefined,
+    resolved_iso_standard_id: groundingStandardId || undefined,
   };
   Object.keys(aiPayload).forEach((key) => {
     if (aiPayload[key] === undefined || aiPayload[key] === "") {
       delete aiPayload[key];
     }
   });
+
+  console.log(
+    `[AuditLens] payload step=${stepNumber} lockedHasIsoExcerpt=${Boolean(
+      (folded.locked_context as any)?.iso_library_excerpt,
+    )} lockedHasGuideline=${Boolean(
+      (folded.locked_context as any)?.audit_guideline_excerpt,
+    )} instructionsChars=${generation_instructions.length}`,
+  );
 
   const callStep = async (body: Record<string, unknown>) => {
     try {
@@ -1577,6 +1862,9 @@ const generateAuditCaseStudyViaChat = async (params: {
   stepTitle: string;
   stage: string;
   lockedContext: any;
+  groundingExcerpt?: string;
+  guidelineExcerpt?: string;
+  standardTitle?: string;
 }): Promise<string> => {
   const ctx = params.lockedContext || {};
   const org =
@@ -1584,20 +1872,34 @@ const generateAuditCaseStudyViaChat = async (params: {
     ctx.organization_name ||
     ctx.client ||
     "the audited organization";
-  const criteria = ctx.criteria || ctx.standard || "the applicable ISO standard";
+  const criteria =
+    params.standardTitle ||
+    ctx.criteria ||
+    ctx.standard ||
+    "the applicable ISO standard";
   const scope = ctx.scope || "the defined audit scope";
+  const isoGround = (params.groundingExcerpt || "").trim().slice(0, 1800);
+  const guideGround = (params.guidelineExcerpt || "").trim().slice(0, 900);
 
   const prompt = [
     `Write an educational Demonstrated Case Study for Audit Lens step ${params.stepNumber}: ${params.stepTitle} (${params.stage}).`,
     `Setting only (do not invent real findings): organization=${org}; criteria=${criteria}; scope=${scope}.`,
+    isoGround
+      ? `Use this ISO library excerpt only as requirement context (do not invent clauses beyond it):\n${isoGround}`
+      : "",
+    guideGround ? `Optional audit methodology excerpt:\n${guideGround}` : "",
     "Use this exact markdown structure:",
     "## 4. Demonstrated Case Study",
     "**Demonstrated Case Study — Hypothetical Example (Not Actual Audit Evidence)**",
     "### The Situation",
-    "### The Complication",
-    "### The Auditor's Action",
-    "Keep it educational and hypothetical. Do not claim real interviews, inspections, or compliance outcomes.",
-  ].join("\n");
+    "### What the Auditor Checks",
+    "### Evidence the Auditor Looks For",
+    "### How the Requirement Is Applied",
+    "### What the Auditor Would Document",
+    "Keep it educational and clearly hypothetical. Do not claim real interviews, inspections, or compliance outcomes about the user's organization.",
+  ]
+    .filter(Boolean)
+    .join("\n");
 
   const formData = new FormData();
   formData.append("messages", prompt);
@@ -1608,6 +1910,8 @@ const generateAuditCaseStudyViaChat = async (params: {
       step_number: params.stepNumber,
       step_title: params.stepTitle,
       stage: params.stage,
+      standard_title: params.standardTitle || undefined,
+      has_iso_grounding: Boolean(isoGround),
     }),
   );
 
@@ -1800,7 +2104,46 @@ const generateFollowup = async (payload: any = {}) => {
           })()
         : {};
 
-  const topic = String(context.topic || payload?.topic || "the selected ISO standard");
+  const topic = String(
+    context.topic ||
+      context.standardTitle ||
+      payload?.topic ||
+      "the selected ISO standard",
+  );
+  const isoStandardId = String(
+    context.isoStandardId || payload?.isoStandardId || "",
+  ).trim();
+
+  // Prefer grounded Library chat when a standard id is available
+  if (isoStandardId && /^[a-fA-F0-9]{24}$/.test(isoStandardId)) {
+    try {
+      const grounded = await chat("", {
+        messages: [
+          "Generate exactly 5 difficult exam-style follow-up questions for this ISO standard.",
+          "Each question must be direct, technical, and answerable from the standard (purpose, evidence, responsibilities, documented information, implementation).",
+          "Do NOT generate open-ended coaching prompts such as: What is your scope?, What do you know about…, Can you explain…, How would you define…, What is ISO…?",
+          "Return only a numbered list of 5 questions.",
+        ].join(" "),
+        context: {
+          purpose: "library_standards",
+          isoStandardId,
+          library_task: "starter_questions",
+        },
+      });
+      const qs = parseGeneratedExamQuestions(
+        String(grounded?.response || ""),
+        5,
+      );
+      if (qs.length >= 3) {
+        return { success: true, data: { questions: qs }, questions: qs };
+      }
+    } catch (error: any) {
+      console.warn(
+        `[Library] grounded followup failed id=${isoStandardId} message=${error?.message || error}`,
+      );
+    }
+  }
+
   const enriched = {
     ...payload,
     context: {
@@ -1811,6 +2154,8 @@ const generateFollowup = async (payload: any = {}) => {
         `Generate difficult exam-style follow-up questions specifically about ${topic}.`,
         "Each question must be direct, technical, and answerable from the standard (purpose, evidence, responsibilities, documented information, implementation).",
         "Do NOT generate open-ended coaching prompts such as: What is your scope?, What do you know about…, Can you explain…, How would you define…, What is ISO…?",
+        'Do NOT use static chips like: "Can you give me a practical example?", "What are the common non-conformances in this area?", "How does this apply to a small organisation?", "What documentation is required?"',
+        "Do NOT ask about the learner's own organization.",
         "Return only exam-style questions.",
       ]
         .filter(Boolean)
@@ -1833,20 +2178,10 @@ const generateFollowup = async (payload: any = {}) => {
       data?.data?.followups ||
       [];
     if (Array.isArray(questionsRaw)) {
-      const filtered = questionsRaw
-        .map((q: any) => String(q || "").trim())
-        .filter((q: string) => {
-          if (q.length < 12) return false;
-          const lower = q.toLowerCase();
-          if (/^what is your scope\b/.test(lower)) return false;
-          if (/^what do you know\b/.test(lower)) return false;
-          if (/^can you explain\b/.test(lower)) return false;
-          if (/^how would you define\b/.test(lower)) return false;
-          if (/^tell me about\b/.test(lower)) return false;
-          if (/^what is iso\b/.test(lower)) return false;
-          return true;
-        })
-        .slice(0, 5);
+      const filtered = filterExamStyleQuestions(
+        questionsRaw.map((q: any) => String(q || "")),
+        5,
+      );
 
       if (data?.data && typeof data.data === "object") {
         return { ...data, data: { ...data.data, questions: filtered } };
@@ -1859,11 +2194,42 @@ const generateFollowup = async (payload: any = {}) => {
   }
 };
 
+const warmLibraryIsoPdf = async (isoStandardId: string) => {
+  if (!isoStandardId || !isValidObjectId(isoStandardId)) {
+    return { warmed: false, reason: "invalid_id" as const };
+  }
+  const t0 = Date.now();
+  const iso = await prisma.iSOStandard.findUnique({
+    where: { id: isoStandardId },
+    select: { id: true, title: true, fileUrl: true },
+  });
+  if (!iso?.fileUrl) {
+    return { warmed: false, reason: "no_file" as const };
+  }
+  const cached = await getCachedIsoPdfBuffer(iso.fileUrl);
+  if (!cached) {
+    return { warmed: false, reason: "download_failed" as const, ms: Date.now() - t0 };
+  }
+  const { extractCachedIsoPdfText, isoPdfUrlCacheKey } = await import("./isoPdfCache");
+  await extractCachedIsoPdfText(isoPdfUrlCacheKey(iso.fileUrl), cached.buffer);
+  const ms = Date.now() - t0;
+  console.log(
+    `[AI LATENCY] warmPdf id=${iso.id} cacheHit=${cached.cacheHit} ms=${ms} title=${String(iso.title || "").slice(0, 60)}`,
+  );
+  return {
+    warmed: true,
+    cacheHit: cached.cacheHit,
+    ms,
+    standardId: iso.id,
+  };
+};
+
 export const AIAssistantService = {
   generateISO,
   simpleChat,
   chat,
   generateFlashcards,
+  warmLibraryIsoPdf,
   getChatSessions,
   getChatHistory,
   getSessionsByISO,

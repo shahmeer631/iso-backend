@@ -20,7 +20,7 @@ const IMS_GUIDE_CAP = 2200;
 /** Per-standard cap when grounding multiple ISOs under IMS. */
 const IMS_PER_STANDARD_CAP = 1400;
 /** Cap when embedding grounding inside generation_instructions. */
-export const INSTRUCTIONS_GROUNDING_CAP = 1800;
+export const INSTRUCTIONS_GROUNDING_CAP = 2800;
 
 export { looksLikeImsRequirement };
 
@@ -79,7 +79,11 @@ export async function findMatchingISOStandard(specificRequirements: string) {
   return resolved.selected;
 }
 
-function selectClauseAwareExcerpt(fullText: string, clause?: string): string {
+function selectClauseAwareExcerpt(
+  fullText: string,
+  clause?: string,
+  queryHints?: string,
+): string {
   const text = (fullText || "").replace(/\s+/g, " ").trim();
   if (!text) return "";
 
@@ -96,6 +100,40 @@ function selectClauseAwareExcerpt(fullText: string, clause?: string): string {
           return text.slice(start, start + CLAUSE_WINDOW).trim();
         }
       }
+    }
+  }
+
+  // Keyword-window retrieval when no clause — prefer requirement-dense regions
+  // over PDF front matter / TOC (common failure mode for Audit Lens).
+  const hints = (queryHints || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9.\s]/g, " ")
+    .split(/\s+/)
+    .filter((w) => w.length >= 4)
+    .slice(0, 12);
+  if (hints.length >= 2 && text.length > GROUNDING_CHAR_CAP) {
+    const windowSize = CLAUSE_WINDOW;
+    const step = Math.max(400, Math.floor(windowSize / 3));
+    let bestScore = 0;
+    let bestStart = 0;
+    for (let i = 0; i + Math.min(800, windowSize) < text.length; i += step) {
+      const slice = text.slice(i, i + windowSize).toLowerCase();
+      let score = 0;
+      for (const h of hints) {
+        if (slice.includes(h)) score += 1 + Math.min(2, h.length / 8);
+      }
+      // Prefer windows that look like normative requirements
+      if (/\bshall\b/.test(slice)) score += 2;
+      if (/\bclause\b|\brequirement\b|\bdocumented information\b/.test(slice)) {
+        score += 1;
+      }
+      if (score > bestScore) {
+        bestScore = score;
+        bestStart = i;
+      }
+    }
+    if (bestScore >= 2) {
+      return text.slice(bestStart, bestStart + windowSize).trim();
     }
   }
 
@@ -380,6 +418,7 @@ export async function getNavigatorImsGuideExcerpt(): Promise<{
 async function getMultiIsoGroundingExcerpts(params: {
   specificRequirements: string;
   clause?: string;
+  queryHints?: string;
 }): Promise<{
   excerpt: string;
   titles: string[];
@@ -436,10 +475,11 @@ async function getMultiIsoGroundingExcerpts(params: {
       if (match.fileUrl && !isPlaceholderFileUrl(match.fileUrl)) {
         const raw = await extractPdfTextCapped(match.fileUrl);
         if (raw) {
-          body = selectClauseAwareExcerpt(raw, params.clause).slice(
-            0,
-            IMS_PER_STANDARD_CAP,
-          );
+          body = selectClauseAwareExcerpt(
+            raw,
+            params.clause,
+            params.queryHints,
+          ).slice(0, IMS_PER_STANDARD_CAP);
         } else {
           console.log(
             `[Navigator] IMS multi-ISO PDF extract empty for id=${match.id}; using description fallback`,
@@ -490,6 +530,8 @@ export async function getNavigatorGroundingExcerpt(params: {
   specificRequirements: string;
   clause?: string;
   documentTitle?: string;
+  /** Free-text hints (audit step, objective) to target a better PDF window. */
+  queryHints?: string;
   /** When true, skip optional supporting Library doc PDF (faster for Audit Lens). */
   skipSupporting?: boolean;
 }): Promise<{
@@ -512,6 +554,7 @@ export async function getNavigatorGroundingExcerpt(params: {
         getMultiIsoGroundingExcerpts({
           specificRequirements: params.specificRequirements,
           clause: params.clause,
+          queryHints: params.queryHints,
         }),
         skipSupporting
           ? Promise.resolve({ excerpt: "", title: undefined as string | undefined })
@@ -580,10 +623,11 @@ export async function getNavigatorGroundingExcerpt(params: {
         if (match.fileUrl && !isPlaceholderFileUrl(match.fileUrl)) {
           const raw = await extractPdfTextCapped(match.fileUrl);
           if (raw) {
-            excerpt = selectClauseAwareExcerpt(raw, params.clause).slice(
-              0,
-              GROUNDING_CHAR_CAP,
-            );
+            excerpt = selectClauseAwareExcerpt(
+              raw,
+              params.clause,
+              params.queryHints || params.documentTitle,
+            ).slice(0, GROUNDING_CHAR_CAP);
           } else {
             console.log(
               `[Navigator] ISO PDF extract empty for id=${match.id}; using description fallback`,

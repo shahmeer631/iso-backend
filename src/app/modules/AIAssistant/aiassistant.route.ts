@@ -129,6 +129,13 @@ router.post(
 );
 
 router.post(
+  "/library/warm-pdf",
+  optionalAuth(),
+  apiUsage("LIBRARY"),
+  AIAssistantController.warmLibraryIsoPdf,
+);
+
+router.post(
   "/library/flashcards",
   optionalAuth(),
   apiUsage("LIBRARY"),

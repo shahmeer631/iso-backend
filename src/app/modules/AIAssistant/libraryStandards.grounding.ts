@@ -3,7 +3,10 @@
  * Reuses the shared AIAssistant chat engine — does not create a second AI system.
  */
 
-import { extractPdfTextFromBuffer } from "../../../helpars/pdf-parser";
+import {
+  extractCachedIsoPdfText,
+  isoPdfBufferCacheKey,
+} from "./isoPdfCache";
 
 /** ISO Consultant persona for Library Ask AI / learning tools. */
 export const LIBRARY_BRIEF_HEADER = [
@@ -11,7 +14,8 @@ export const LIBRARY_BRIEF_HEADER = [
   "Speak professionally to the user. Use the actual standard name and year when known (e.g. ISO/IEC 27001:2022).",
   "Authoritative sources: the selected ISO standard PDF (when attached) and any retrieved excerpts provided below.",
   "Ground every ISO-specific claim on that material. Do not invent clauses, controls, mandatory documents, editions, or page numbers.",
-  "If the available source material is insufficient, say clearly that the available source material does not provide enough information — do not fabricate.",
+  "When Source material from the selected standard is provided, answer the user's question using that material — do not claim the source is insufficient solely because the excerpt is partial.",
+  "Only say that the available source material does not provide enough information when neither an excerpt nor the attached standard PDF gives a usable basis for the specific claim — do not fabricate.",
   "Never use internal/system wording such as: locked edition, connected edition, logged edition, connected knowledge documents, retrieved excerpt, RAG, vector store, or prompt.",
   "Prefer clear structure: short headings, bullets, and tables when helpful. Avoid walls of text.",
   "Generic model knowledge may only fill conceptual gaps when clearly labeled as general practice — never as a quotation from the standard.",
@@ -126,25 +130,43 @@ export function buildLibraryTaskInstructions(
   switch (task) {
     case "starter_questions":
       return [
-        `TASK: Propose exactly 5 short starter study questions about ${std}.`,
-        "Each question must be a difficult, direct exam-style probe of a specific requirement (purpose, evidence, responsibilities, documented information, or implementation).",
-        "Do NOT use open-ended prompts like \"What is your scope?\", \"What do you know about…\", \"Can you explain…\", or \"How would you define…\".",
-        "Return ONLY a numbered list of 5 questions (one per line). No preamble.",
+        `TASK: Propose exactly 5 difficult exam-style study questions about ${std}.`,
+        `Every question MUST be specifically about ${std} (use the selected standard name/year when natural).`,
+        "Each question must test knowledge of a concrete requirement theme from the provided source material:",
+        "- purpose/intent of a requirement",
+        "- evidence an auditor would look for",
+        "- responsibilities",
+        "- documented information",
+        "- implementation/application of a specific requirement",
+        "Cover FIVE DIFFERENT topics/clauses from the source material — do not repeat one theme.",
+        "Questions must be direct examination probes, e.g. style references only:",
+        '"What is the purpose of … under this standard?"',
+        '"What evidence demonstrates …?"',
+        '"How is … established / determined under the requirements?"',
+        "FORBIDDEN (reject these patterns):",
+        '- coaching prompts: "What is your scope?", "What do you know about…?", "Tell me about…", "How would you define…?"',
+        '- asking the learner about their own organization ("your company", "your QMS", "in your organization")',
+        '- trivial: "What is ISO…?", "What are the benefits of…?"',
+        "- inventing clause numbers not present in the source material",
+        "Return ONLY a numbered list of 5 questions (one per line). No preamble, no answers.",
       ].join("\n");
 
     case "exam_questions":
       return [
-        `TASK: Generate 5 difficult professional exam questions grounded in ${std}.`,
-        "Style: certification/examination questions — direct, specific, technically meaningful, clause/context aware.",
+        `TASK: Generate 5 difficult professional exam questions grounded ONLY in ${std} source material.`,
+        `Every question MUST clearly relate to ${std} — never another ISO family.`,
+        "Style: certification/examination questions — direct, specific, technically meaningful, challenging.",
         "Cover DIFFERENT aspects across the set (one each where the source supports it):",
         "1) Requirement understanding / interpretation",
         "2) Purpose / intent of a requirement",
         "3) Evidence an auditor would expect",
-        "4) Implementation / application in an organization",
+        "4) Implementation / application of a requirement",
         "5) Documented information / compliance expectation",
-        "Do NOT use generic open-ended coaching prompts (\"What is your scope?\", \"What do you know about…\", \"Can you explain…\", \"How would you define…\").",
-        "Do NOT invent clause numbers that are not supported by the source material.",
-        "Avoid trivial questions such as \"What is ISO…?\".",
+        "FORBIDDEN:",
+        '- open-ended coaching ("What is your scope?", "What do you know about…?", "Can you explain…?", "How would you define…?")',
+        '- questions about the learner\'s own organization ("your company", "your processes")',
+        '- trivial "What is ISO…?" / benefits questions',
+        "- inventing clause numbers or mandatory documents not supported by sources",
         "Format markdown:",
         "## Exam Questions",
         "For each: **Q1.** question text",
@@ -373,19 +395,205 @@ export function sanitizeLibraryAssistantText(text: string): string {
 }
 
 const OVERVIEW_CAP = 2800;
+/** Cap for multi-window study/exam grounding excerpts. */
+const STUDY_GROUNDING_CAP = 3600;
 
 /** Bounded overview excerpt when clause/keyword windows are unavailable. */
 export async function excerptIsoOverviewFromBuffer(
   buffer: Buffer | Uint8Array,
+  options?: { cacheKey?: string },
 ): Promise<string> {
   try {
-    const raw = await extractPdfTextFromBuffer(buffer);
-    const text = (raw || "").replace(/\s+/g, " ").trim();
+    const cacheKey = options?.cacheKey || isoPdfBufferCacheKey(buffer);
+    const { text } = await extractCachedIsoPdfText(cacheKey, buffer);
     if (!text) return "";
     return text.slice(0, OVERVIEW_CAP);
   } catch {
     return "";
   }
+}
+
+/**
+ * Multi-theme PDF windows for exam/starter question generation.
+ * Prefer requirement-dense regions over cover/TOC so 5 questions can cover different areas.
+ */
+export async function excerptExamStudyGroundingFromBuffer(
+  buffer: Buffer | Uint8Array,
+  options?: { cacheKey?: string },
+): Promise<string> {
+  try {
+    const cacheKey = options?.cacheKey || isoPdfBufferCacheKey(buffer);
+    const { text } = await extractCachedIsoPdfText(cacheKey, buffer);
+    if (!text) return "";
+
+    const themes = [
+      ["context", "interested parties", "scope", "boundaries"],
+      ["leadership", "policy", "commitment", "roles"],
+      ["planning", "risk", "opportunity", "objectives"],
+      ["support", "competence", "awareness", "communication", "documented information"],
+      ["operation", "control", "implementation", "process"],
+      ["performance", "monitoring", "audit", "management review"],
+      ["improvement", "nonconformity", "corrective", "continual"],
+    ];
+
+    const windowSize = 900;
+    const step = 700;
+    const selected: string[] = [];
+    const usedStarts = new Set<number>();
+
+    for (const theme of themes) {
+      let bestIdx = -1;
+      let bestScore = 0;
+      for (let i = 0; i < Math.min(text.length, 140000); i += step) {
+        if ([...usedStarts].some((s) => Math.abs(s - i) < windowSize / 2)) continue;
+        const win = text.slice(i, i + windowSize).toLowerCase();
+        let score = 0;
+        for (const t of theme) {
+          if (win.includes(t)) score += 2;
+        }
+        if (/\bshall\b/.test(win)) score += 3;
+        if (/\bclause\b|\brequirement\b/.test(win)) score += 1;
+        if (/\bcontents\b|\bforeword\b|\bcopyright\b/.test(win) && !/\bshall\b/.test(win)) {
+          score -= 4;
+        }
+        if (score > bestScore) {
+          bestScore = score;
+          bestIdx = i;
+        }
+      }
+      if (bestIdx >= 0 && bestScore >= 4) {
+        usedStarts.add(bestIdx);
+        selected.push(text.slice(bestIdx, bestIdx + windowSize).trim());
+      }
+      if (selected.join("\n\n").length >= STUDY_GROUNDING_CAP) break;
+    }
+
+    if (!selected.length) {
+      // Fall back: densest shall-windows
+      let bestIdx = 0;
+      let bestScore = 0;
+      for (let i = 0; i < Math.min(text.length, 100000); i += step) {
+        const win = text.slice(i, i + windowSize).toLowerCase();
+        const shallCount = (win.match(/\bshall\b/g) || []).length;
+        if (shallCount > bestScore) {
+          bestScore = shallCount;
+          bestIdx = i;
+        }
+      }
+      return text.slice(bestIdx, bestIdx + Math.min(STUDY_GROUNDING_CAP, text.length - bestIdx)).trim();
+    }
+
+    return selected.join("\n\n").slice(0, STUDY_GROUNDING_CAP);
+  } catch {
+    return "";
+  }
+}
+
+/** Detect generic / open-ended coaching questions that should not appear as exam chips. */
+export function isOpenEndedCoachingQuestion(text: string): boolean {
+  const q = String(text || "")
+    .trim()
+    .toLowerCase()
+    .replace(/^[\d\.\)\-\*]+\s*/, "")
+    .replace(/^\*+\s*q\d+\.?\**\s*/i, "");
+  if (!q || q.length < 12) return true;
+  if (
+    !/\?/.test(q) &&
+    !/^(what|how|why|which|when|where|who|describe|explain|identify|list|state|outline|distinguish)\b/i.test(
+      q,
+    )
+  ) {
+    return true;
+  }
+  return (
+    /^what is your (scope|organization|company|qms|process)\b/.test(q) ||
+    /\bin your (own )?organization\b/.test(q) ||
+    /\byour (company|organization|qms|isms|ams|scope)\b/.test(q) ||
+    /^what do you know\b/.test(q) ||
+    /^can you (give|provide|show|explain|tell|describe|help)\b/.test(q) ||
+    /^how would you (define|describe|determine your)\b/.test(q) ||
+    /^tell me about\b/.test(q) ||
+    /^what is iso\b/.test(q) ||
+    /^what are the benefits of\b/.test(q) ||
+    /^why is iso (important|useful)\b/.test(q) ||
+    /^how do you (manage|ensure|handle)\b/.test(q) ||
+    /^what is your approach\b/.test(q) ||
+    /\bpractical example\b/.test(q) ||
+    /\bcommon non-?conform/.test(q) ||
+    /\bsmall organis(?:z)?ation\b/.test(q) ||
+    /\bhow does this apply\b/.test(q) ||
+    /\bin this area\b/.test(q) ||
+    /^what documentation is required\??$/.test(q) ||
+    /^what (else|next)\b/.test(q) ||
+    /^any (tips|advice|examples)\b/.test(q)
+  );
+}
+
+/** Keep up to `limit` exam-style questions; drop coaching / trivial / duplicates. */
+export function filterExamStyleQuestions(
+  items: string[],
+  limit = 5,
+): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of items || []) {
+    let q = String(raw || "")
+      .trim()
+      .replace(/^[\d\.\)\-\*]+\s*/, "")
+      .replace(/^\*\*q\d+\.\*\*\s*/i, "")
+      .replace(/^q\d+\.\s*/i, "")
+      .replace(/^"|"$/g, "")
+      .trim();
+    if (!q || q.length < 20) continue;
+    if (/^#{1,3}\s/.test(q)) continue;
+    if (/^model answer/i.test(q)) continue;
+    if (/^relevant requirement/i.test(q)) continue;
+    if (isOpenEndedCoachingQuestion(q)) continue;
+    const looksExam =
+      /\b(requirement|evidence|clause|documented information|purpose|auditor|shall|compliance|responsibility|implementation|verify|demonstrate)\b/i.test(
+        q,
+      ) ||
+      /^(what|how|why|which|when|identify|state|outline|distinguish|explain)\b/i.test(
+        q,
+      );
+    if (!looksExam) continue;
+    const key = q
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, " ")
+      .trim()
+      .slice(0, 80);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(q);
+    if (out.length >= limit) break;
+  }
+  return out;
+}
+
+/** Parse numbered / Qn question lines from a model response. */
+export function parseGeneratedExamQuestions(markdown: string, limit = 5): string[] {
+  const lines = String(markdown || "")
+    .split(/\n+/)
+    .map((l) => l.trim())
+    .filter(Boolean);
+  const candidates: string[] = [];
+  for (const line of lines) {
+    if (/^#{1,3}\s/.test(line)) continue;
+    if (/model answer/i.test(line)) continue;
+    const m =
+      line.match(/^\*\*q\s*\d+\.\*\*\s*(.+)$/i) ||
+      line.match(/^q\s*\d+[\.:)\-]\s*(.+)$/i) ||
+      line.match(/^\d+[\.:)\-]\s*(.+)$/) ||
+      line.match(/^[\-\*]\s+(.+\?)\s*$/);
+    if (m?.[1]) {
+      candidates.push(m[1].trim());
+      continue;
+    }
+    if (/\?\s*$/.test(line) && line.length > 20) {
+      candidates.push(line);
+    }
+  }
+  return filterExamStyleQuestions(candidates, limit);
 }
 
 /** Normalize remote flashcard payloads into the frontend deck contract. */

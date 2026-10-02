@@ -21,7 +21,6 @@ import {
   resolveModuleId,
   type IsoBrainModuleId,
 } from "./isobrainModules.context";
-import axios from "axios";
 import extractPdfTextFromUrl from "../../../helpars/pdf-parser";
 
 export const UNIVERSAL_ASK_HEADER = [
@@ -336,15 +335,22 @@ async function excerptFromIsoFile(
 ): Promise<string> {
   if (!fileUrl || /example\.pdf|placeholder/i.test(fileUrl)) return "";
   try {
-    const fileRes = await axios.get(fileUrl, {
-      responseType: "arraybuffer",
-      timeout: 20000,
-    });
-    const buffer = Buffer.from(fileRes.data);
+    const {
+      getCachedIsoPdfBuffer,
+      isoPdfUrlCacheKey,
+    } = await import("./isoPdfCache");
+    const cached = await getCachedIsoPdfBuffer(fileUrl, { timeoutMs: 20000 });
+    if (!cached) return "";
     const q = clause ? `${question} clause ${clause}` : question;
-    let excerpt = await excerptLockedIsoFromBuffer(buffer, q);
+    const opts = { cacheKey: isoPdfUrlCacheKey(fileUrl) };
+    let excerpt = await excerptLockedIsoFromBuffer(
+      cached.buffer,
+      q,
+      undefined,
+      opts,
+    );
     if (!excerpt) {
-      excerpt = await excerptIsoOverviewFromBuffer(buffer);
+      excerpt = await excerptIsoOverviewFromBuffer(cached.buffer, opts);
     }
     return (excerpt || "").slice(0, 2800);
   } catch (error: any) {
