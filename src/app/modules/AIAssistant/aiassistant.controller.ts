@@ -20,7 +20,8 @@ const generateISO = catchAsync(async (req, res) => {
 });
 
 const simpleChat = catchAsync(async (req, res) => {
-  const result = await AIAssistantService.simpleChat(req.body);
+  const userId = req.user?.id;
+  const result = await AIAssistantService.simpleChat(userId, req.body);
 
   sendResponse(res, {
     statusCode: 200,

@@ -55,6 +55,13 @@ import {
   resolveLibraryTask,
   sanitizeLibraryAssistantText,
 } from "./libraryStandards.grounding";
+import {
+  buildUniversalAskGrounding,
+  isUniversalAskContext,
+  isUniversalAskGreeting,
+  sanitizeUniversalAskClientContext,
+  UNIVERSAL_ASK_GREETING_REPLY,
+} from "./universalAsk.grounding";
 
 const NAVIGATOR_GENERATE_TIMEOUT_MS = 120000;
 // Remote /discovery/iso-suggestions often exceeds 60s (LLM + ranking).
@@ -289,10 +296,180 @@ const generateISO = async (payload: any = {}) => {
   return normalized;
 };
 
-const simpleChat = async (payload: any = {}) => {
+const simpleChat = async (userId: string | undefined, payload: any = {}) => {
+  // Parse context once — used for Universal Ask routing without breaking
+  // Navigator / Audit Lens / Benchmark callers that pass their own document context.
+  let parsedContext: any = {};
+  if (typeof payload.context === "string") {
+    try {
+      parsedContext = JSON.parse(payload.context);
+    } catch {
+      parsedContext = {};
+    }
+  } else {
+    parsedContext = payload.context || {};
+  }
+
+  const questionText =
+    typeof payload.messages === "string"
+      ? payload.messages
+      : payload.messages?.[0]?.content || payload.question || "";
+
+  // ── Universal Ask AI: ground in ISO + Library before calling the shared /chat engine
+  if (isUniversalAskContext(parsedContext)) {
+    const t0 = Date.now();
+
+    // Greetings / tiny chitchat — never run RAG or return a knowledge-base miss
+    if (isUniversalAskGreeting(questionText)) {
+      console.log(
+        `[UniversalAsk] greeting total=${Date.now() - t0}ms user=${userId || "guest"}`,
+      );
+      return {
+        response: UNIVERSAL_ASK_GREETING_REPLY,
+        sources: [],
+        session_id: payload.session_id || null,
+        purpose: "universal_ask",
+        grounded: false,
+        standard_title: null,
+        standard_id: null,
+      };
+    }
+
+    const safeContext = sanitizeUniversalAskClientContext(parsedContext);
+    const grounding = await buildUniversalAskGrounding({
+      question: questionText,
+      isoStandardId:
+        typeof safeContext.isoStandardId === "string"
+          ? safeContext.isoStandardId
+          : typeof safeContext.standardId === "string"
+            ? safeContext.standardId
+            : undefined,
+      standardTitle:
+        typeof safeContext.standardTitle === "string"
+          ? safeContext.standardTitle
+          : undefined,
+      standardCode:
+        typeof safeContext.standardCode === "string"
+          ? safeContext.standardCode
+          : typeof safeContext.isoCode === "string"
+            ? safeContext.isoCode
+            : undefined,
+      standardVersion:
+        typeof safeContext.standardVersion === "string"
+          ? safeContext.standardVersion
+          : typeof safeContext.version === "string"
+            ? safeContext.version
+            : undefined,
+      clause:
+        typeof safeContext.clause === "string"
+          ? safeContext.clause
+          : typeof safeContext.clauseId === "string"
+            ? safeContext.clauseId
+            : undefined,
+      libraryContext:
+        typeof safeContext.libraryContext === "string"
+          ? safeContext.libraryContext
+          : undefined,
+      documentContext:
+        typeof safeContext.documentContext === "string"
+          ? safeContext.documentContext
+          : undefined,
+      documentId:
+        typeof safeContext.documentId === "string"
+          ? safeContext.documentId
+          : undefined,
+      organizationContext:
+        typeof safeContext.organizationContext === "string"
+          ? safeContext.organizationContext
+          : undefined,
+      conversationSnippet:
+        typeof safeContext.conversationSnippet === "string"
+          ? safeContext.conversationSnippet
+          : undefined,
+      currentModule:
+        typeof safeContext.currentModule === "string"
+          ? safeContext.currentModule
+          : undefined,
+      currentRoute:
+        typeof safeContext.currentRoute === "string"
+          ? safeContext.currentRoute
+          : undefined,
+    });
+
+    // No grounding → do not call the LLM with a fake "ISO-backed" answer
+    if (!grounding.hasGrounding) {
+      console.log(
+        `[UniversalAsk] no_grounding total=${Date.now() - t0}ms retrieval=${grounding.retrievalMs}ms user=${userId || "guest"}`,
+      );
+      return {
+        response:
+          grounding.unavailableMessage ||
+          "I couldn't find sufficiently relevant material in the connected ISOBrain knowledge base for this question. Please select an ISO standard or provide additional context.",
+        sources: [],
+        session_id: payload.session_id || null,
+        purpose: "universal_ask",
+        grounded: false,
+        standard_title: null,
+        standard_id: null,
+      };
+    }
+
+    const remoteContext = {
+      purpose: "universal_ask",
+      isoStandardId: grounding.standardId || safeContext.isoStandardId || undefined,
+      instruction:
+        "Answer as ISOBrain Universal Ask AI using only the provided REFERENCE MATERIAL (module/application context, ISO excerpts, Library documents, and workspace context). Be practical and module-aware when the user asks about ISOBrain tools. Do not invent clauses, editions, scores, or audit findings. If ISO evidence is missing for a requirements question, say the available source material is insufficient. Never use internal system terminology.",
+    };
+
+    let aiResponse: any;
+    const tAi = Date.now();
+    try {
+      aiResponse = await callAI({
+        messages: grounding.brief,
+        context: remoteContext,
+        session_id: payload.session_id || undefined,
+      });
+    } catch (error: any) {
+      console.error(
+        `[UniversalAsk] AI provider failed user=${userId || "guest"} message=${error?.message || error}`,
+      );
+      throw error;
+    }
+
+    if (
+      !aiResponse ||
+      typeof aiResponse.response !== "string" ||
+      !String(aiResponse.response).trim()
+    ) {
+      aiResponse = {
+        ...(aiResponse || {}),
+        response:
+          "The available source material does not provide enough information to answer this reliably.",
+        sources: grounding.sources,
+      };
+    } else {
+      aiResponse.response = sanitizeLibraryAssistantText(aiResponse.response);
+      // Only return sources that were actually retrieved — never remote-invented citations
+      aiResponse.sources = grounding.sources.slice(0, 8);
+    }
+
+    console.log(
+      `[UniversalAsk] total=${Date.now() - t0}ms retrieval=${grounding.retrievalMs}ms ai=${Date.now() - tAi}ms user=${userId || "guest"} standard=${grounding.standardTitle || "n/a"} sources=${(aiResponse.sources || []).length}`,
+    );
+
+    return {
+      ...aiResponse,
+      session_id: payload.session_id || null,
+      purpose: "universal_ask",
+      grounded: true,
+      standard_title: grounding.standardTitle || null,
+      standard_id: grounding.standardId || null,
+    };
+  }
+
+  // ── Default simpleChat pass-through (Navigator / Audit Lens / Benchmark)
   const formData = new FormData();
 
-  // 🔥 messages
   formData.append(
     "messages",
     typeof payload.messages === "string"
@@ -300,7 +477,6 @@ const simpleChat = async (payload: any = {}) => {
       : payload.messages?.[0]?.content || "",
   );
 
-  // 🔥 optional context
   formData.append(
     "context",
     typeof payload.context === "string"
@@ -308,12 +484,9 @@ const simpleChat = async (payload: any = {}) => {
       : JSON.stringify(payload.context || {}),
   );
 
-  // 🔥 optional session_id (AI supports but we ignore DB)
   if (payload.session_id) {
     formData.append("session_id", payload.session_id);
   }
-
-  // ❌ NO file handling (as requested)
 
   const response = await axios.post(
     `${process.env.AI_BASE_URL}/chat`,
@@ -434,9 +607,18 @@ const chat = async (userId: string, payload: any = {}) => {
         title: iso.title,
       };
 
-      // Library Ask AI: mark purpose when not already course_learning
-      if (finalContext.purpose !== "course_learning") {
+      // Library Ask AI: mark purpose when not already a specialized grounded purpose
+      if (
+        finalContext.purpose !== "course_learning" &&
+        finalContext.purpose !== "universal_ask" &&
+        finalContext.purpose !== "library_standards"
+      ) {
         finalContext.purpose = "library_standards";
+      }
+      if (
+        finalContext.purpose === "library_standards" ||
+        finalContext.purpose === "universal_ask"
+      ) {
         finalContext.available_sources = buildLibraryAvailableSources(iso.title);
       }
 

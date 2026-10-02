@@ -24,6 +24,17 @@ export function normalizeStandardKey(value: string): string {
 }
 
 /**
+ * Canonical family key so "ISO 27001" matches DB titles "ISO/IEC 27001".
+ * Strips the optional IEC qualifier between ISO and the number for equality checks.
+ */
+export function canonicalIsoFamilyKey(familyKey: string): string {
+  return normalizeStandardKey(familyKey)
+    .replace(/\biso\s+iec\s+(\d+)/g, "iso $1")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/**
  * Parse standard family + edition year from a title/code.
  * Does not invent a year when none is present.
  */
@@ -50,13 +61,17 @@ export function extractIsoFamilyKey(value: string): string | null {
 /** Prefer the actual requirements standard over guidance/companion PDFs. */
 function titlePreference(title: string): number {
   const t = title.toLowerCase();
-  if (/requirements/.test(t) && !/how to use|guidance|small enterprises|principles/.test(t)) {
+  if (/requirements/.test(t) && !/how to use|guidance|small enterprises|principles|practical guide|smes/.test(t)) {
     return 4;
   }
-  if (/quality management systems|environmental management|occupational/.test(t)) {
+  if (
+    /quality management systems|environmental management|occupational|information security management systems/.test(
+      t,
+    )
+  ) {
     return 3;
   }
-  if (/how to use|guidance|principles|small enterprises/.test(t)) return 1;
+  if (/how to use|guidance|principles|small enterprises|practical guide|smes/.test(t)) return 1;
   return 2;
 }
 
@@ -66,24 +81,35 @@ function familyCandidates<T extends { title: string }>(
 ): { candidates: T[]; needleParsed: ParsedIsoEdition | null; availableYears: number[] } {
   const needleParsed = parseIsoEdition(needle);
   const needleKey = normalizeStandardKey(needle);
+  const needleCanon = needleParsed
+    ? canonicalIsoFamilyKey(needleParsed.familyKey)
+    : "";
 
   const familyMatches = needleParsed
     ? standards.filter((s) => {
         const parsed = parseIsoEdition(s.title);
-        return parsed?.familyKey === needleParsed.familyKey;
+        if (!parsed) return false;
+        return canonicalIsoFamilyKey(parsed.familyKey) === needleCanon;
       })
     : [];
 
+  // Avoid short-needle false positives (e.g. "hi" matching titles containing "within")
+  const includeMinLen = 6;
   const candidates = familyMatches.length
     ? familyMatches
-    : standards.filter((s) => {
-        const titleKey = normalizeStandardKey(s.title);
-        return (
-          titleKey === needleKey ||
-          titleKey.includes(needleKey) ||
-          (needleKey.length >= 8 && needleKey.includes(titleKey))
-        );
-      });
+    : needleKey.length < 3
+      ? []
+      : standards.filter((s) => {
+          const titleKey = normalizeStandardKey(s.title);
+          if (titleKey === needleKey) return true;
+          if (needleKey.length >= includeMinLen && titleKey.includes(needleKey)) {
+            return true;
+          }
+          if (needleKey.length >= 8 && needleKey.includes(titleKey)) {
+            return true;
+          }
+          return false;
+        });
 
   const availableYears = candidates
     .map((s) => parseIsoEdition(s.title)?.year)
