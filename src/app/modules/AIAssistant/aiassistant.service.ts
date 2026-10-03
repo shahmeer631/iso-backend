@@ -50,10 +50,19 @@ import {
   LIBRARY_FLASHCARD_INSTRUCTION,
   buildLibraryAvailableSources,
   buildLibraryTaskInstructions,
+  computeIsoExtractCoverage,
+  excerptDocumentedInformationGroundingFromBuffer,
   excerptExamStudyGroundingFromBuffer,
   excerptIsoOverviewFromBuffer,
+  debugChunksForExcerpt,
+  excerptMultiWindowChatGroundingFromBuffer,
   filterExamStyleQuestions,
   getLibraryRelatedDocumentExcerpt,
+  isDocumentedInformationInventoryQuestion,
+  isStrongIsoFocusExcerpt,
+  IsoExtractCoverage,
+  LibraryRagChunkDebug,
+  logLibraryRagDebug,
   normalizeLibraryFlashcardDeck,
   parseGeneratedExamQuestions,
   resolveLibraryTask,
@@ -67,7 +76,9 @@ import {
   UNIVERSAL_ASK_GREETING_REPLY,
 } from "./universalAsk.grounding";
 import {
+  extractCachedIsoPdfText,
   getCachedIsoPdfBuffer,
+  isoPdfBufferCacheKey,
   isoPdfUrlCacheKey,
 } from "./isoPdfCache";
 
@@ -747,6 +758,15 @@ const chat = async (userId: string, payload: any = {}) => {
 
   const excerptOpts = pdfCacheKey ? { cacheKey: pdfCacheKey } : undefined;
 
+  const isInventoryQuestion =
+    finalContext?.purpose === "library_standards" &&
+    libraryTaskPreview === "chat" &&
+    isDocumentedInformationInventoryQuestion(questionText || "");
+  const ragDebugChunks: LibraryRagChunkDebug[] = [];
+  let libraryRetrievalMode = "none";
+  let libraryCoverage: IsoExtractCoverage | undefined;
+  let libraryExtractedPdfChars = 0;
+
   const isoExcerptPromise = wantsClauseExcerpt
     ? (async () => {
         try {
@@ -758,6 +778,47 @@ const chat = async (userId: string, payload: any = {}) => {
           )
             .replace(/[^\d.]/g, "")
             .replace(/^\.+|\.+$/g, "");
+
+          // Coverage diagnostics over FULL extracted PDF text (early/mid/late).
+          if (
+            finalContext?.purpose === "library_standards" &&
+            isoBufferForExcerpt
+          ) {
+            try {
+              const cacheKey =
+                excerptOpts?.cacheKey ||
+                isoPdfBufferCacheKey(isoBufferForExcerpt);
+              const { text } = await extractCachedIsoPdfText(
+                cacheKey,
+                isoBufferForExcerpt,
+              );
+              libraryExtractedPdfChars = (text || "").length;
+              libraryCoverage = computeIsoExtractCoverage(text || "");
+            } catch {
+              /* diagnostics must never block chat */
+            }
+          }
+
+          // Inventory / documented-information list questions: multi-window
+          // retrieval across the selected standard PDF (not a single keyword hit).
+          if (isInventoryQuestion && isoBufferForExcerpt) {
+            const inventory =
+              await excerptDocumentedInformationGroundingFromBuffer(
+                isoBufferForExcerpt,
+                questionText || "",
+                { ...excerptOpts, debug: ragDebugChunks },
+              );
+            // Only keep strong inventory excerpts; weak early-page noise must not
+            // dominate when the full PDF will be attached.
+            if (
+              inventory &&
+              inventory.length > 200 &&
+              isStrongIsoFocusExcerpt(inventory)
+            ) {
+              libraryRetrievalMode = "documented_information_inventory";
+              return inventory;
+            }
+          }
 
           // Exam / starter / quiz / flashcards: multi-theme requirement windows
           if (
@@ -771,7 +832,64 @@ const chat = async (userId: string, payload: any = {}) => {
               isoBufferForExcerpt,
               excerptOpts,
             );
-            if (study && study.length > 200) return study;
+            if (study && study.length > 200) {
+              libraryRetrievalMode = "exam_study_multi_theme";
+              return study;
+            }
+          }
+
+          // Explicit / question-embedded clause → targeted window anywhere
+          // in the full extract (not limited to early pages).
+          const clauseFromQuestion =
+            explicitClause ||
+            extractClauseKeyFromQuestion(questionText || "") ||
+            "";
+          if (clauseFromQuestion) {
+            const clauseExcerpt = await excerptLockedIsoFromBuffer(
+              isoBufferForExcerpt,
+              questionText,
+              clauseFromQuestion,
+              excerptOpts,
+            );
+            if (clauseExcerpt) {
+              libraryRetrievalMode = "clause_window";
+              try {
+                const cacheKey =
+                  excerptOpts?.cacheKey ||
+                  isoPdfBufferCacheKey(isoBufferForExcerpt);
+                const { text: fullText } = await extractCachedIsoPdfText(
+                  cacheKey,
+                  isoBufferForExcerpt,
+                );
+                const chunks = debugChunksForExcerpt(fullText, clauseExcerpt, {
+                  score: 10,
+                  clauseHint: clauseFromQuestion,
+                });
+                ragDebugChunks.length = 0;
+                ragDebugChunks.push(...chunks);
+              } catch {
+                /* page diagnostics must never block chat */
+              }
+              return clauseExcerpt;
+            }
+          }
+
+          // General Library chat: multi-window retrieval across ALL pages
+          // (not a single keyword hit that can bias toward early pages).
+          if (
+            finalContext?.purpose === "library_standards" &&
+            libraryTaskPreview === "chat" &&
+            !wantsStudyOverview
+          ) {
+            const multi = await excerptMultiWindowChatGroundingFromBuffer(
+              isoBufferForExcerpt,
+              questionText || "",
+              { ...excerptOpts, debug: ragDebugChunks },
+            );
+            if (multi && multi.length > 200 && isStrongIsoFocusExcerpt(multi)) {
+              libraryRetrievalMode = "chat_multi_window";
+              return multi;
+            }
           }
 
           let excerpt = await excerptLockedIsoFromBuffer(
@@ -780,6 +898,30 @@ const chat = async (userId: string, payload: any = {}) => {
             explicitClause || undefined,
             excerptOpts,
           );
+          if (excerpt) {
+            libraryRetrievalMode = explicitClause
+              ? "clause_window"
+              : "keyword_window";
+            if (!ragDebugChunks.length && isoBufferForExcerpt) {
+              try {
+                const cacheKey =
+                  excerptOpts?.cacheKey ||
+                  isoPdfBufferCacheKey(isoBufferForExcerpt);
+                const { text: fullText } = await extractCachedIsoPdfText(
+                  cacheKey,
+                  isoBufferForExcerpt,
+                );
+                ragDebugChunks.push(
+                  ...debugChunksForExcerpt(fullText, excerpt, {
+                    score: 5,
+                    clauseHint: clauseFromQuestion || undefined,
+                  }),
+                );
+              } catch {
+                /* ignore */
+              }
+            }
+          }
           if (
             !excerpt &&
             (wantsStudyOverview || finalContext?.purpose === "library_standards")
@@ -789,14 +931,21 @@ const chat = async (userId: string, payload: any = {}) => {
                 isoBufferForExcerpt,
                 excerptOpts,
               );
+              if (excerpt) libraryRetrievalMode = "exam_study_multi_theme";
             }
             if (!excerpt) {
               excerpt = await excerptIsoOverviewFromBuffer(
                 isoBufferForExcerpt,
                 excerptOpts,
               );
+              if (excerpt) libraryRetrievalMode = "overview_fallback";
             }
-            if (excerpt && !wantsStudyOverview) {
+            if (
+              excerpt &&
+              !wantsStudyOverview &&
+              !isInventoryQuestion &&
+              libraryRetrievalMode !== "chat_multi_window"
+            ) {
               excerpt = excerpt.slice(0, 2400);
             }
           }
@@ -808,13 +957,16 @@ const chat = async (userId: string, payload: any = {}) => {
       })()
     : Promise.resolve("");
 
+  // Inventory questions must stay grounded in the selected ISO PDF — skip
+  // secondary Documents Library material that can dilute requirements lists.
   const relatedDocPromise =
     finalContext?.purpose === "library_standards" &&
     finalContext.isoStandard?.title &&
     !finalContext.library_doc_excerpt &&
     // Study/studio tasks rely on the selected ISO excerpt — skip secondary
     // Documents Library PDF fetch (often 100ms–several seconds on Promise.all).
-    libraryTaskPreview === "chat"
+    libraryTaskPreview === "chat" &&
+    !isInventoryQuestion
       ? Promise.race([
           getLibraryRelatedDocumentExcerpt({
             isoTitle: String(finalContext.isoStandard.title),
@@ -860,9 +1012,27 @@ const chat = async (userId: string, payload: any = {}) => {
         extractClauseKeyFromQuestion(questionText || "") ||
         "",
     );
+    const extractedChars = String(finalContext.iso_clause_excerpt || "").length;
     console.log(
-      `[Library][timing] grounding=${Date.now() - tLibraryGround}ms task=${libraryTaskPreview} isoExcerpt=${Boolean(finalContext.iso_clause_excerpt)} isoExcerptChars=${String(finalContext.iso_clause_excerpt || "").length} docExcerpt=${Boolean(finalContext.library_doc_excerpt)} clause=${clauseHint || "n/a"} fileAttached=${Boolean(downloadedFile || payload.file)} attachFailed=${isoFileAttachFailed} pdfCache=${pdfCacheHit ? "hit" : "miss"} downloadMs=${latency.pdfDownloadMs ?? 0}`,
+      `[Library][timing] grounding=${Date.now() - tLibraryGround}ms task=${libraryTaskPreview} mode=${libraryRetrievalMode || "n/a"} inventory=${isInventoryQuestion} isoExcerpt=${Boolean(finalContext.iso_clause_excerpt)} isoExcerptChars=${extractedChars} docExcerpt=${Boolean(finalContext.library_doc_excerpt)} clause=${clauseHint || "n/a"} fileAttached=${Boolean(downloadedFile || payload.file)} attachFailed=${isoFileAttachFailed} pdfCache=${pdfCacheHit ? "hit" : "miss"} downloadMs=${latency.pdfDownloadMs ?? 0}`,
     );
+    finalContext._libraryRetrievalMode = libraryRetrievalMode;
+    finalContext._libraryRagChunks = ragDebugChunks;
+    finalContext._isInventoryQuestion = isInventoryQuestion;
+    finalContext._libraryCoverage = libraryCoverage;
+    finalContext._libraryExtractedPdfChars = libraryExtractedPdfChars;
+    if (libraryCoverage) {
+      const retrievedPages = [
+        ...new Set(
+          ragDebugChunks
+            .map((c) => c.pageNumber)
+            .filter((p): p is number => typeof p === "number" && p > 0),
+        ),
+      ].sort((a, b) => a - b);
+      console.log(
+        `[Library][coverage] standardId=${finalContext.isoStandardId || "n/a"} extractedChars=${libraryCoverage.extractedChars} indexedPages=${libraryCoverage.minPage}-${libraryCoverage.maxPage}/${libraryCoverage.pageCount || "?"} early=${libraryCoverage.hasEarlyClause}@p${libraryCoverage.earlyPage ?? "?"} mid=${libraryCoverage.hasMidClause}@p${libraryCoverage.midPage ?? "?"} late=${libraryCoverage.hasLateClause}@p${libraryCoverage.latePage ?? "?"} docInfo=${libraryCoverage.hasDocumentedInformation} retrievedPages=${retrievedPages.join(",") || "n/a"} mode=${libraryRetrievalMode || "n/a"}`,
+      );
+    }
   }
   latency.groundingMs = Date.now() - tLibraryGround;
 
@@ -951,17 +1121,30 @@ const chat = async (userId: string, payload: any = {}) => {
     );
     const excerptChars = String(finalContext.iso_clause_excerpt || "").trim()
       .length;
-    // Strong excerpt already embeds the needed ISO text in the brief — skip
-    // re-uploading the full PDF to the remote AI (major latency win).
+    // Inventory multi-window mode is chat-only — never override studio tasks
+    // (starter questions / quiz / notes) even if the brief mentions "documented information".
+    const inventoryMode =
+      libraryTask === "chat" &&
+      (finalContext._isInventoryQuestion === true ||
+        isDocumentedInformationInventoryQuestion(userQ));
+    const retrievalMode = String(
+      finalContext._libraryRetrievalMode || libraryRetrievalMode || "",
+    );
+
+    // CRITICAL — restore old working Library behavior (pre-da96c8a):
+    // Commit da96c8a skipped PDF attach when excerptChars ≥ 700 (chat) / 1200
+    // (studio). That left the model on a tiny local window → shallow /
+    // first-pages-only answers. Old working code always attached the selected
+    // ISO PDF when available (`if (downloadedFile) finalPayload.file = …`).
+    //
+    // Architecture now (both requirements):
+    //   1) FULL PDF text extracted + searchable across ALL pages
+    //   2) Multi-window / clause retrieval picks relevant chunks from ANY page
+    //   3) Full PDF is attached for chat/study (old settings) so the model can
+    //      read beyond any single excerpt — only starter chips stay excerpt-only
+    //      for latency. We do NOT paste the whole PDF into the text prompt.
     const excerptSufficientForAttachSkip =
-      libraryTask === "exam_questions" ||
-      libraryTask === "starter_questions" ||
-      libraryTask === "quiz" ||
-      libraryTask === "flashcards" ||
-      libraryTask === "notes" ||
-      libraryTask === "summary"
-        ? excerptChars >= 1200
-        : excerptChars >= 700;
+      libraryTask === "starter_questions" && excerptChars >= 1200;
     const willAttachPdf =
       Boolean(downloadedFile || payload.file) && !excerptSufficientForAttachSkip;
     const pdfAttached = willAttachPdf || Boolean(payload.file);
@@ -983,27 +1166,63 @@ const chat = async (userId: string, payload: any = {}) => {
       libraryTask === "quiz" ||
       libraryTask === "flashcards"
         ? 3600
-        : 2400;
+        : inventoryMode
+          ? 4800
+          : retrievalMode === "chat_multi_window"
+            ? 4000
+            : 2400;
+
+    const inventoryInstructions = inventoryMode
+      ? [
+          `TASK: Answer the user's inventory/list question about ${standardTitle}.`,
+          pdfAttached
+            ? "The selected ISO standard PDF is attached — use the FULL attached PDF as the authoritative source across ALL clauses/pages (not only the excerpt)."
+            : "Use the source material from the selected standard below as the authoritative source.",
+          "Focus on documented information / mandatory documents / maintain vs retain exactly as stated in the source.",
+          "Prefer a clear structured list or table with clause references when the source supports them.",
+          "Do not invent items. Do not pad with generic management-system advice. Do not substitute another ISO family or edition.",
+        ].join(" ")
+      : "";
+
+    const rawExcerpt = hasIsoExcerpt
+      ? String(finalContext.iso_clause_excerpt).slice(0, excerptCap)
+      : "";
+    // When full PDF is attached, drop weak early-page/TOC excerpts so they cannot
+    // overshadow the complete standard.
+    const promptExcerpt =
+      rawExcerpt &&
+      (!willAttachPdf || isStrongIsoFocusExcerpt(rawExcerpt))
+        ? rawExcerpt
+        : "";
+
+    const attachNote =
+      isoFileAttachFailed || finalContext.iso_file_attached === false
+        ? "NOTE: The selected ISO PDF could not be attached for this request. Do not invent clause text; say the available source material is insufficient if you cannot ground the answer."
+        : willAttachPdf && promptExcerpt
+          ? "NOTE: The selected ISO standard PDF is attached (full document). The excerpt below is only a focus aid — search the FULL attached PDF for requirements on any clause/page. Do not invent clauses."
+          : willAttachPdf
+            ? "NOTE: The selected ISO standard PDF is attached (full document). Use relevant content from ANY clause/page. Do not invent clauses."
+          : attachMode === "excerpt_only"
+            ? "NOTE: Use the source material from the selected standard provided above. Do not invent clauses."
+            : pdfAttached && !promptExcerpt
+              ? "NOTE: The selected ISO standard PDF is attached. Use the attached PDF content for the selected standard/clause across the full document. Only say the source is insufficient if the PDF truly lacks the requested topic."
+              : "";
 
     const brief = [
       LIBRARY_BRIEF_HEADER,
       `SELECTED STANDARD: ${standardTitle}`,
       clauseForBrief ? `CLAUSE FOCUS: ${clauseForBrief}` : "",
       sourcesList ? `Sources to prefer: ${sourcesList}` : "",
-      taskInstructions,
-      hasIsoExcerpt
-        ? `Source material from the selected standard (use this to answer — do not claim it is insufficient):\n${String(finalContext.iso_clause_excerpt).slice(0, excerptCap)}`
+      inventoryInstructions || taskInstructions,
+      promptExcerpt
+        ? willAttachPdf
+          ? `Focus excerpt from the selected standard (aid only — full PDF is attached):\n${promptExcerpt}`
+          : `Source material from the selected standard (use this to answer — do not claim it is insufficient):\n${promptExcerpt}`
         : "",
-      finalContext.library_doc_excerpt
+      !inventoryMode && finalContext.library_doc_excerpt
         ? `Related reference material:\n${String(finalContext.library_doc_excerpt).slice(0, 1200)}`
         : "",
-      isoFileAttachFailed || finalContext.iso_file_attached === false
-        ? "NOTE: The selected ISO PDF could not be attached for this request. Do not invent clause text; say the available source material is insufficient if you cannot ground the answer."
-        : attachMode === "excerpt_only"
-          ? "NOTE: Use the source material from the selected standard provided above. Do not invent clauses."
-          : pdfAttached && !hasIsoExcerpt
-            ? "NOTE: The selected ISO standard PDF is attached. Use the attached PDF content for the selected standard/clause. Only say the source is insufficient if the PDF truly lacks the requested topic."
-            : "",
+      attachNote,
       `USER REQUEST: ${userQ}`,
     ]
       .filter(Boolean)
@@ -1015,6 +1234,42 @@ const chat = async (userId: string, payload: any = {}) => {
     finalContext.library_task_resolved = libraryTask;
     finalContext._attachMode = attachMode;
 
+    const debugChunks: LibraryRagChunkDebug[] = Array.isArray(
+      finalContext._libraryRagChunks,
+    )
+      ? finalContext._libraryRagChunks
+      : [];
+    logLibraryRagDebug({
+      standardId: String(finalContext.isoStandardId || ""),
+      standardTitle,
+      retrievalMode: retrievalMode || attachMode,
+      questionType: inventoryMode
+        ? "documented_information_inventory"
+        : libraryTask,
+      chunkCount: debugChunks.length || (promptExcerpt ? 1 : 0),
+      totalChars: excerptChars,
+      chunksInsertedIntoPrompt: promptExcerpt
+        ? debugChunks.length || 1
+        : 0,
+      promptExcerptChars: promptExcerpt.length,
+      attachMode,
+      extractedPdfChars: Number(finalContext._libraryExtractedPdfChars || 0) || undefined,
+      coverage: finalContext._libraryCoverage as IsoExtractCoverage | undefined,
+      chunks: debugChunks.length
+        ? debugChunks
+        : promptExcerpt
+          ? [
+              {
+                index: 0,
+                start: 0,
+                end: Math.min(excerptChars, excerptCap),
+                score: 0,
+                preview: promptExcerpt.slice(0, 160),
+              },
+            ]
+          : [],
+    });
+
     remoteContext = {
       isoStandardId: finalContext.isoStandardId || undefined,
       purpose: "library_standards",
@@ -1022,10 +1277,12 @@ const chat = async (userId: string, payload: any = {}) => {
       instruction:
         libraryTask === "exam_questions" || libraryTask === "starter_questions"
           ? `Generate difficult exam-style questions grounded ONLY in ${standardTitle} and the provided source material. No open-ended coaching prompts. No invented clauses. Never use internal system terminology.`
-          : hasIsoExcerpt
-            ? "Answer as an ISO consultant using the SELECTED STANDARD source material below. Answer the user's specific question. Do not invent clauses or substitute editions. Do not claim the source is insufficient when source material from the selected standard is provided. Never use internal system terminology."
-            : pdfAttached
-              ? "Answer as an ISO consultant using the attached selected ISO PDF. Answer the user's specific question. Do not invent clauses or substitute editions. Only say the available source material is insufficient if the attached PDF truly lacks the topic. Never use internal system terminology."
+          : pdfAttached
+            ? inventoryMode
+              ? `Answer as an ISO consultant for ${standardTitle}. The full selected ISO PDF is attached — use the entire document (all clauses/pages), not only any focus excerpt. List documented information / maintain vs retain only when supported by the attached standard. Prefer clause references. Do not invent items. Never use internal system terminology.`
+              : `Answer as an ISO consultant using the attached selected ISO PDF (full document). Answer the user's specific question using relevant content from ANY clause/page. Focus excerpts are aids only. Do not invent clauses or substitute editions. Only say the source is insufficient if the attached PDF truly lacks the topic. Never use internal system terminology.`
+            : hasIsoExcerpt
+              ? "Answer as an ISO consultant using the SELECTED STANDARD source material below. Answer the user's specific question. Do not invent clauses or substitute editions. Do not claim the source is insufficient when source material from the selected standard is provided. Never use internal system terminology."
               : "Answer as an ISO consultant using the selected ISO standard and any attached ISO document. Do not invent clauses or substitute editions. If evidence is missing, say the available source material is insufficient. Never use internal system terminology.",
     };
   }
@@ -1037,7 +1294,8 @@ const chat = async (userId: string, payload: any = {}) => {
     session_id: session?.id || payload.session_id || undefined,
   };
 
-  // Attach full PDF only when excerpt is weak/missing (Library), or always for course when present.
+  // Library: attach full PDF when attachMode is full_pdf (chat/study tools).
+  // Starter chips may remain excerpt_only for latency.
   const libraryAttachMode = String(finalContext?._attachMode || "");
   const shouldAttachFullPdf =
     Boolean(downloadedFile) &&

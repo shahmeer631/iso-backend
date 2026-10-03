@@ -186,7 +186,8 @@ export async function excerptLockedIsoFromBuffer(
   try {
     const cacheKey = options?.cacheKey || isoPdfBufferCacheKey(buffer);
     const { text: raw } = await extractCachedIsoPdfText(cacheKey, buffer);
-    const text = (raw || "").replace(/\s+/g, " ").trim();
+    // Preserve `-- N of M --` page markers (do not collapse all whitespace).
+    const text = (raw || "").replace(/[^\S\n]+/g, " ").replace(/\n{3,}/g, "\n\n").trim();
     if (!text) return "";
 
     const clauseKey =
@@ -222,7 +223,8 @@ export async function excerptLockedIsoFromBuffer(
       let bestIdx = 0;
       let bestScore = 0;
       const step = 600;
-      for (let i = 0; i < Math.min(text.length, 120000); i += step) {
+      // Scan the FULL extracted standard text (no early-page cap).
+      for (let i = 0; i < text.length; i += step) {
         const window = text.slice(i, i + ISO_CLAUSE_CAP).toLowerCase();
         let score = 0;
         for (const t of scoredTokens) {

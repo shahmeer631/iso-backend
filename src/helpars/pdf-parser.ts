@@ -1,11 +1,16 @@
 import axios from "axios";
 
+export type PdfExtractResult = {
+  text: string;
+  pageCount: number;
+};
+
 /**
  * pdf-parse v1 exported a function. v2 exports `{ PDFParse }` class.
  * Resolve either shape so Library/ISO PDF grounding does not crash.
  */
 function resolvePdfParse(): {
-  parseBuffer: (data: Buffer | Uint8Array) => Promise<{ text?: string }>;
+  parseBuffer: (data: Buffer | Uint8Array) => Promise<PdfExtractResult>;
 } {
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   const mod = require("pdf-parse");
@@ -18,7 +23,31 @@ function resolvePdfParse(): {
         const parser = new PDFParseClass({ data });
         try {
           const result = await parser.getText();
-          return { text: result?.text || "" };
+          const total = Number(result?.total) || 0;
+          const pages: Array<{ text?: string; num?: number }> = Array.isArray(
+            result?.pages,
+          )
+            ? result.pages
+            : [];
+
+          // Inject stable page markers so retrieval diagnostics can map
+          // character offsets → PDF page numbers across the FULL document.
+          if (pages.length > 0) {
+            const pageCount = total || pages.length;
+            const joined = pages
+              .map((p, i) => {
+                const n = Number(p?.num) > 0 ? Number(p.num) : i + 1;
+                const body = String(p?.text || "").trim();
+                return `-- ${n} of ${pageCount} --\n${body}`;
+              })
+              .join("\n\n");
+            return { text: joined, pageCount };
+          }
+
+          return {
+            text: String(result?.text || ""),
+            pageCount: total || 0,
+          };
         } finally {
           if (typeof parser.destroy === "function") {
             await parser.destroy();
@@ -29,7 +58,15 @@ function resolvePdfParse(): {
   }
 
   if (typeof fn === "function") {
-    return { parseBuffer: fn };
+    return {
+      parseBuffer: async (data: Buffer | Uint8Array) => {
+        const result = await fn(data);
+        return {
+          text: String(result?.text || ""),
+          pageCount: Number(result?.numpages || result?.total || 0) || 0,
+        };
+      },
+    };
   }
 
   throw new Error("pdf-parse module did not export a parser");
@@ -37,11 +74,22 @@ function resolvePdfParse(): {
 
 const parser = resolvePdfParse();
 
+/** Full extract with page markers (`-- N of M --`) when available. */
+export async function extractPdfFromBuffer(
+  data: Buffer | Uint8Array,
+): Promise<PdfExtractResult> {
+  const result = await parser.parseBuffer(data);
+  return {
+    text: (result?.text || "").trim(),
+    pageCount: Number(result?.pageCount) || 0,
+  };
+}
+
 export async function extractPdfTextFromBuffer(
   data: Buffer | Uint8Array,
 ): Promise<string> {
-  const result = await parser.parseBuffer(data);
-  return (result?.text || "").trim();
+  const result = await extractPdfFromBuffer(data);
+  return result.text;
 }
 
 const extractPdfTextFromUrl = async (

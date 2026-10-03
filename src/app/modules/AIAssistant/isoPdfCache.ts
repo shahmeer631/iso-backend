@@ -12,6 +12,7 @@ type BufferEntry = {
 
 type TextEntry = {
   text: string;
+  pageCount: number;
   expiresAt: number;
 };
 
@@ -21,6 +22,8 @@ const INFLIGHT_DOWNLOAD = new Map<string, Promise<BufferEntry | null>>();
 
 const TTL_MS = 15 * 60 * 1000;
 const MAX_ENTRIES = 48;
+/** Bump when extraction format changes (e.g. page markers) so stale cache is ignored. */
+const TEXT_CACHE_VERSION = "v2pages";
 
 function touchEvict<T extends { expiresAt: number }>(
   map: Map<string, T>,
@@ -44,17 +47,37 @@ function bufferFingerprint(buffer: Buffer | Uint8Array): string {
   return `buf:${buf.length}:${head}:${tail}`;
 }
 
+function versionedTextKey(cacheKey: string): string {
+  return `${TEXT_CACHE_VERSION}:${cacheKey}`;
+}
+
 export function getCachedIsoPdfText(cacheKey: string): string | null {
-  const hit = TEXT_CACHE.get(cacheKey);
+  const hit = TEXT_CACHE.get(versionedTextKey(cacheKey));
   if (hit && hit.expiresAt > Date.now()) return hit.text;
-  if (hit) TEXT_CACHE.delete(cacheKey);
+  if (hit) TEXT_CACHE.delete(versionedTextKey(cacheKey));
   return null;
 }
 
-export function setCachedIsoPdfText(cacheKey: string, text: string): void {
+export function getCachedIsoPdfTextMeta(
+  cacheKey: string,
+): { text: string; pageCount: number } | null {
+  const hit = TEXT_CACHE.get(versionedTextKey(cacheKey));
+  if (hit && hit.expiresAt > Date.now()) {
+    return { text: hit.text, pageCount: hit.pageCount || 0 };
+  }
+  if (hit) TEXT_CACHE.delete(versionedTextKey(cacheKey));
+  return null;
+}
+
+export function setCachedIsoPdfText(
+  cacheKey: string,
+  text: string,
+  pageCount = 0,
+): void {
   if (!text) return;
-  touchEvict(TEXT_CACHE, cacheKey, {
+  touchEvict(TEXT_CACHE, versionedTextKey(cacheKey), {
     text,
+    pageCount: Number(pageCount) || 0,
     expiresAt: Date.now() + TTL_MS,
   });
 }
@@ -67,6 +90,16 @@ export function isoPdfUrlCacheKey(fileUrl: string): string {
 /** Cache key for an in-memory buffer (session upload). */
 export function isoPdfBufferCacheKey(buffer: Buffer | Uint8Array): string {
   return bufferFingerprint(buffer);
+}
+
+/** Normalize PDF text while preserving `-- N of M --` page markers. */
+export function normalizeIsoPdfExtractText(raw: string): string {
+  return String(raw || "")
+    .replace(/\r\n/g, "\n")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .replace(/[^\S\n]+/g, " ")
+    .trim();
 }
 
 /**
@@ -144,22 +177,31 @@ export async function getCachedIsoPdfBuffer(
 
 /**
  * Extract PDF text with process-local cache (by URL key or buffer fingerprint).
+ * Text includes `-- N of M --` markers when pdf-parse returns per-page text,
+ * so Library RAG can prove early/middle/late pages are indexed and retrieved.
  */
 export async function extractCachedIsoPdfText(
   cacheKey: string,
   buffer: Buffer | Uint8Array,
-): Promise<{ text: string; cacheHit: boolean }> {
-  const cached = getCachedIsoPdfText(cacheKey);
+): Promise<{ text: string; cacheHit: boolean; pageCount: number }> {
+  const cached = getCachedIsoPdfTextMeta(cacheKey);
   if (cached != null) {
-    return { text: cached, cacheHit: true };
+    return {
+      text: cached.text,
+      cacheHit: true,
+      pageCount: cached.pageCount,
+    };
   }
 
-  const { extractPdfTextFromBuffer } = await import("../../../helpars/pdf-parser");
-  const text = ((await extractPdfTextFromBuffer(buffer)) || "")
-    .replace(/\s+/g, " ")
-    .trim();
-  setCachedIsoPdfText(cacheKey, text);
+  const { extractPdfFromBuffer } = await import("../../../helpars/pdf-parser");
+  const extracted = await extractPdfFromBuffer(buffer);
+  const text = normalizeIsoPdfExtractText(extracted.text || "");
+  const pageCount =
+    Number(extracted.pageCount) ||
+    (text.match(/--\s*\d+\s+of\s+\d+\s*--/g) || []).length ||
+    0;
+  setCachedIsoPdfText(cacheKey, text, pageCount);
   // Also store under buffer fingerprint for buffer-only callers
-  setCachedIsoPdfText(isoPdfBufferCacheKey(buffer), text);
-  return { text, cacheHit: false };
+  setCachedIsoPdfText(isoPdfBufferCacheKey(buffer), text, pageCount);
+  return { text, cacheHit: false, pageCount };
 }
