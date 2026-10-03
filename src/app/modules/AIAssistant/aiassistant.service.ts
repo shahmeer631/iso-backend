@@ -60,6 +60,7 @@ import {
   getLibraryRelatedDocumentExcerpt,
   isDocumentedInformationInventoryQuestion,
   isStrongIsoFocusExcerpt,
+  isUnusableLibraryStudioResponse,
   IsoExtractCoverage,
   LibraryRagChunkDebug,
   logLibraryRagDebug,
@@ -820,13 +821,19 @@ const chat = async (userId: string, payload: any = {}) => {
             }
           }
 
-          // Exam / starter / quiz / flashcards: multi-theme requirement windows
+          // Studio tools (notes/summary/exam/quiz/flashcards/starter): multi-theme
+          // requirement windows across the FULL standard. Notes previously fell
+          // through to a weak keyword/TOC window that was then dropped → empty
+          // grounding → remote model sometimes returned literary fiction.
           if (
             wantsStudyOverview &&
             (libraryTaskPreview === "exam_questions" ||
               libraryTaskPreview === "starter_questions" ||
               libraryTaskPreview === "quiz" ||
-              libraryTaskPreview === "flashcards")
+              libraryTaskPreview === "flashcards" ||
+              libraryTaskPreview === "notes" ||
+              libraryTaskPreview === "summary" ||
+              libraryTaskPreview === "eli5")
           ) {
             const study = await excerptExamStudyGroundingFromBuffer(
               isoBufferForExcerpt,
@@ -1164,7 +1171,10 @@ const chat = async (userId: string, payload: any = {}) => {
       libraryTask === "exam_questions" ||
       libraryTask === "starter_questions" ||
       libraryTask === "quiz" ||
-      libraryTask === "flashcards"
+      libraryTask === "flashcards" ||
+      libraryTask === "notes" ||
+      libraryTask === "summary" ||
+      libraryTask === "eli5"
         ? 3600
         : inventoryMode
           ? 4800
@@ -1188,12 +1198,24 @@ const chat = async (userId: string, payload: any = {}) => {
       ? String(finalContext.iso_clause_excerpt).slice(0, excerptCap)
       : "";
     // When full PDF is attached, drop weak early-page/TOC excerpts so they cannot
-    // overshadow the complete standard.
-    const promptExcerpt =
+    // overshadow the complete standard — BUT never leave studio tools (notes /
+    // summary) with zero text grounding; that caused literary-fiction hallucinations.
+    let promptExcerpt =
       rawExcerpt &&
       (!willAttachPdf || isStrongIsoFocusExcerpt(rawExcerpt))
         ? rawExcerpt
         : "";
+    if (
+      !promptExcerpt &&
+      rawExcerpt &&
+      (libraryTask === "notes" ||
+        libraryTask === "summary" ||
+        libraryTask === "eli5" ||
+        libraryTask === "flashcards" ||
+        libraryTask === "quiz")
+    ) {
+      promptExcerpt = rawExcerpt;
+    }
 
     const attachNote =
       isoFileAttachFailed || finalContext.iso_file_attached === false
@@ -1354,6 +1376,81 @@ const chat = async (userId: string, payload: any = {}) => {
       finalContext?.purpose === "course_learning")
   ) {
     aiResponse.response = sanitizeLibraryAssistantText(aiResponse.response);
+  }
+
+  // Reject literary-fiction / empty studio outputs (notes/summary) and retry once
+  // with an explicit grounded brief. Some standards previously returned one-line
+  // narrative prose while still showing VERIFIED in the UI.
+  if (
+    finalContext?.purpose === "library_standards" &&
+    typeof aiResponse?.response === "string"
+  ) {
+    const studioTask =
+      finalContext.library_task_resolved ||
+      resolveLibraryTask(finalContext, questionText || "");
+    if (
+      (studioTask === "notes" ||
+        studioTask === "summary" ||
+        studioTask === "eli5" ||
+        studioTask === "flashcards" ||
+        studioTask === "quiz") &&
+      isUnusableLibraryStudioResponse(aiResponse.response, studioTask)
+    ) {
+      console.warn(
+        `[Library] unusable ${studioTask} response rejected standard=${finalContext.isoStandard?.title || finalContext.isoStandardId || "n/a"} chars=${String(aiResponse.response).length} preview=${JSON.stringify(String(aiResponse.response).slice(0, 120))}`,
+      );
+      const retryBrief = [
+        String(finalPayload.messages || ""),
+        "CRITICAL: Your previous reply was unusable (too short, narrative fiction, or not grounded in the selected ISO standard).",
+        "Produce the requested study material now using ONLY the selected ISO standard PDF / source excerpts.",
+        "Use clear markdown headings and bullet points. Include concrete requirements language from the source (shall/should/clause) when present.",
+        "Do NOT write stories, fiction, metaphors, or literary prose.",
+      ]
+        .filter(Boolean)
+        .join("\n\n");
+      try {
+        const tRetry = Date.now();
+        const retryResponse = await callAI({
+          ...finalPayload,
+          messages: retryBrief,
+        });
+        latency.aiMs = (latency.aiMs || 0) + (Date.now() - tRetry);
+        if (
+          retryResponse &&
+          typeof retryResponse.response === "string" &&
+          !isUnusableLibraryStudioResponse(
+            sanitizeLibraryAssistantText(retryResponse.response),
+            studioTask,
+          )
+        ) {
+          aiResponse = {
+            ...retryResponse,
+            response: sanitizeLibraryAssistantText(retryResponse.response),
+          };
+          console.log(
+            `[Library] ${studioTask} retry accepted standard=${finalContext.isoStandard?.title || finalContext.isoStandardId || "n/a"} chars=${String(aiResponse.response).length}`,
+          );
+        } else {
+          aiResponse = {
+            ...(aiResponse || {}),
+            response:
+              "The available source material could not be turned into reliable study notes for this request. Please try Generate Notes again, or ask a specific clause question about the selected standard.",
+            sources: aiResponse?.sources || [],
+          };
+          console.warn(
+            `[Library] ${studioTask} retry still unusable — controlled fallback used`,
+          );
+        }
+      } catch (retryErr) {
+        console.error(`[Library] ${studioTask} retry failed`, retryErr);
+        aiResponse = {
+          ...(aiResponse || {}),
+          response:
+            "The available source material could not be turned into reliable study notes for this request. Please try again.",
+          sources: aiResponse?.sources || [],
+        };
+      }
+    }
   }
 
   // Validate / normalize exam & starter question lists (drop coaching filler)

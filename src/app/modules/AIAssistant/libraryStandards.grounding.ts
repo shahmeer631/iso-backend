@@ -894,6 +894,7 @@ export function buildLibraryTaskInstructions(
         "## Important Evidence / Documentation",
         "## Key Takeaways",
         "Under each heading use bullets with concrete, standard-grounded detail.",
+        "Do NOT repeat the section title as plain text under the heading (never write 'Topic Overview' again after '## Topic Overview').",
         "Prefer depth and study usefulness over brevity. No internal/system terminology. Do not invent requirements or clause numbers.",
       ].join("\n");
 
@@ -1050,30 +1051,134 @@ export async function getLibraryRelatedDocumentExcerpt(params: {
   }
 }
 
+/**
+ * Detect unusable Expert Studio / Library outputs (literary fiction, empty,
+ * or content with no ISO grounding signals). Seen in production for notes on
+ * some standards when grounding was empty and the remote model hallucinated.
+ */
+export function isUnusableLibraryStudioResponse(
+  text: string,
+  task?: string,
+): boolean {
+  const t = String(text || "").trim();
+  if (!t) return true;
+
+  const lower = t.toLowerCase();
+  const hasIsoSignal =
+    /\b(shall|should|clause|requirement|requirements|iso\/?iec|documented information|management system|organization|organisation|audit|nonconformit|corrective|continual improvement)\b/i.test(
+      t,
+    ) || /^#{1,3}\s+/m.test(t);
+
+  // Known literary / narrative fragments returned instead of notes
+  if (
+    /\bafter a long silence\b|\btruth finally surfaced\b|\bdoor quietly opened\b|\bno one moved\b|\bsomewhere beyond the walls\b|\bonce upon a time\b|\bin a distant (land|kingdom)\b/i.test(
+      lower,
+    )
+  ) {
+    return true;
+  }
+
+  // Short narrative openers with no ISO content
+  if (
+    /^(and then|and for a moment|then,? somewhere|suddenly|meanwhile)\b/i.test(
+      t,
+    ) &&
+    !hasIsoSignal
+  ) {
+    return true;
+  }
+
+  const studioTask =
+    task === "notes" ||
+    task === "summary" ||
+    task === "eli5" ||
+    task === "flashcards" ||
+    task === "quiz";
+
+  if (studioTask) {
+    // Notes/summary must be substantive and grounded
+    if (t.length < 280 && !hasIsoSignal) return true;
+    if (t.length < 800 && !hasIsoSignal && !/^#{1,3}\s+/m.test(t)) return true;
+    // Single-sentence fiction / prose with no structure
+    if (
+      t.length < 400 &&
+      (t.match(/\n/g) || []).length < 2 &&
+      !hasIsoSignal
+    ) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+/**
+ * Drop plain-text lines that merely repeat the previous markdown heading
+ * (e.g. "## Topic Overview" followed by "Topic Overview" / "opic Overview").
+ */
+export function stripDuplicateHeadingEchoes(text: string): string {
+  const lines = String(text || "").replace(/\r\n/g, "\n").split("\n");
+  const out: string[] = [];
+  let lastHeading = "";
+
+  const norm = (s: string) =>
+    s
+      .replace(/^#{1,6}\s+/, "")
+      .replace(/\*\*/g, "")
+      .trim()
+      .toLowerCase()
+      .replace(/\s+/g, " ");
+
+  for (const line of lines) {
+    const headingMatch = /^(#{1,3})\s+(.+?)\s*$/.exec(line);
+    if (headingMatch) {
+      lastHeading = norm(headingMatch[2]);
+      out.push(line);
+      continue;
+    }
+    const n = norm(line);
+    if (
+      lastHeading &&
+      n &&
+      (n === lastHeading ||
+        (n.length >= 4 && lastHeading.endsWith(n)) ||
+        (lastHeading.length >= 4 && n.endsWith(lastHeading)))
+    ) {
+      // Skip echoed / mangled title line under the heading
+      continue;
+    }
+    if (n) lastHeading = "";
+    out.push(line);
+  }
+  return out.join("\n");
+}
+
 /** Strip internal implementation wording from model output (best-effort). */
 export function sanitizeLibraryAssistantText(text: string): string {
   if (!text) return text;
-  return text
-    .replace(/\blocked\s+ISO\s+edition\b/gi, "selected ISO standard")
-    .replace(/\blocked\s+edition\b/gi, "selected edition")
-    .replace(/\bconnected\s+edition\b/gi, "applicable edition")
-    .replace(/\blogged\s+edition\b/gi, "applicable edition")
-    .replace(/\blogged\s+document\b/gi, "source document")
-    .replace(
-      /\bconnected\s+ISO\s+standards\s+or\s+knowledge\s+documents\b/gi,
-      "available source material",
-    )
-    .replace(/\bconnected\s+knowledge\s+documents\b/gi, "available source material")
-    .replace(/\bconnected\s+ISO\s+standards\b/gi, "available ISO standards")
-    .replace(/\bretrieved\s+excerpt(s)?\b/gi, "source material")
-    .replace(/\bvector\s+store\b/gi, "source library")
-    .replace(/\bRELATED LIBRARY DOCUMENT EXCERPT\s*:?\s*/gi, "")
-    .replace(/\bRELEVANT SOURCE EXCERPT\b[^\n]*:?\s*/gi, "")
-    .replace(/\bSource material from the selected standard:\s*/gi, "")
-    .replace(/\bRelated reference material:\s*/gi, "")
-    .replace(/\bAVAILABLE SOURCES \(cite only these if needed\):\s*/gi, "Sources: ")
-    .replace(/\bUSER REQUEST:\s*/gi, "")
-    .replace(/\bSELECTED STANDARD:\s*/gi, "");
+  return stripDuplicateHeadingEchoes(
+    text
+      .replace(/\blocked\s+ISO\s+edition\b/gi, "selected ISO standard")
+      .replace(/\blocked\s+edition\b/gi, "selected edition")
+      .replace(/\bconnected\s+edition\b/gi, "applicable edition")
+      .replace(/\blogged\s+edition\b/gi, "applicable edition")
+      .replace(/\blogged\s+document\b/gi, "source document")
+      .replace(
+        /\bconnected\s+ISO\s+standards\s+or\s+knowledge\s+documents\b/gi,
+        "available source material",
+      )
+      .replace(/\bconnected\s+knowledge\s+documents\b/gi, "available source material")
+      .replace(/\bconnected\s+ISO\s+standards\b/gi, "available ISO standards")
+      .replace(/\bretrieved\s+excerpt(s)?\b/gi, "source material")
+      .replace(/\bvector\s+store\b/gi, "source library")
+      .replace(/\bRELATED LIBRARY DOCUMENT EXCERPT\s*:?\s*/gi, "")
+      .replace(/\bRELEVANT SOURCE EXCERPT\b[^\n]*:?\s*/gi, "")
+      .replace(/\bSource material from the selected standard:\s*/gi, "")
+      .replace(/\bRelated reference material:\s*/gi, "")
+      .replace(/\bAVAILABLE SOURCES \(cite only these if needed\):\s*/gi, "Sources: ")
+      .replace(/\bUSER REQUEST:\s*/gi, "")
+      .replace(/\bSELECTED STANDARD:\s*/gi, ""),
+  );
 }
 
 const OVERVIEW_CAP = 2800;
