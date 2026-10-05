@@ -813,24 +813,23 @@ export function buildLibraryTaskInstructions(
     case "starter_questions":
       return [
         `TASK: Propose exactly 5 difficult exam-style study questions about ${std}.`,
-        `Every question MUST be specifically about ${std} (use the selected standard name/year when natural).`,
-        "Each question must test knowledge of a concrete requirement theme from the provided source material:",
-        "- purpose/intent of a requirement",
-        "- evidence an auditor would look for",
-        "- responsibilities",
-        "- documented information",
-        "- implementation/application of a specific requirement",
-        "Cover FIVE DIFFERENT topics/clauses from the source material — do not repeat one theme.",
-        "Questions must be direct examination probes, e.g. style references only:",
-        '"What is the purpose of … under this standard?"',
-        '"What evidence demonstrates …?"',
-        '"How is … established / determined under the requirements?"',
-        "FORBIDDEN (reject these patterns):",
-        '- coaching prompts: "What is your scope?", "What do you know about…?", "Tell me about…", "How would you define…?"',
-        '- asking the learner about their own organization ("your company", "your QMS", "in your organization")',
-        '- trivial: "What is ISO…?", "What are the benefits of…?"',
+        `Every question MUST be specifically about ${std} — use the selected standard name/year when natural.`,
+        "Ground EVERY question in the SOURCE MATERIAL below (requirements from the selected standard). Do not invent clauses.",
+        "Cover FIVE DIFFERENT requirement themes drawn from DIFFERENT parts of the source material (early/middle/late topics if present).",
+        "Use a useful mixture of styles across the set (not all the same type):",
+        "1) Purpose / intent of a specific requirement",
+        "2) Key requirements of a specific topic/clause theme",
+        "3) Evidence / documented information that demonstrates conformity",
+        "4) Implementation / how an organization applies a requirement",
+        "5) Auditor focus / what would be evaluated for a requirement",
+        "OR relationship between two related requirements when the source supports it.",
+        "FORBIDDEN (never generate these):",
+        '- "What is ISO?", "What are the benefits of…?", "Why is this standard important?"',
+        '- coaching: "What is your scope?", "What do you know about…?", "Tell me about…", "How would you define…?"',
+        '- learner-org questions ("your company", "your QMS", "in your organization")',
         "- inventing clause numbers not present in the source material",
-        "Return ONLY a numbered list of 5 questions (one per line). No preamble, no answers.",
+        "- five near-duplicates of the same topic",
+        "Return ONLY a numbered list of 5 clean questions (one per line). No preamble, no answers, no internal instructions.",
       ].join("\n");
 
     case "exam_questions":
@@ -952,7 +951,8 @@ export function buildLibraryAvailableSources(isoTitle?: string | null): string[]
 }
 
 /**
- * Retrieve one short related Documents Library excerpt for the selected ISO.
+ * Retrieve one related Documents Library excerpt for the selected ISO.
+ * Searches the FULL related PDF (multi-window) — never first-pages-only truncation.
  * Relevance-based; never dumps unrelated library documents into the prompt.
  */
 export async function getLibraryRelatedDocumentExcerpt(params: {
@@ -982,9 +982,10 @@ export async function getLibraryRelatedDocumentExcerpt(params: {
     if (!orFilters.length) return { excerpt: "" };
 
     const prisma = (await import("../../../shared/prisma")).default;
-    const extractPdfTextFromUrl = (
-      await import("../../../helpars/pdf-parser")
-    ).default;
+    const {
+      getCachedIsoPdfBuffer,
+      isoPdfUrlCacheKey,
+    } = await import("./isoPdfCache");
 
     const docs = await prisma.document.findMany({
       where: {
@@ -1028,15 +1029,31 @@ export async function getLibraryRelatedDocumentExcerpt(params: {
     if (bestScore < 4) return { excerpt: "" };
 
     if (best.fileUrl && !/example\.pdf|placeholder/i.test(best.fileUrl)) {
-      const text = await extractPdfTextFromUrl(best.fileUrl, {
-        timeoutMs: 8000,
-        maxChars: 4000,
+      const cached = await getCachedIsoPdfBuffer(best.fileUrl, {
+        timeoutMs: 12000,
       });
-      if (text) {
-        return {
-          excerpt: text.replace(/\s+/g, " ").trim().slice(0, 1400),
-          title: best.title,
-        };
+      if (cached) {
+        const multi = await excerptMultiWindowChatGroundingFromBuffer(
+          cached.buffer,
+          params.question || title,
+          { cacheKey: isoPdfUrlCacheKey(best.fileUrl) },
+        );
+        if (multi && multi.length > 120) {
+          return {
+            excerpt: multi.slice(0, 2800),
+            title: best.title,
+          };
+        }
+        // Fallback: overview window from full extract (still not first-4k URL slap)
+        const overview = await excerptIsoOverviewFromBuffer(cached.buffer, {
+          cacheKey: isoPdfUrlCacheKey(best.fileUrl),
+        });
+        if (overview) {
+          return {
+            excerpt: overview.slice(0, 1400),
+            title: best.title,
+          };
+        }
       }
     }
 
@@ -1407,6 +1424,142 @@ export async function excerptExamStudyGroundingFromBuffer(
   }
 }
 
+const ASK_AI_QUESTION_SEED_CAP = 4200;
+
+/**
+ * Ask AI question-generation seed: requirement-dense windows from early, middle,
+ * and late regions of the FULL extracted standard (not first pages only).
+ * Used so generated study questions can cover different parts of the selected ISO.
+ */
+export async function excerptAskAiQuestionSeedFromBuffer(
+  buffer: Buffer | Uint8Array,
+  options?: { cacheKey?: string; debug?: LibraryRagChunkDebug[] },
+): Promise<string> {
+  try {
+    const cacheKey = options?.cacheKey || isoPdfBufferCacheKey(buffer);
+    const { text } = await extractCachedIsoPdfText(cacheKey, buffer);
+    if (!text) return "";
+
+    const markers = collectIsoPdfPageMarkers(text);
+    const len = text.length;
+    const bands: Array<{ label: string; start: number; end: number }> = [
+      { label: "early", start: Math.floor(len * 0.05), end: Math.floor(len * 0.35) },
+      { label: "mid", start: Math.floor(len * 0.3), end: Math.floor(len * 0.7) },
+      { label: "late", start: Math.floor(len * 0.6), end: len },
+    ];
+
+    const themes = [
+      ["scope", "context", "interested parties", "boundaries"],
+      ["leadership", "policy", "roles", "commitment"],
+      ["planning", "risk", "objectives", "opportunity"],
+      ["documented information", "competence", "awareness", "communication"],
+      ["operation", "control", "implementation", "process"],
+      ["performance", "monitoring", "audit", "management review"],
+      ["improvement", "nonconformity", "corrective", "continual"],
+    ];
+
+    const windowSize = 850;
+    const step = 600;
+    const selected: LibraryRagChunkDebug[] = [];
+    const usedStarts: number[] = [];
+
+    const pickBestInBand = (
+      bandStart: number,
+      bandEnd: number,
+      theme: string[],
+      themeIndex: number,
+    ) => {
+      let bestIdx = -1;
+      let bestScore = 0;
+      const from = Math.max(0, bandStart);
+      const to = Math.max(from + 1, Math.min(len, bandEnd));
+      for (let i = from; i < to; i += step) {
+        if (usedStarts.some((s) => Math.abs(s - i) < windowSize * 0.55)) continue;
+        const win = text.slice(i, i + windowSize).toLowerCase();
+        let score = 0;
+        for (const t of theme) {
+          if (win.includes(t)) score += 2.5;
+        }
+        const shallCount = (win.match(/\bshall\b/g) || []).length;
+        score += Math.min(8, shallCount * 2);
+        if (/\brequirement\b|\bclause\b|\borganization\b/.test(win)) score += 1;
+        if (
+          /\bcontents\b|\bforeword\b|\bcopyright\b|\ball rights reserved\b/.test(win) &&
+          shallCount < 1
+        ) {
+          score -= 10;
+        }
+        if (score > bestScore) {
+          bestScore = score;
+          bestIdx = i;
+        }
+      }
+      if (bestIdx >= 0 && bestScore >= 4) {
+        usedStarts.push(bestIdx);
+        selected.push({
+          index: selected.length,
+          start: bestIdx,
+          end: bestIdx + windowSize,
+          score: bestScore + themeIndex * 0.01,
+          clauseHint: extractNearbyClauseHint(text, bestIdx),
+          preview: repairCommonIsoOcr(text.slice(bestIdx, bestIdx + windowSize)).slice(
+            0,
+            160,
+          ),
+          pageNumber: estimatePageNumberAtOffset(text, bestIdx, markers),
+        });
+      }
+    };
+
+    // Rotate themes across early/mid/late so the seed spans the document
+    for (let t = 0; t < themes.length; t++) {
+      const band = bands[t % bands.length];
+      pickBestInBand(band.start, band.end, themes[t], t);
+      if (selected.length >= 6) break;
+    }
+
+    // Ensure at least one hit per band when possible
+    for (const band of bands) {
+      if (selected.some((s) => s.start >= band.start && s.start < band.end)) continue;
+      pickBestInBand(band.start, band.end, ["shall", "requirement", "organization"], 9);
+    }
+
+    selected.sort((a, b) => a.start - b.start);
+
+    if (options?.debug) {
+      options.debug.length = 0;
+      selected.forEach((c, i) => {
+        options.debug!.push({ ...c, index: i });
+      });
+    }
+
+    const pages = [
+      ...new Set(
+        selected
+          .map((c) => c.pageNumber)
+          .filter((p): p is number => typeof p === "number" && p > 0),
+      ),
+    ].sort((a, b) => a - b);
+
+    console.log(
+      `[AskAI][question_seed] windows=${selected.length} pages=${pages.join(",") || "n/a"} chars=${text.length} indexedMarkers=${markers.length}`,
+    );
+
+    if (!selected.length) {
+      return excerptExamStudyGroundingFromBuffer(buffer, options);
+    }
+
+    return selected
+      .map((s) =>
+        repairCommonIsoOcr(text.slice(s.start, s.start + windowSize)),
+      )
+      .join("\n\n---\n\n")
+      .slice(0, ASK_AI_QUESTION_SEED_CAP);
+  } catch {
+    return "";
+  }
+}
+
 /** Detect generic / open-ended coaching questions that should not appear as exam chips. */
 export function isOpenEndedCoachingQuestion(text: string): boolean {
   const q = String(text || "")
@@ -1433,7 +1586,10 @@ export function isOpenEndedCoachingQuestion(text: string): boolean {
     /^tell me about\b/.test(q) ||
     /^what is iso\b/.test(q) ||
     /^what are the benefits of\b/.test(q) ||
+    /^why is (this |the )?standard important\b/.test(q) ||
     /^why is iso (important|useful)\b/.test(q) ||
+    /^how can (an |the )?organi[sz]ation implement iso\b/.test(q) ||
+    /^what is the (purpose|importance) of (this |the )?standard\??$/.test(q) ||
     /^how do you (manage|ensure|handle)\b/.test(q) ||
     /^what is your approach\b/.test(q) ||
     /\bpractical example\b/.test(q) ||

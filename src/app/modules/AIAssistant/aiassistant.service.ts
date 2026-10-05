@@ -53,6 +53,7 @@ import {
   computeIsoExtractCoverage,
   excerptDocumentedInformationGroundingFromBuffer,
   excerptExamStudyGroundingFromBuffer,
+  excerptAskAiQuestionSeedFromBuffer,
   excerptIsoOverviewFromBuffer,
   debugChunksForExcerpt,
   excerptMultiWindowChatGroundingFromBuffer,
@@ -73,8 +74,10 @@ import {
   buildUniversalAskGrounding,
   isUniversalAskContext,
   isUniversalAskGreeting,
+  isVagueDocumentChatQuestion,
   sanitizeUniversalAskClientContext,
   UNIVERSAL_ASK_GREETING_REPLY,
+  UNIVERSAL_ASK_VAGUE_QUESTION_REPLY,
 } from "./universalAsk.grounding";
 import {
   extractCachedIsoPdfText,
@@ -316,6 +319,111 @@ const generateISO = async (payload: any = {}) => {
   return normalized;
 };
 
+function isValidObjectIdForAsk(id: string) {
+  return /^[a-fA-F0-9]{24}$/.test(id);
+}
+
+/** Document-grounded starter chips for Universal Ask AI (not Library workflow chat). */
+async function runUniversalAskStarterQuestions(params: {
+  isoStandardId: string;
+  standardTitle?: string;
+  sessionId?: string | null;
+}) {
+  const isoStandardId = params.isoStandardId;
+  if (!isValidObjectIdForAsk(isoStandardId)) {
+    return {
+      response: "",
+      suggested_followups: [] as string[],
+      session_id: params.sessionId || null,
+      purpose: "universal_ask",
+      grounded: false,
+      standard_title: null,
+      standard_id: null,
+      sources: [] as string[],
+    };
+  }
+
+  const iso = await prisma.iSOStandard.findFirst({
+    where: { id: isoStandardId, status: "ACTIVE" },
+    select: { id: true, title: true, fileUrl: true },
+  });
+  if (!iso?.fileUrl) {
+    return {
+      response: "",
+      suggested_followups: [] as string[],
+      session_id: params.sessionId || null,
+      purpose: "universal_ask",
+      grounded: false,
+      standard_title: iso?.title || null,
+      standard_id: iso?.id || null,
+      sources: [] as string[],
+    };
+  }
+
+  const cached = await getCachedIsoPdfBuffer(iso.fileUrl, { timeoutMs: 25000 });
+  if (!cached) {
+    return {
+      response: "",
+      suggested_followups: [] as string[],
+      session_id: params.sessionId || null,
+      purpose: "universal_ask",
+      grounded: false,
+      standard_title: iso.title,
+      standard_id: iso.id,
+      sources: [] as string[],
+    };
+  }
+
+  const cacheKey = isoPdfUrlCacheKey(iso.fileUrl);
+  const seed = await excerptAskAiQuestionSeedFromBuffer(cached.buffer, {
+    cacheKey,
+  });
+  if (!seed || seed.length < 200) {
+    return {
+      response: "",
+      suggested_followups: [] as string[],
+      session_id: params.sessionId || null,
+      purpose: "universal_ask",
+      grounded: false,
+      standard_title: iso.title,
+      standard_id: iso.id,
+      sources: [iso.title],
+    };
+  }
+
+  const brief = [
+    "You are ISOBrain Ask AI — generate starter questions for document chat over an uploaded standard.",
+    "Using ONLY the REFERENCE MATERIAL below, write exactly 5 short exam-style questions a user might ask about this document.",
+    "Each question must be specific enough to answer from the material. No generic ISO marketing questions. No ISOBrain module questions.",
+    "Output only a numbered list (1. ... through 5.).",
+    `STANDARD: ${params.standardTitle || iso.title}`,
+    `REFERENCE MATERIAL:\n${seed}`,
+  ].join("\n\n");
+
+  const aiResponse = await callAI({
+    messages: brief,
+    context: {
+      purpose: "universal_ask",
+      instruction:
+        "Generate numbered document-grounded starter questions only. Do not answer them.",
+    },
+    session_id: params.sessionId || undefined,
+  });
+
+  const qs = parseGeneratedExamQuestions(String(aiResponse?.response || ""), 5);
+  const cleaned = filterExamStyleQuestions(qs, 5);
+  return {
+    response: cleaned.map((q, i) => `${i + 1}. ${q}`).join("\n"),
+    suggested_followups: cleaned,
+    session_id: params.sessionId || null,
+    purpose: "universal_ask",
+    grounded: cleaned.length > 0,
+    standard_title: iso.title,
+    standard_id: iso.id,
+    sources: cleaned.length ? [iso.title] : [],
+  };
+}
+
 const simpleChat = async (userId: string | undefined, payload: any = {}) => {
   // Parse context once — used for Universal Ask routing without breaking
   // Navigator / Audit Lens / Benchmark callers that pass their own document context.
@@ -355,7 +463,38 @@ const simpleChat = async (userId: string | undefined, payload: any = {}) => {
       };
     }
 
+    // Placeholder / template prompts (e.g. "Explain a specific clause…") — guide the user
+    if (isVagueDocumentChatQuestion(questionText)) {
+      console.log(
+        `[UniversalAsk] vague_question total=${Date.now() - t0}ms user=${userId || "guest"}`,
+      );
+      return {
+        response: UNIVERSAL_ASK_VAGUE_QUESTION_REPLY,
+        sources: [],
+        session_id: payload.session_id || null,
+        purpose: "universal_ask",
+        grounded: false,
+        standard_title: null,
+        standard_id: null,
+      };
+    }
+
     const safeContext = sanitizeUniversalAskClientContext(parsedContext);
+
+    if (
+      safeContext.task === "document_starter_questions" &&
+      typeof safeContext.isoStandardId === "string"
+    ) {
+      return runUniversalAskStarterQuestions({
+        isoStandardId: safeContext.isoStandardId,
+        standardTitle:
+          typeof safeContext.standardTitle === "string"
+            ? safeContext.standardTitle
+            : undefined,
+        sessionId: payload.session_id || null,
+      });
+    }
+
     const grounding = await buildUniversalAskGrounding({
       question: questionText,
       isoStandardId:
@@ -386,33 +525,13 @@ const simpleChat = async (userId: string | undefined, payload: any = {}) => {
           : typeof safeContext.clauseId === "string"
             ? safeContext.clauseId
             : undefined,
-      libraryContext:
-        typeof safeContext.libraryContext === "string"
-          ? safeContext.libraryContext
-          : undefined,
-      documentContext:
-        typeof safeContext.documentContext === "string"
-          ? safeContext.documentContext
-          : undefined,
       documentId:
         typeof safeContext.documentId === "string"
           ? safeContext.documentId
           : undefined,
-      organizationContext:
-        typeof safeContext.organizationContext === "string"
-          ? safeContext.organizationContext
-          : undefined,
       conversationSnippet:
         typeof safeContext.conversationSnippet === "string"
           ? safeContext.conversationSnippet
-          : undefined,
-      currentModule:
-        typeof safeContext.currentModule === "string"
-          ? safeContext.currentModule
-          : undefined,
-      currentRoute:
-        typeof safeContext.currentRoute === "string"
-          ? safeContext.currentRoute
           : undefined,
     });
 
@@ -424,7 +543,7 @@ const simpleChat = async (userId: string | undefined, payload: any = {}) => {
       return {
         response:
           grounding.unavailableMessage ||
-          "I couldn't find sufficiently relevant material in the connected ISOBrain knowledge base for this question. Please select an ISO standard or provide additional context.",
+          "I couldn't find enough relevant material in the uploaded documents for this question. Name a specific standard/document or topic, open a document in the Library, or rephrase the question.",
         sources: [],
         session_id: payload.session_id || null,
         purpose: "universal_ask",
@@ -438,7 +557,7 @@ const simpleChat = async (userId: string | undefined, payload: any = {}) => {
       purpose: "universal_ask",
       isoStandardId: grounding.standardId || safeContext.isoStandardId || undefined,
       instruction:
-        "Answer as ISOBrain Universal Ask AI using only the provided REFERENCE MATERIAL (module/application context, ISO excerpts, Library documents, and workspace context). Be practical and module-aware when the user asks about ISOBrain tools. Do not invent clauses, editions, scores, or audit findings. If ISO evidence is missing for a requirements question, say the available source material is insufficient. Never use internal system terminology.",
+        "Answer as ISOBrain Ask AI — a universal document chat. Use only the provided REFERENCE MATERIAL from uploaded ISO standards and Library documents. Answer the user's question directly. Do not run Navigator, Audit Lens, or Expert Studio workflows. If document evidence is missing, say the uploaded sources are insufficient. Never use internal system terminology.",
     };
 
     let aiResponse: any;
@@ -821,14 +940,27 @@ const chat = async (userId: string, payload: any = {}) => {
             }
           }
 
-          // Studio tools (notes/summary/exam/quiz/flashcards/starter): multi-theme
-          // requirement windows across the FULL standard. Notes previously fell
-          // through to a weak keyword/TOC window that was then dropped → empty
-          // grounding → remote model sometimes returned literary fiction.
+          // Ask AI starter questions: seed from early/mid/late requirement windows
+          // across the FULL selected standard (not first pages only).
+          if (
+            wantsStudyOverview &&
+            libraryTaskPreview === "starter_questions"
+          ) {
+            const seed = await excerptAskAiQuestionSeedFromBuffer(
+              isoBufferForExcerpt,
+              { ...excerptOpts, debug: ragDebugChunks },
+            );
+            if (seed && seed.length > 200) {
+              libraryRetrievalMode = "ask_ai_question_seed";
+              return seed;
+            }
+          }
+
+          // Studio tools (notes/summary/exam/quiz/flashcards): multi-theme
+          // requirement windows across the FULL standard.
           if (
             wantsStudyOverview &&
             (libraryTaskPreview === "exam_questions" ||
-              libraryTaskPreview === "starter_questions" ||
               libraryTaskPreview === "quiz" ||
               libraryTaskPreview === "flashcards" ||
               libraryTaskPreview === "notes" ||
@@ -1138,20 +1270,25 @@ const chat = async (userId: string, payload: any = {}) => {
       finalContext._libraryRetrievalMode || libraryRetrievalMode || "",
     );
 
-    // CRITICAL — restore old working Library behavior (pre-da96c8a):
-    // Commit da96c8a skipped PDF attach when excerptChars ≥ 700 (chat) / 1200
-    // (studio). That left the model on a tiny local window → shallow /
-    // first-pages-only answers. Old working code always attached the selected
-    // ISO PDF when available (`if (downloadedFile) finalPayload.file = …`).
-    //
-    // Architecture now (both requirements):
-    //   1) FULL PDF text extracted + searchable across ALL pages
-    //   2) Multi-window / clause retrieval picks relevant chunks from ANY page
-    //   3) Full PDF is attached for chat/study (old settings) so the model can
-    //      read beyond any single excerpt — only starter chips stay excerpt-only
-    //      for latency. We do NOT paste the whole PDF into the text prompt.
+    // Ask AI chat retrieval policy (library_task === "chat"):
+    // Regression (da96c8a): skipped PDF when ANY short excerpt existed → shallow
+    // first-pages answers. Correct Ask AI architecture:
+    //   FULL extract indexed → retrieve relevant windows from ANY page → AI
+    // Do NOT dump the entire PDF into every chat request when full-document
+    // multi-window / inventory / clause retrieval already succeeded.
+    // Expert Studio tools (notes/summary/quiz/…) keep full-PDF attach for depth.
+    const strongAskAiRetrieval =
+      libraryTask === "chat" &&
+      excerptChars >= 1800 &&
+      isStrongIsoFocusExcerpt(String(finalContext.iso_clause_excerpt || "")) &&
+      (retrievalMode === "chat_multi_window" ||
+        retrievalMode === "documented_information_inventory" ||
+        retrievalMode === "clause_window");
+
     const excerptSufficientForAttachSkip =
-      libraryTask === "starter_questions" && excerptChars >= 1200;
+      (libraryTask === "starter_questions" && excerptChars >= 1200) ||
+      strongAskAiRetrieval;
+
     const willAttachPdf =
       Boolean(downloadedFile || payload.file) && !excerptSufficientForAttachSkip;
     const pdfAttached = willAttachPdf || Boolean(payload.file);
@@ -1174,13 +1311,18 @@ const chat = async (userId: string, payload: any = {}) => {
       libraryTask === "flashcards" ||
       libraryTask === "notes" ||
       libraryTask === "summary" ||
-      libraryTask === "eli5"
-        ? 3600
+      libraryTask === "eli5" ||
+      retrievalMode === "ask_ai_question_seed"
+        ? 4200
         : inventoryMode
           ? 4800
           : retrievalMode === "chat_multi_window"
-            ? 4000
-            : 2400;
+            ? willAttachPdf
+              ? 4000
+              : 4800
+            : retrievalMode === "clause_window" && !willAttachPdf
+              ? 2800
+              : 2400;
 
     const inventoryInstructions = inventoryMode
       ? [
