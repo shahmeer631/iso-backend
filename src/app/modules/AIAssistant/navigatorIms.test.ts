@@ -27,21 +27,27 @@ test("collectIsoTokensFromText extracts unique families", () => {
   assert.match(tokens[1], /ISO 14001/);
 });
 
-test("ensureNavigatorImsSuggestions injects IMS when multiple standards present", () => {
+test("ensureNavigatorImsSuggestions injects analysis entry-points not merged lists", () => {
   const payload = {
     suggestions: [
       {
         standard: "ISO 9001:2026",
         title: "Quality management",
         relevance: "QMS",
-        documents: [{ title: "Quality Policy", clause: "5.2", type: "document" }],
+        documents: [
+          { title: "Quality Policy", clause: "5.2", type: "document" },
+          { title: "Management Review Records", clause: "9.3", type: "document" },
+        ],
         records: [],
       },
       {
         standard: "ISO 14001:2015",
         title: "Environmental",
         relevance: "EMS",
-        documents: [{ title: "Environmental Policy", clause: "5.2", type: "document" }],
+        documents: [
+          { title: "Environmental Policy", clause: "5.2", type: "document" },
+          { title: "Management Review Records", clause: "9.3", type: "document" },
+        ],
         records: [],
       },
     ],
@@ -55,7 +61,30 @@ test("ensureNavigatorImsSuggestions injects IMS when multiple standards present"
   assert.match(ims.standard, /ISO 9001/);
   assert.match(ims.standard, /ISO 14001/);
   assert.ok(Array.isArray(ims.documents));
-  assert.equal(ims.documents.length, 2);
+  // Analysis entry-points — not Quality Policy + Environmental Policy merge
+  assert.ok(
+    ims.documents.every((d: any) => d.ims_role === "analysis"),
+    "IMS docs should be analysis entry-points",
+  );
+  assert.ok(
+    ims.documents.some((d: any) =>
+      /Documented Information Requirements/i.test(d.title),
+    ),
+  );
+  assert.ok(
+    ims.documents.some((d: any) => /Integrated \/ Common/i.test(d.title)),
+  );
+  assert.ok(
+    ims.documents.some((d: any) => /Standard-Specific/i.test(d.title)),
+  );
+  assert.ok(
+    ims.documents.some((d: any) => /Maintain vs Retain/i.test(d.title)),
+  );
+  assert.ok(
+    !ims.documents.some((d: any) => /Quality Policy/i.test(d.title)),
+    "must not merge single-standard policy titles into IMS",
+  );
+  assert.match(ims.relevance, /not a merged document list|concatenated/i);
 });
 
 test("ensureNavigatorImsSuggestions always returns flat suggestions array", () => {
@@ -77,7 +106,7 @@ test("ensureNavigatorImsSuggestions always returns flat suggestions array", () =
   );
 });
 
-test("ensureNavigatorImsSuggestions does not duplicate existing IMS", () => {
+test("ensureNavigatorImsSuggestions replaces AI-returned merged IMS document lists", () => {
   const payload = {
     suggestions: [
       { standard: "ISO 9001:2026", title: "QMS", documents: [], records: [] },
@@ -85,16 +114,27 @@ test("ensureNavigatorImsSuggestions does not duplicate existing IMS", () => {
       {
         standard: "Integrated Management Systems (ISO 9001:2026, ISO 14001:2015)",
         title: "IMS",
-        documents: [],
-        records: [],
+        documents: [
+          { title: "Quality Policy", clause: "5.2" },
+          { title: "Environmental Policy", clause: "5.2" },
+        ],
+        records: [{ title: "Audit records" }],
       },
     ],
   };
   const next = ensureNavigatorImsSuggestions(payload);
-  const imsCount = next.suggestions.filter((s: any) =>
+  const imsRows = next.suggestions.filter((s: any) =>
     /Integrated Management Systems/i.test(s.standard),
-  ).length;
-  assert.equal(imsCount, 1);
+  );
+  assert.equal(imsRows.length, 1);
+  const ims = imsRows[0];
+  assert.ok(ims.documents.every((d: any) => d.ims_role === "analysis"));
+  assert.ok(
+    !ims.documents.some((d: any) => /Quality Policy|Environmental Policy/i.test(d.title)),
+  );
+  assert.ok(
+    ims.documents.some((d: any) => /Documented Information Requirements/i.test(d.title)),
+  );
 });
 
 test("ensureNavigatorImsSuggestions drops families not in Standards Library", () => {

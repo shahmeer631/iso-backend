@@ -8,21 +8,65 @@ import {
   collectIsoTokensFromText,
   looksLikeImsRequirement,
 } from "./navigatorIms";
+import {
+  extractCachedIsoPdfText,
+  getCachedIsoPdfBuffer,
+  isoPdfUrlCacheKey,
+} from "./isoPdfCache";
+import {
+  collectIsoPdfPageMarkers,
+  computeIsoExtractCoverage,
+  excerptDocumentedInformationGroundingFromBuffer,
+  excerptMultiWindowChatGroundingFromBuffer,
+  isDocumentedInformationInventoryQuestion,
+  isStrongIsoFocusExcerpt,
+  LibraryRagChunkDebug,
+  repairCommonIsoOcr,
+} from "./libraryStandards.grounding";
 
-/** Cap ISO excerpt returned to the AI payload (performance). */
-const GROUNDING_CHAR_CAP = 4500;
+/** Cap ISO excerpt returned to the AI payload (single-standard path). */
+const GROUNDING_CHAR_CAP = 6000;
 /** Window around a matched clause heading. */
 const CLAUSE_WINDOW = 2800;
 /** Cap for optional supporting Library document excerpt. */
 const SUPPORTING_DOC_CAP = 1500;
 /** Cap for IMS Practical Guide excerpt. */
-const IMS_GUIDE_CAP = 2200;
+const IMS_GUIDE_CAP = 3200;
 /** Per-standard cap when grounding multiple ISOs under IMS. */
-const IMS_PER_STANDARD_CAP = 1400;
+const IMS_PER_STANDARD_CAP = 4200;
+/** Total cap across all selected standards under IMS (must not collapse to one tiny blob). */
+const IMS_TOTAL_STANDARDS_CAP = 18000;
 /** Cap when embedding grounding inside generation_instructions. */
-export const INSTRUCTIONS_GROUNDING_CAP = 2800;
+export const INSTRUCTIONS_GROUNDING_CAP = 12000;
+/** Max ISO families grounded in one IMS request (performance ceiling; extras are logged). */
+const IMS_MAX_STANDARDS = 10;
 
 export { looksLikeImsRequirement };
+
+export type NavigatorGroundingSource = {
+  standard: string;
+  documentId?: string;
+  /** Edition year when known (from title or resolved library match). */
+  version?: string;
+  pageCount?: number;
+  extractedChars?: number;
+  retrievedPages?: number[];
+  clauseHints?: string[];
+  mode?: string;
+  coverage?: {
+    hasEarlyClause: boolean;
+    hasMidClause: boolean;
+    hasLateClause: boolean;
+    hasDocumentedInformation: boolean;
+    minPage: number;
+    maxPage: number;
+  };
+};
+
+function editionYearFromTitle(title: string): string | undefined {
+  const m = String(title || "").match(/:(\d{4})\b/);
+  return m?.[1];
+}
 
 type ActiveStandard = {
   id: string;
@@ -77,6 +121,30 @@ export async function findMatchingISOStandard(specificRequirements: string) {
   const resolved = await resolveNavigatorISOStandard(specificRequirements);
   if (!resolved.ok) return null;
   return resolved.selected;
+}
+
+/** Detect documented-information / IMS document-list intent from Navigator inputs. */
+export function looksLikeNavigatorDocumentedInfoRequest(
+  documentTitle?: string,
+  queryHints?: string,
+  clause?: string,
+): boolean {
+  const q = `${documentTitle || ""} ${queryHints || ""} ${clause || ""}`
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!q) return false;
+  if (isDocumentedInformationInventoryQuestion(q)) return true;
+  return (
+    /\bdocumented\s+information\b/.test(q) ||
+    /\bdocuments?\s+required\b/.test(q) ||
+    /\bmandatory\s+(documents?|records?)\b/.test(q) ||
+    /\brequired\s+(documents?|records?)\b/.test(q) ||
+    /\bdocument\s+list\b/.test(q) ||
+    /\bims\s+documents?\b/.test(q) ||
+    /\bmaintain(?:ed)?\b.*\bretain(?:ed)?\b/.test(q) ||
+    /\bretain(?:ed)?\b.*\bmaintain(?:ed)?\b/.test(q)
+  );
 }
 
 function selectClauseAwareExcerpt(
@@ -140,7 +208,242 @@ function selectClauseAwareExcerpt(
   return text.slice(0, GROUNDING_CHAR_CAP).trim();
 }
 
-/** Process-local PDF text cache (shared library docs; not tenant-scoped). */
+function pagesFromExcerpt(fullText: string, excerpt: string): number[] {
+  if (!fullText || !excerpt) return [];
+  const markers = collectIsoPdfPageMarkers(fullText);
+  if (!markers.length) return [];
+  const needle = excerpt.trim().slice(0, 120);
+  const idx = needle ? fullText.indexOf(needle) : -1;
+  if (idx < 0) {
+    // Multi-window joins — sample each segment
+    const pages = new Set<number>();
+    for (const part of excerpt.split(/\n\n---\n\n/)) {
+      const stem = part.trim().slice(0, 80);
+      if (!stem) continue;
+      const at = fullText.indexOf(stem);
+      if (at < 0) continue;
+      let best: number | undefined;
+      for (const mk of markers) {
+        if (mk.offset <= at) best = mk.page;
+        else break;
+      }
+      if (best) pages.add(best);
+    }
+    return [...pages].sort((a, b) => a - b);
+  }
+  let best: number | undefined;
+  for (const mk of markers) {
+    if (mk.offset <= idx) best = mk.page;
+    else break;
+  }
+  return best ? [best] : [];
+}
+
+/**
+ * Full-document PDF load for Navigator (Standards Library URLs).
+ * Uses the shared ISO PDF cache — complete extract with page markers.
+ */
+async function loadNavigatorStandardPdf(fileUrl: string): Promise<{
+  text: string;
+  pageCount: number;
+  buffer: Buffer | null;
+  cacheKey: string;
+}> {
+  const url = String(fileUrl || "").trim();
+  if (!url || isPlaceholderFileUrl(url)) {
+    return { text: "", pageCount: 0, buffer: null, cacheKey: "" };
+  }
+  const cacheKey = isoPdfUrlCacheKey(url);
+  const cached = await getCachedIsoPdfBuffer(url, { timeoutMs: 45000 });
+  if (!cached?.buffer) {
+    // Fallback to legacy URL extractor (bounded) if cache download fails
+    const text = await extractPdfTextFromUrl(url, {
+      timeoutMs: 20000,
+      maxChars: 200000,
+    });
+    return {
+      text: (text || "").trim(),
+      pageCount: (text.match(/--\s*\d+\s+of\s+\d+\s*--/g) || []).length,
+      buffer: null,
+      cacheKey,
+    };
+  }
+  const extracted = await extractCachedIsoPdfText(cacheKey, cached.buffer);
+  return {
+    text: extracted.text || "",
+    pageCount: extracted.pageCount || 0,
+    buffer: cached.buffer,
+    cacheKey,
+  };
+}
+
+/**
+ * Retrieve relevant windows from a COMPLETE uploaded standard PDF.
+ * Prefer multi-window documented-information inventory when the request needs it;
+ * otherwise multi-window keyword retrieval; then clause/keyword fallback.
+ * Never intentionally limited to the first N pages.
+ */
+async function selectNavigatorExcerptFromStandard(params: {
+  fileUrl: string;
+  clause?: string;
+  queryHints?: string;
+  documentTitle?: string;
+  maxChars: number;
+  preferInventory: boolean;
+}): Promise<{
+  excerpt: string;
+  pageCount: number;
+  extractedChars: number;
+  retrievedPages: number[];
+  clauseHints: string[];
+  mode: string;
+  coverage?: NavigatorGroundingSource["coverage"];
+}> {
+  const loaded = await loadNavigatorStandardPdf(params.fileUrl);
+  const empty = {
+    excerpt: "",
+    pageCount: 0,
+    extractedChars: 0,
+    retrievedPages: [] as number[],
+    clauseHints: [] as string[],
+    mode: "empty",
+  };
+  if (!loaded.text && !loaded.buffer) return empty;
+
+  const question = [
+    params.documentTitle,
+    params.queryHints,
+    params.clause,
+    params.preferInventory
+      ? "documented information maintain retain mandatory documents records requirements"
+      : "",
+  ]
+    .filter(Boolean)
+    .join(" ")
+    .trim();
+
+  const coverageFull = loaded.text
+    ? computeIsoExtractCoverage(loaded.text)
+    : undefined;
+  const coverage = coverageFull
+    ? {
+        hasEarlyClause: coverageFull.hasEarlyClause,
+        hasMidClause: coverageFull.hasMidClause,
+        hasLateClause: coverageFull.hasLateClause,
+        hasDocumentedInformation: coverageFull.hasDocumentedInformation,
+        minPage: coverageFull.minPage,
+        maxPage: coverageFull.maxPage,
+      }
+    : undefined;
+
+  let excerpt = "";
+  let mode = "none";
+  const debug: LibraryRagChunkDebug[] = [];
+
+  const preferInventory =
+    params.preferInventory ||
+    looksLikeNavigatorDocumentedInfoRequest(
+      params.documentTitle,
+      params.queryHints,
+      params.clause,
+    );
+
+  if (loaded.buffer && preferInventory) {
+    const inventory = await excerptDocumentedInformationGroundingFromBuffer(
+      loaded.buffer,
+      question || "documented information maintain retain",
+      { cacheKey: loaded.cacheKey, debug },
+    );
+    if (
+      inventory &&
+      inventory.length > 200 &&
+      isStrongIsoFocusExcerpt(inventory)
+    ) {
+      excerpt = inventory;
+      mode = "documented_information_inventory";
+    }
+  }
+
+  if (!excerpt && loaded.buffer && question) {
+    debug.length = 0;
+    const multi = await excerptMultiWindowChatGroundingFromBuffer(
+      loaded.buffer,
+      question,
+      { cacheKey: loaded.cacheKey, debug },
+    );
+    if (multi && multi.length > 200 && isStrongIsoFocusExcerpt(multi)) {
+      excerpt = multi;
+      mode = "chat_multi_window";
+    }
+  }
+
+  if (!excerpt && loaded.text) {
+    excerpt = selectClauseAwareExcerpt(
+      loaded.text,
+      params.clause,
+      question || params.queryHints,
+    );
+    mode = params.clause ? "clause_window" : "keyword_window";
+  }
+
+  const clauseHints = [
+    ...new Set(
+      debug
+        .map((c) => c.clauseHint)
+        .filter((c): c is string => Boolean(c && String(c).trim())),
+    ),
+  ].slice(0, 12);
+
+  const retrievedPages = [
+    ...new Set(
+      debug
+        .map((c) => c.pageNumber)
+        .filter((p): p is number => typeof p === "number" && p > 0),
+    ),
+  ].sort((a, b) => a - b);
+
+  // Cap AFTER collecting page/clause metadata from unrepaired chunk windows
+  excerpt = repairCommonIsoOcr((excerpt || "").slice(0, params.maxChars));
+
+  // Fallback page estimate if debug chunks lacked markers
+  const pagesFallback =
+    retrievedPages.length > 0
+      ? retrievedPages
+      : pagesFromExcerpt(loaded.text, excerpt);
+
+  // Annotate excerpt with lightweight source headers for the model (no internal IDs)
+  if (excerpt && (clauseHints.length || pagesFallback.length)) {
+    const metaBits = [
+      pagesFallback.length
+        ? `pages ${pagesFallback.slice(0, 8).join(", ")}${pagesFallback.length > 8 ? "…" : ""}`
+        : "",
+      clauseHints.length
+        ? `clauses ${clauseHints.slice(0, 8).join(", ")}${clauseHints.length > 8 ? "…" : ""}`
+        : "",
+    ]
+      .filter(Boolean)
+      .join("; ");
+    if (metaBits) {
+      excerpt = `[Source windows: ${metaBits}]\n${excerpt}`;
+    }
+  }
+
+  console.log(
+    `[Navigator][retrieval] mode=${mode} extractedChars=${loaded.text.length} pages=${coverage?.minPage ?? "?"}-${coverage?.maxPage ?? "?"}/${loaded.pageCount || "?"} retrievedPages=${pagesFallback.join(",") || "n/a"} clauses=${clauseHints.join(",") || "n/a"} excerptChars=${excerpt.length} inventory=${preferInventory} chunks=${debug.length}`,
+  );
+
+  return {
+    excerpt,
+    pageCount: loaded.pageCount,
+    extractedChars: loaded.text.length,
+    retrievedPages: pagesFallback,
+    clauseHints,
+    mode,
+    coverage,
+  };
+}
+
+/** Process-local PDF text cache for supporting/non-ISO docs only. */
 const PDF_TEXT_CACHE = new Map<string, { text: string; expiresAt: number }>();
 const PDF_TEXT_CACHE_TTL_MS = 10 * 60 * 1000;
 const PDF_TEXT_CACHE_MAX = 40;
@@ -151,8 +454,7 @@ async function extractPdfTextCapped(url: string, maxChars = 40000): Promise<stri
   if (hit && hit.expiresAt > Date.now()) {
     return hit.text;
   }
-  // Keep Audit/Navigator grounding responsive — fall back to description if slow.
-  const text = await extractPdfTextFromUrl(url, { timeoutMs: 8000, maxChars });
+  const text = await extractPdfTextFromUrl(url, { timeoutMs: 15000, maxChars });
   if (text) {
     if (PDF_TEXT_CACHE.size >= PDF_TEXT_CACHE_MAX) {
       const oldest = PDF_TEXT_CACHE.keys().next().value;
@@ -277,10 +579,18 @@ export async function getNavigatorSupportingDocExcerpt(params: {
  * Searches Documents Library AND Standards Library — the client IMS PG may be
  * stored as either. Never hardcodes document IDs or exact titles.
  */
-export async function getNavigatorImsGuideExcerpt(): Promise<{
+export async function getNavigatorImsGuideExcerpt(params?: {
+  preferInventory?: boolean;
+  queryHints?: string;
+}): Promise<{
   excerpt: string;
   title?: string;
   id?: string;
+  version?: string;
+  pageCount?: number;
+  retrievedPages?: number[];
+  clauseHints?: string[];
+  mode?: string;
 }> {
   try {
     const [docs, standards] = await Promise.all([
@@ -386,12 +696,26 @@ export async function getNavigatorImsGuideExcerpt(): Promise<{
     );
 
     if (best.fileUrl && !isPlaceholderFileUrl(best.fileUrl)) {
-      const text = await extractPdfTextCapped(best.fileUrl, 16000);
-      if (text) {
+      const preferInventory = Boolean(params?.preferInventory);
+      const retrieved = await selectNavigatorExcerptFromStandard({
+        fileUrl: best.fileUrl,
+        queryHints:
+          params?.queryHints ||
+          "integrated management system documented information common requirements",
+        documentTitle: best.title,
+        maxChars: IMS_GUIDE_CAP,
+        preferInventory,
+      });
+      if (retrieved.excerpt) {
         return {
-          excerpt: text.replace(/\s+/g, " ").trim().slice(0, IMS_GUIDE_CAP),
+          excerpt: retrieved.excerpt,
           title: best.title,
           id: best.id,
+          version: editionYearFromTitle(best.title),
+          pageCount: retrieved.pageCount,
+          retrievedPages: retrieved.retrievedPages,
+          clauseHints: retrieved.clauseHints,
+          mode: retrieved.mode || "ims_guide",
         };
       }
       console.log(
@@ -408,6 +732,8 @@ export async function getNavigatorImsGuideExcerpt(): Promise<{
       excerpt: fallback.slice(0, IMS_GUIDE_CAP),
       title: best.title,
       id: best.id,
+      version: editionYearFromTitle(best.title),
+      mode: "description_fallback",
     };
   } catch (error) {
     console.log("Navigator IMS guide grounding failed", error);
@@ -419,14 +745,19 @@ async function getMultiIsoGroundingExcerpts(params: {
   specificRequirements: string;
   clause?: string;
   queryHints?: string;
+  documentTitle?: string;
+  preferInventory?: boolean;
 }): Promise<{
   excerpt: string;
   titles: string[];
   standardId?: string;
   missingEditions: string[];
+  sources: NavigatorGroundingSource[];
 }> {
   const tokens = collectIsoTokensFromText(params.specificRequirements);
-  if (!tokens.length) return { excerpt: "", titles: [], missingEditions: [] };
+  if (!tokens.length) {
+    return { excerpt: "", titles: [], missingEditions: [], sources: [] };
+  }
 
   const standards = await loadActiveStandards();
   if (!standards.length) {
@@ -434,17 +765,34 @@ async function getMultiIsoGroundingExcerpts(params: {
       excerpt: "",
       titles: [],
       missingEditions: tokens.map((t) => t),
+      sources: [],
     };
   }
 
   const blocks: string[] = [];
   const titles: string[] = [];
   const missingEditions: string[] = [];
+  const sources: NavigatorGroundingSource[] = [];
   let firstId: string | undefined;
+  let remaining = IMS_TOTAL_STANDARDS_CAP;
 
-  // Resolve + extract each standard in parallel (was sequential PDF downloads).
+  const preferInventory =
+    params.preferInventory ||
+    looksLikeNavigatorDocumentedInfoRequest(
+      params.documentTitle,
+      params.queryHints,
+      params.clause,
+    );
+
+  // Resolve + extract EACH selected standard in parallel — never stop at the first hit.
+  const tokenList = tokens.slice(0, IMS_MAX_STANDARDS);
+  if (tokens.length > IMS_MAX_STANDARDS) {
+    console.log(
+      `[Navigator] IMS multi-ISO: grounding first ${IMS_MAX_STANDARDS} of ${tokens.length} selected standards (performance ceiling); omitted: ${tokens.slice(IMS_MAX_STANDARDS).join(", ")}`,
+    );
+  }
   const settled = await Promise.all(
-    tokens.slice(0, 6).map(async (token) => {
+    tokenList.map(async (token) => {
       const resolved = resolveLibraryStandardEdition(standards, token);
       if (!resolved.ok) {
         const label =
@@ -472,15 +820,35 @@ async function getMultiIsoGroundingExcerpts(params: {
       );
 
       let body = "";
+      let sourceMeta: NavigatorGroundingSource = {
+        standard: match.title,
+        documentId: match.id,
+        version:
+          resolved.selectedYear != null
+            ? String(resolved.selectedYear)
+            : editionYearFromTitle(match.title),
+      };
+
       if (match.fileUrl && !isPlaceholderFileUrl(match.fileUrl)) {
-        const raw = await extractPdfTextCapped(match.fileUrl);
-        if (raw) {
-          body = selectClauseAwareExcerpt(
-            raw,
-            params.clause,
-            params.queryHints,
-          ).slice(0, IMS_PER_STANDARD_CAP);
-        } else {
+        const retrieved = await selectNavigatorExcerptFromStandard({
+          fileUrl: match.fileUrl,
+          clause: params.clause,
+          queryHints: params.queryHints,
+          documentTitle: params.documentTitle,
+          maxChars: IMS_PER_STANDARD_CAP,
+          preferInventory,
+        });
+        body = retrieved.excerpt;
+        sourceMeta = {
+          ...sourceMeta,
+          pageCount: retrieved.pageCount,
+          extractedChars: retrieved.extractedChars,
+          retrievedPages: retrieved.retrievedPages,
+          clauseHints: retrieved.clauseHints,
+          mode: retrieved.mode,
+          coverage: retrieved.coverage,
+        };
+        if (!body) {
           console.log(
             `[Navigator] IMS multi-ISO PDF extract empty for id=${match.id}; using description fallback`,
           );
@@ -492,13 +860,17 @@ async function getMultiIsoGroundingExcerpts(params: {
       }
       if (!body) {
         body = (match.description || "").trim().slice(0, IMS_PER_STANDARD_CAP);
+        sourceMeta.mode = body ? "description_fallback" : "empty";
       }
 
       return {
         ok: true as const,
         id: match.id,
         title: match.title,
-        block: body ? `ISO STANDARD (${match.title}):\n${body}` : "",
+        source: sourceMeta,
+        block: body
+          ? `ISO STANDARD (${match.title}):\n${body}`
+          : "",
       };
     }),
   );
@@ -510,21 +882,27 @@ async function getMultiIsoGroundingExcerpts(params: {
     }
     if (!firstId) firstId = item.id;
     titles.push(item.title);
-    if (item.block) blocks.push(item.block);
+    sources.push(item.source);
+    if (item.block && remaining > 200) {
+      const slice = item.block.slice(0, Math.min(IMS_PER_STANDARD_CAP + 80, remaining));
+      blocks.push(slice);
+      remaining -= slice.length + 2;
+    }
   }
 
   return {
-    excerpt: blocks.join("\n\n").slice(0, GROUNDING_CHAR_CAP),
+    excerpt: blocks.join("\n\n"),
     titles,
     standardId: firstId,
     missingEditions,
+    sources,
   };
 }
 
 /**
  * Bounded library grounding excerpt for navigator generate.
  * Failures return empty string — never block generation.
- * When IMS is selected: IMS Practical Guide + selected ISO standards.
+ * When IMS is selected: IMS Practical Guide + selected ISO standards (full-doc retrieval).
  */
 export async function getNavigatorGroundingExcerpt(params: {
   specificRequirements: string;
@@ -543,18 +921,45 @@ export async function getNavigatorGroundingExcerpt(params: {
   imsGuideAvailable?: boolean;
   isIms?: boolean;
   missingEditions?: string[];
+  groundingSources?: NavigatorGroundingSource[];
 }> {
   try {
     const isIms = looksLikeImsRequirement(params.specificRequirements);
     const skipSupporting = Boolean(params.skipSupporting);
+    const preferInventory =
+      isIms ||
+      looksLikeNavigatorDocumentedInfoRequest(
+        params.documentTitle,
+        params.queryHints,
+        params.clause,
+      );
+
+    const queryHints = [
+      params.queryHints || "",
+      params.documentTitle || "",
+      preferInventory
+        ? "documented information maintain retain mandatory documents records shall"
+        : "",
+      isIms
+        ? "integrated management system common requirements standard-specific"
+        : "",
+    ]
+      .filter(Boolean)
+      .join(" ")
+      .trim();
 
     if (isIms) {
       const [imsGuide, multiIso, supporting] = await Promise.all([
-        getNavigatorImsGuideExcerpt(),
+        getNavigatorImsGuideExcerpt({
+          preferInventory,
+          queryHints,
+        }),
         getMultiIsoGroundingExcerpts({
           specificRequirements: params.specificRequirements,
           clause: params.clause,
-          queryHints: params.queryHints,
+          queryHints,
+          documentTitle: params.documentTitle,
+          preferInventory,
         }),
         skipSupporting
           ? Promise.resolve({ excerpt: "", title: undefined as string | undefined })
@@ -573,7 +978,9 @@ export async function getNavigatorGroundingExcerpt(params: {
         );
       }
       if (multiIso.excerpt) {
-        parts.push(`SELECTED ISO STANDARDS (IMS context):\n${multiIso.excerpt}`);
+        parts.push(
+          `SELECTED ISO STANDARDS (IMS context — analyze together; do not concatenate independent lists):\n${multiIso.excerpt}`,
+        );
       }
       if (supporting.excerpt && supporting.title !== imsGuide.title) {
         parts.push(
@@ -583,7 +990,20 @@ export async function getNavigatorGroundingExcerpt(params: {
 
       const excerpt = parts
         .join("\n\n")
-        .slice(0, GROUNDING_CHAR_CAP + IMS_GUIDE_CAP + SUPPORTING_DOC_CAP);
+        .slice(0, IMS_GUIDE_CAP + IMS_TOTAL_STANDARDS_CAP + SUPPORTING_DOC_CAP);
+
+      const groundingSources: NavigatorGroundingSource[] = [...multiIso.sources];
+      if (imsGuideAvailable && imsGuide.title) {
+        groundingSources.unshift({
+          standard: imsGuide.title,
+          documentId: imsGuide.id,
+          version: imsGuide.version,
+          pageCount: imsGuide.pageCount,
+          retrievedPages: imsGuide.retrievedPages,
+          clauseHints: imsGuide.clauseHints,
+          mode: imsGuide.mode || "ims_guide",
+        });
+      }
 
       return {
         excerpt,
@@ -597,6 +1017,7 @@ export async function getNavigatorGroundingExcerpt(params: {
         imsGuideAvailable,
         isIms: true,
         missingEditions: multiIso.missingEditions,
+        groundingSources,
       };
     }
 
@@ -615,32 +1036,55 @@ export async function getNavigatorGroundingExcerpt(params: {
               resolved.requestedYear
                 ? [`${resolved.family}:${resolved.requestedYear}`]
                 : [],
+            sources: [] as NavigatorGroundingSource[],
           };
         }
         const match = resolved.selected;
 
         let excerpt = "";
+        let source: NavigatorGroundingSource = {
+          standard: match.title,
+          documentId: match.id,
+          version:
+            resolved.selectedYear != null
+              ? String(resolved.selectedYear)
+              : editionYearFromTitle(match.title),
+        };
         if (match.fileUrl && !isPlaceholderFileUrl(match.fileUrl)) {
-          const raw = await extractPdfTextCapped(match.fileUrl);
-          if (raw) {
-            excerpt = selectClauseAwareExcerpt(
-              raw,
-              params.clause,
-              params.queryHints || params.documentTitle,
-            ).slice(0, GROUNDING_CHAR_CAP);
-          } else {
+          const retrieved = await selectNavigatorExcerptFromStandard({
+            fileUrl: match.fileUrl,
+            clause: params.clause,
+            queryHints,
+            documentTitle: params.documentTitle,
+            maxChars: GROUNDING_CHAR_CAP,
+            preferInventory,
+          });
+          excerpt = retrieved.excerpt;
+          source = {
+            ...source,
+            pageCount: retrieved.pageCount,
+            extractedChars: retrieved.extractedChars,
+            retrievedPages: retrieved.retrievedPages,
+            clauseHints: retrieved.clauseHints,
+            mode: retrieved.mode,
+            coverage: retrieved.coverage,
+          };
+          if (!excerpt) {
             console.log(
               `[Navigator] ISO PDF extract empty for id=${match.id}; using description fallback`,
             );
             excerpt = (match.description || "").trim().slice(0, GROUNDING_CHAR_CAP);
+            source.mode = excerpt ? "description_fallback" : "empty";
           }
         } else if (match.fileUrl && isPlaceholderFileUrl(match.fileUrl)) {
           console.log(
             `[Navigator] ISO placeholder fileUrl for id=${match.id}; using description fallback`,
           );
           excerpt = (match.description || "").trim().slice(0, GROUNDING_CHAR_CAP);
+          source.mode = "description_fallback";
         } else {
           excerpt = (match.description || "").trim().slice(0, GROUNDING_CHAR_CAP);
+          source.mode = "description_fallback";
         }
 
         return {
@@ -648,6 +1092,7 @@ export async function getNavigatorGroundingExcerpt(params: {
           standardTitle: match.title,
           standardId: match.id,
           missingEditions: [] as string[],
+          sources: [source],
         };
       })(),
       skipSupporting
@@ -676,6 +1121,7 @@ export async function getNavigatorGroundingExcerpt(params: {
       isIms: false,
       imsGuideAvailable: undefined,
       missingEditions: isoPart.missingEditions,
+      groundingSources: isoPart.sources,
     };
   } catch (error) {
     console.log("Navigator grounding failed", error);

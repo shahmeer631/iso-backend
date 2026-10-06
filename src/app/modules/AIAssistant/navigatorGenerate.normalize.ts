@@ -25,6 +25,15 @@ export type NormalizedNavigatorDocument = {
     ims_guide_title?: string;
     ims_guide_available?: boolean;
     missing_editions?: string[];
+    /** Traceable uploaded-standard sources used for generation (no internal IDs). */
+    grounding_sources?: Array<{
+      standard: string;
+      version?: string;
+      page_count?: number;
+      retrieved_pages?: number[];
+      clauses?: string[];
+      retrieval_mode?: string;
+    }>;
   };
   iso_clauses_referenced: string[];
   generation_timestamp: string;
@@ -376,6 +385,14 @@ export function normalizeNavigatorResponse(
     ims_guide_title?: string;
     ims_guide_available?: boolean;
     missing_editions?: string[];
+    grounding_sources?: Array<{
+      standard: string;
+      version?: string;
+      page_count?: number;
+      retrieved_pages?: number[];
+      clauses?: string[];
+      retrieval_mode?: string;
+    }>;
     fallbackTitle: string;
   },
 ): NormalizedNavigatorDocument {
@@ -466,6 +483,7 @@ export function normalizeNavigatorResponse(
       ims_guide_title: meta.ims_guide_title,
       ims_guide_available: meta.ims_guide_available,
       missing_editions: meta.missing_editions,
+      grounding_sources: meta.grounding_sources,
     },
     iso_clauses_referenced: extractClauses(payload, meta.clause),
     generation_timestamp:

@@ -49,24 +49,66 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
   return !!v && typeof v === "object" && !Array.isArray(v);
 }
 
-function mergeDocLists(
-  lists: Array<unknown[] | undefined>,
+/**
+ * Analysis entry-points for IMS suggestions — NOT a merged per-standard document list.
+ * Selecting these triggers generate/chat retrieval over the selected uploaded standards.
+ */
+function buildImsAnalysisEntryDocuments(
+  selectedTokens: string[],
 ): Array<Record<string, unknown>> {
-  const out: Array<Record<string, unknown>> = [];
-  const seen = new Set<string>();
-  for (const list of lists) {
-    if (!Array.isArray(list)) continue;
-    for (const item of list) {
-      if (!isPlainObject(item)) continue;
-      const key = String(item.title || item.name || "")
-        .toLowerCase()
-        .trim();
-      if (!key || seen.has(key)) continue;
-      seen.add(key);
-      out.push(item);
-    }
-  }
-  return out;
+  const label = selectedTokens.length
+    ? selectedTokens.join(", ")
+    : "the selected standards";
+  return [
+    {
+      title: "IMS Documented Information Requirements",
+      type: "document",
+      ims_role: "analysis",
+      taxonomy: "mandatory_document",
+      integration_note: `Analyze documented information required across ${label} together (maintain vs retain). Do not concatenate independent lists.`,
+    },
+    {
+      title: "Integrated / Common Requirements",
+      type: "document",
+      ims_role: "analysis",
+      taxonomy: "recommended",
+      integration_note:
+        "Identify requirements that can be managed through shared/integrated processes or documented information.",
+    },
+    {
+      title: "Standard-Specific Requirements",
+      type: "document",
+      ims_role: "analysis",
+      taxonomy: "recommended",
+      integration_note:
+        "Identify requirements that remain specific to individual selected standards (quality, environmental, OH&S, information security, etc.).",
+    },
+    {
+      title: "Maintain vs Retain Documented Information",
+      type: "document",
+      ims_role: "analysis",
+      taxonomy: "mandatory_document",
+      integration_note:
+        "Distinguish documented information to be maintained vs retained when the source standards state that distinction.",
+    },
+  ];
+}
+
+function buildImsAnalysisEntryRecords(
+  selectedTokens: string[],
+): Array<Record<string, unknown>> {
+  const label = selectedTokens.length
+    ? selectedTokens.join(", ")
+    : "the selected standards";
+  return [
+    {
+      title: "IMS Evidence / Records Overview",
+      type: "record",
+      ims_role: "analysis",
+      taxonomy: "mandatory_record",
+      integration_note: `Map retained documented information / evidence across ${label} from retrieved source text only.`,
+    },
+  ];
 }
 
 function locateSuggestions(payload: any): {
@@ -170,26 +212,52 @@ export function ensureNavigatorImsSuggestions(
   const hasIms = next.some(suggestionLooksLikeIms);
 
   if (!hasIms && combined.length >= 2) {
-    const related = next.filter((sug) => {
-      const tokens = collectIsoTokensFromText(String(sug.standard || ""));
-      return tokens.some((t) =>
-        combined.some((c) => familyKeyFromToken(t) === familyKeyFromToken(c)),
-      );
-    });
+    const tokensForLabel = combined.slice(0, 10);
     next = [
       ...next,
       {
-        standard: `Integrated Management Systems (${combined.slice(0, 6).join(", ")})`,
+        standard: `Integrated Management Systems (${tokensForLabel.join(", ")})`,
         title: "Integrated Management Systems",
-        relevance:
-          sourceImpliesIms
-            ? "Integrated Management Systems framework covering the selected ISO standards together."
-            : "Combined management system across the recommended ISO standards.",
-        documents: mergeDocLists(related.map((s) => s.documents as unknown[])),
-        records: mergeDocLists(related.map((s) => s.records as unknown[])),
+        relevance: sourceImpliesIms
+          ? "Integrated Management Systems framework: analyze the selected ISO standards together from uploaded PDFs (common/integratable vs standard-specific). Entry documents trigger retrieval — they are not a merged document list."
+          : "Combined management system across the recommended ISO standards. Analyze together from uploaded sources; do not treat as a concatenated document list.",
+        documents: buildImsAnalysisEntryDocuments(tokensForLabel),
+        records: buildImsAnalysisEntryRecords(tokensForLabel),
       },
     ];
   }
+
+  // Force EVERY IMS / multi-ISO suggestion to use analysis entry-points.
+  // AI-returned IMS rows often ship concatenated per-standard document lists —
+  // replace those so Navigator never presents "9001 list + 14001 list = IMS".
+  next = next.map((sug) => {
+    if (!suggestionLooksLikeIms(sug)) return sug;
+    const tokens = filterToLibrary(
+      collectIsoTokensFromText(String(sug.standard || "")),
+    );
+    const tokensForLabel = (tokens.length ? tokens : combined).slice(0, 10);
+    const alreadyAnalysis =
+      Array.isArray(sug.documents) &&
+      sug.documents.length > 0 &&
+      (sug.documents as unknown[]).every(
+        (d) => isPlainObject(d) && d.ims_role === "analysis",
+      );
+    if (alreadyAnalysis) {
+      return {
+        ...sug,
+        relevance:
+          sug.relevance ||
+          "Analyze selected standards together from uploaded PDFs — not a merged document list.",
+      };
+    }
+    return {
+      ...sug,
+      relevance:
+        "Integrated Management Systems: analyze selected standards together from uploaded PDFs (common vs standard-specific). Entry documents trigger retrieval — not a merged per-standard document list.",
+      documents: buildImsAnalysisEntryDocuments(tokensForLabel),
+      records: buildImsAnalysisEntryRecords(tokensForLabel),
+    };
+  });
 
   // Place IMS after individual standards for a clear select list
   const singles = next.filter((s) => !suggestionLooksLikeIms(s));

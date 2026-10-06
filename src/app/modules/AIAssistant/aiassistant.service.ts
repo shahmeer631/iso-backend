@@ -15,9 +15,9 @@ import {
   looksLikeImsRequirement,
   INSTRUCTIONS_GROUNDING_CAP,
 } from "./navigatorGenerate.grounding";
+import { looksLikeNavigatorImsAnalysisQuestion, isNavigatorChatContext, buildNavigatorChatGrounding } from "./navigatorChat";
 import {
   applyLatestLibraryEditionsToPayload,
-  rewriteStandardLabelToLatest,
 } from "./isoStandardVersion";
 import { ensureNavigatorImsSuggestions } from "./navigatorIms";
 import {
@@ -138,20 +138,13 @@ const generateISO = async (payload: any = {}) => {
   const isIms = looksLikeImsRequirement(specific_requirements_raw);
 
   // IMS labels must stay multi-standard — never collapse to a single ISO title.
-  // Single standards: lock to the selected library edition (exact year when specified).
+  // Preserve explicit edition years from the Navigator selection (version isolation).
+  // Do NOT rewrite IMS labels to "latest" library editions — that mixes years.
   let specific_requirements = specific_requirements_raw;
   if (isIms) {
-    const libraryTitles = await prisma.iSOStandard.findMany({
-      where: { status: "ACTIVE" },
-      select: { title: true },
-      take: 200,
-    });
-    specific_requirements = rewriteStandardLabelToLatest(
-      specific_requirements_raw,
-      libraryTitles,
-    );
+    specific_requirements = specific_requirements_raw;
     console.log(
-      `[Navigator] IMS context preserved "${specific_requirements_raw}" → "${specific_requirements}"`,
+      `[Navigator] IMS context preserved as-selected (exact editions): "${specific_requirements}"`,
     );
   } else {
     const resolved = await resolveNavigatorISOStandard(specific_requirements_raw);
@@ -206,10 +199,22 @@ const generateISO = async (payload: any = {}) => {
     );
   }
 
+  const navigatorQueryHints = [
+    document_title,
+    output_type,
+    document_taxonomy || "",
+    isIms || looksLikeNavigatorImsAnalysisQuestion(document_title)
+      ? "integrated management system documented information maintain retain mandatory documents records common requirements standard-specific"
+      : "documented information maintain retain mandatory documents records requirements",
+  ]
+    .filter(Boolean)
+    .join(" ");
+
   const grounding = await getNavigatorGroundingExcerpt({
     specificRequirements: specific_requirements,
     clause,
     documentTitle: document_title,
+    queryHints: navigatorQueryHints,
   });
 
   if (isIms && grounding.missingEditions && grounding.missingEditions.length > 0) {
@@ -224,6 +229,14 @@ const generateISO = async (payload: any = {}) => {
     console.log(
       `[Navigator] IMS proceeding without unavailable editions: ${grounding.missingEditions.join("; ")}`,
     );
+  }
+
+  if (grounding.groundingSources?.length) {
+    for (const src of grounding.groundingSources) {
+      console.log(
+        `[Navigator][source] standard="${src.standard}" id=${src.documentId || "n/a"} pages=${src.pageCount ?? "?"} extractedChars=${src.extractedChars ?? "?"} mode=${src.mode || "n/a"} retrievedPages=${(src.retrievedPages || []).join(",") || "n/a"} coverage=${src.coverage ? `early=${src.coverage.hasEarlyClause}/mid=${src.coverage.hasMidClause}/late=${src.coverage.hasLateClause}/docInfo=${src.coverage.hasDocumentedInformation}` : "n/a"}`,
+      );
+    }
   }
 
   const generation_instructions = buildGenerationInstructions({
@@ -251,6 +264,7 @@ const generateISO = async (payload: any = {}) => {
     clause,
     documentTitle: document_title,
     taxonomy: document_taxonomy,
+    isIms: grounding.isIms || isIms,
   });
 
   // Server-owned prompt only — never trust client override keys
@@ -275,6 +289,17 @@ const generateISO = async (payload: any = {}) => {
     }
   });
 
+  const groundingSourcesForClient = (grounding.groundingSources || [])
+    .filter((s) => s.standard)
+    .map((s) => ({
+      standard: s.standard,
+      version: s.version,
+      page_count: s.pageCount,
+      retrieved_pages: s.retrievedPages?.length ? s.retrievedPages : undefined,
+      clauses: s.clauseHints?.length ? s.clauseHints : undefined,
+      retrieval_mode: s.mode,
+    }));
+
   const meta = {
     organization_context,
     tone,
@@ -288,6 +313,10 @@ const generateISO = async (payload: any = {}) => {
     missing_editions:
       grounding.missingEditions && grounding.missingEditions.length > 0
         ? grounding.missingEditions
+        : undefined,
+    grounding_sources:
+      groundingSourcesForClient.length > 0
+        ? groundingSourcesForClient
         : undefined,
     fallbackTitle: document_title,
   };
@@ -606,7 +635,100 @@ const simpleChat = async (userId: string | undefined, payload: any = {}) => {
     };
   }
 
-  // ── Default simpleChat pass-through (Navigator / Audit Lens / Benchmark)
+  // ── ISO Navigator chat: document-grounded IMS / standard Q&A (not Universal Ask AI)
+  if (isNavigatorChatContext(parsedContext)) {
+    const t0 = Date.now();
+    const grounding = await buildNavigatorChatGrounding({
+      question: questionText,
+      specificRequirements:
+        typeof parsedContext.specific_requirements === "string"
+          ? parsedContext.specific_requirements
+          : typeof parsedContext.iso_standard === "string"
+            ? parsedContext.iso_standard
+            : undefined,
+      organizationContext:
+        typeof parsedContext.organization_context === "string"
+          ? parsedContext.organization_context
+          : undefined,
+      documentTitle:
+        typeof parsedContext.document_title === "string"
+          ? parsedContext.document_title
+          : undefined,
+      clause:
+        typeof parsedContext.clause === "string"
+          ? parsedContext.clause
+          : undefined,
+      generatedDocumentSnippet:
+        typeof parsedContext.full_document_context === "string"
+          ? parsedContext.full_document_context
+          : typeof parsedContext.generated_document === "string"
+            ? parsedContext.generated_document
+            : undefined,
+    });
+
+    if (!grounding.hasGrounding) {
+      console.log(
+        `[NavigatorChat] no_grounding total=${Date.now() - t0}ms retrieval=${grounding.retrievalMs}ms user=${userId || "guest"}`,
+      );
+      return {
+        response:
+          "I couldn't retrieve enough material from the selected Standards Library editions for this question. Select an ISO standard or Integrated Management Systems option in ISO Navigator, then ask again.",
+        messages: [
+          {
+            role: "assistant",
+            content:
+              "I couldn't retrieve enough material from the selected Standards Library editions for this question. Select an ISO standard or Integrated Management Systems option in ISO Navigator, then ask again.",
+          },
+        ],
+        sources: [],
+        session_id: payload.session_id || null,
+        purpose: "iso_navigator",
+        grounded: false,
+      };
+    }
+
+    let aiResponse: any;
+    const tAi = Date.now();
+    try {
+      aiResponse = await callAI({
+        messages: grounding.brief,
+        context: {
+          purpose: "iso_navigator",
+          instruction:
+            "Answer as ISOBrain ISO Navigator. Use only the provided authoritative source material from uploaded Standards Library / IMS guide excerpts plus organization context. For IMS questions, analyze selected standards together — do not concatenate independent document lists. Do not invent requirements. Never use internal system terminology.",
+        },
+        session_id: payload.session_id || undefined,
+      });
+    } catch (error: any) {
+      console.error(
+        `[NavigatorChat] AI provider failed user=${userId || "guest"} message=${error?.message || error}`,
+      );
+      throw mapAiProxyError(error, "ISO Navigator chat");
+    }
+
+    const answer =
+      typeof aiResponse?.response === "string" && aiResponse.response.trim()
+        ? sanitizeLibraryAssistantText(aiResponse.response)
+        : "The available source material does not provide enough information to answer this reliably.";
+
+    console.log(
+      `[NavigatorChat] total=${Date.now() - t0}ms retrieval=${grounding.retrievalMs}ms ai=${Date.now() - tAi}ms user=${userId || "guest"} ims=${grounding.isIms} sources=${grounding.sources.length}`,
+    );
+
+    return {
+      ...(aiResponse || {}),
+      response: answer,
+      messages: [{ role: "assistant", content: answer }],
+      sources: grounding.sources.slice(0, 10),
+      session_id: payload.session_id || null,
+      purpose: "iso_navigator",
+      grounded: true,
+      standard_title: grounding.standardTitle || null,
+      is_ims: grounding.isIms,
+    };
+  }
+
+  // ── Default simpleChat pass-through (Audit Lens / Benchmark / legacy)
   const formData = new FormData();
 
   formData.append(
