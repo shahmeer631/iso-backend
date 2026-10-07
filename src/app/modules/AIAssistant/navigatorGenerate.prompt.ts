@@ -11,6 +11,8 @@ export type OrganizationContextStructured = {
   whom?: string;
 };
 
+import { collectImsIntegrationStandardTokens } from "./navigatorIms";
+
 export type NavigatorGenerateInput = {
   organization_context: string;
   organization_context_structured?: OrganizationContextStructured;
@@ -85,20 +87,32 @@ export function buildGenerationInstructions(input: {
       ? `\n- The following selected editions were NOT available in the Standards Library and must NOT be invented or substituted: ${input.missingEditions.join("; ")}. Ground only on editions present in the grounding excerpt.`
       : "";
 
+  const imsSelectedTokens = input.isIms
+    ? collectImsIntegrationStandardTokens(input.isoStandard)
+    : [];
+  const imsScopeLine =
+    imsSelectedTokens.length > 0
+      ? `- Integration scope (user-selected standards ONLY — do not add others): ${imsSelectedTokens.join(", ")}`
+      : "";
+
   const imsBlock = input.isIms
     ? `
-IMS FRAMEWORK (Integrated Management System — analyze standards TOGETHER):
-- An IMS is an integrated management-system structure combining requirements from the selected standards — it is NOT itself an ISO standard, and it is NOT a concatenated list of each standard's documents.
-- Use the retrieved uploaded ISO standards as the authoritative source for standard-specific requirements. Do not invent or substitute requirements from general knowledge.
-- Use the IMS Practical Guide${input.imsGuideTitle ? ` ("${input.imsGuideTitle}")` : ""} when present in grounding as supporting framework material, together with the listed ISO standards — never as a substitute for those standards.
-- Analyze the selected standards jointly to identify:
-  1) documented information explicitly required by the sources (maintain vs retain when the source states it);
+IMS FRAMEWORK (Integrated Management System — analyze sources TOGETHER):
+${imsScopeLine}
+- The user requested an Integrated Management System. Use the Integrated Management System Practical Guide as the primary IMS integration guidance source. Use the ISO standards selected by the user as the applicable standard-specific sources. Analyze these sources together. Identify the documented information required for the integrated management system. Distinguish integrated/common requirements from standard-specific requirements. Use the actual retrieved source content. Do not introduce standards that were not selected. Do not invent requirements.
+- The user requested an Integrated Management System for the ISO standards named in the context above ONLY. Do not introduce, mention, or invent requirements from standards that were not selected.
+- PRIMARY IMS source: the Integrated Management System – A Practical Guide${input.imsGuideTitle ? ` ("${input.imsGuideTitle}")` : ""} when present in grounding. Use it for integration methodology / IMS structure — not as a substitute for the selected ISO standards' requirements.
+- Selected ISO standards in grounding are the authoritative sources for standard-specific requirements. Do not invent or substitute requirements from general knowledge.
+- Analyze the IMS Practical Guide + selected standards jointly to identify:
+  1) documented information explicitly required for the integrated system (maintain vs retain when the source states it);
   2) requirements that can be managed through shared/integrated processes, controls, or documented information;
-  3) requirements that remain standard-specific (e.g. quality vs environmental vs OH&S vs information security);
-  4) relevant source standard + clause/section where available.
+  3) requirements that remain standard-specific to each selected family;
+  4) relevant source standard + clause/section where available;
+  5) a brief integration / IMS mapping of how common vs specific requirements relate (grounded in sources);
+  6) where sources support it, which processes/procedures or documented information can be shared vs must stay discipline-specific (do not invent a generic IMS process list).
 - Clearly label: (a) explicitly required, (b) source-supported recommendation, (c) analysis/inference — never present (b)/(c) as mandatory ISO obligations.
-- When listing documented information, prefer groupings: Integrated/Common → Maintain vs Retain (when stated) → standard-specific (by each selected family dynamically) → Source/Clause references.
-- Do NOT simply merge independent document lists (ISO 9001 list + ISO 14001 list + …) and call the result an IMS.
+- When listing documented information, prefer groupings: Integrated/Common (core IMS) → Maintain vs Retain (when stated) → standard-specific (label by each selected family dynamically) → Integration / IMS mapping → Source/Clause references.
+- Do NOT simply merge independent document lists (ISO 27001 list + ISO 42001 list + …) and call the result an IMS.
 - Do NOT claim two requirements are identical merely because they sound similar — only integrate when the retrieved source text supports shared treatment.
 - Distinguish mandatory requirements from recommendations / guidance / notes. Do not convert recommendations into mandatory ISO obligations.
 - Cite the relevant standard and clause/section from the grounding when available.
@@ -130,7 +144,11 @@ TONE: ${input.tone}. LANGUAGE: ${input.language}.
 ${groundingBlock}
 
 RULES:
-- Relevance over volume. Target ~800–1400 words total. No ISO history, generic compliance lectures, or repetition.
+- Relevance over volume. ${
+    input.isIms
+      ? "For IMS documented-information requests, prefer a thorough structured analysis (~1400–2400 words) with clear integrated vs standard-specific sections and tables where useful."
+      : "Target ~800–1400 words total."
+  } No ISO history, generic compliance lectures, or repetition.
 - Customize language to the organization when context supports it; otherwise use placeholders: [Organization to define], [Insert responsible role].
 - Do not invent org facts, roles, systems, thresholds, certifications, or controls.
 - Do not invent clauses, documents, records, or ISO obligations not supported by the grounding.
@@ -146,14 +164,25 @@ REQUIRED MARKDOWN (exact H2s):
 Usable template for "${input.documentTitle}" aligned to ${input.isoStandard}${input.clause ? ` clause ${input.clause}` : ""}. Only relevant fields for this document type; placeholders for unknown values.${
     input.isIms
       ? `
-When this request concerns IMS documented information / required documents, structure the template with clear groupings such as:
-- Integrated / Common documented information
-- Documented information to be maintained (when the sources state "maintain")
-- Documented information to be retained / records (when the sources state "retain")
-- Standard-specific documented information (label by each selected standard family dynamically — e.g. ISO 9001-specific, ISO 14001-specific — not hardcoded silos)
-- Source / clause references where available
-Clearly mark items as: explicitly required | source-supported recommendation | analysis/inference.
-Do not output separate siloed lists labeled as an IMS.`
+When this request concerns IMS documented information / required documents, produce a detailed Integrated Management System analysis (not a short paragraph and not independent siloed lists). Prefer this structure when the retrieved sources support it:
+
+### Integrated Management System overview
+Briefly explain how the selected standards can be integrated using the IMS Practical Guide + retrieved requirements (grounded only).
+
+### Integrated Core Mandatory Documented Information
+For each item the sources support, prefer a table or structured rows with columns such as:
+Document / information name | Clause / reference | Purpose | Selected standards satisfied | Integrated or common? | Standard-specific considerations | Classification (explicitly required | source-supported recommendation | analysis/inference)
+
+### Documented information to be maintained / retained
+Only when maintain vs retain is stated in the sources.
+
+### Standard-specific Mandatory Documented Information
+For EACH standard in the integration scope only, use a heading like "{that standard}-specific Mandatory Documented Information" and list items grounded in that standard's retrieved text (same column style where useful).
+
+### Integration / IMS Mapping
+Explain how the common IMS structure connects the selected standards. A table such as Integrated Area | Standard requirement | IMS treatment | Documented information is acceptable when it improves clarity — choose the structure that best fits the retrieved material.
+
+Rules: use only retrieved source content; do not invent clauses/documents; do not add unselected standards; do not present recommendations as mandatory.`
       : ""
   }
 
@@ -195,7 +224,7 @@ export function foldInstructionsIntoPayload(params: {
     `Document: ${params.documentTitle}`,
     params.taxonomy ? `Taxonomy: ${TAXONOMY_LABEL[params.taxonomy]}` : null,
     params.isIms
-      ? "IMS: analyze selected standards together; identify integrated/common vs standard-specific documented information; do not concatenate independent document lists; ground only on retrieved library sources."
+      ? "IMS: primary source = Integrated Management System Practical Guide + user-selected ISO standards only; analyze together; identify integrated/common vs standard-specific documented information; do not concatenate independent document lists; do not introduce unselected standards; ground only on retrieved library sources."
       : null,
     "Output must include: (1) Documented Information Template (2) Implementation Guidance Package (3) Daily Usability & Operational Tools. Relevance over volume. No invented org facts—use placeholders. Do not claim compliance. Use only the Standards Library edition named in specific_requirements; do not fall back to an older edition.",
   ].filter(Boolean);

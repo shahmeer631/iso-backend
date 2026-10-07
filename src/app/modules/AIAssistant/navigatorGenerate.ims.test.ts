@@ -49,15 +49,67 @@ test("buildGenerationInstructions IMS block forbids concatenated document lists"
     instructionsGroundingCap: 9000,
   });
 
-  assert.match(text, /analyze standards TOGETHER/i);
-  assert.match(text, /NOT a concatenated list/i);
+  assert.match(text, /analyze sources TOGETHER/i);
+  assert.match(text, /PRIMARY IMS source|Practical Guide/i);
   assert.match(text, /authoritative/i);
-  assert.match(text, /Integrated\/Common|common\/integrat/i);
+  assert.match(text, /Integrated Management System overview/i);
+  assert.match(text, /Integrated Core Mandatory Documented Information/i);
+  assert.match(text, /Integration \/ IMS Mapping/i);
+  assert.match(text, /Document \/ information name|Clause \/ reference|Purpose/i);
   assert.match(text, /standard-specific/i);
-  assert.match(text, /maintain vs retain/i);
+  assert.match(text, /maintain vs retain|maintained \/ retained/i);
   assert.match(text, /Do NOT simply merge independent document lists/i);
+  assert.match(text, /were not selected|unselected standards/i);
   // Full grounding embed (not truncated to ~2800)
   assert.ok(text.includes("documented information shall be maintained"));
+});
+
+test("buildGenerationInstructions IMS allows thorough documented-information length", () => {
+  const text = buildGenerationInstructions({
+    orgContext: "Acme Manufacturing operates in automotive supply chain.",
+    isoStandard:
+      "Integrated Management Systems (ISO/IEC 27001:2022, ISO/IEC 42001:2023)",
+    documentTitle: "Documented Information Required for the Integrated Management System",
+    outputType: "Documented Information",
+    tone: "professional",
+    language: "English",
+    isIms: true,
+    imsGuideAvailable: true,
+  });
+  assert.match(text, /1400–2400|thorough structured analysis/i);
+  assert.doesNotMatch(text, /Target ~800–1400 words total/);
+});
+
+test("buildGenerationInstructions has no IMS block for single-standard selection", () => {
+  const text = buildGenerationInstructions({
+    orgContext: "Acme Manufacturing operates in automotive supply chain.",
+    isoStandard: "ISO 9001:2026",
+    documentTitle: "Quality Policy",
+    outputType: "Policy",
+    tone: "professional",
+    language: "English",
+    isIms: false,
+  });
+  assert.doesNotMatch(text, /IMS FRAMEWORK/i);
+  assert.doesNotMatch(text, /Integration scope/i);
+});
+
+test("buildGenerationInstructions lists integration scope from IMS label only", () => {
+  const text = buildGenerationInstructions({
+    orgContext: "Acme Manufacturing operates in automotive supply chain.",
+    isoStandard:
+      "Integrated Management Systems (ISO/IEC 27001:2022, ISO/IEC 42001:2023)",
+    documentTitle: "Documented Information Required for the Integrated Management System",
+    outputType: "Documented Information",
+    tone: "professional",
+    language: "English",
+    isIms: true,
+    imsGuideAvailable: true,
+    imsGuideTitle: "Integrated Management System – A Practical Guide",
+  });
+  assert.match(text, /Integration scope.*27001/i);
+  assert.match(text, /Integration scope.*42001/i);
+  assert.doesNotMatch(text, /Integration scope.*9001/i);
 });
 
 test("buildGenerationInstructions embeds substantial grounding under raised cap", () => {

@@ -19,7 +19,15 @@ import { looksLikeNavigatorImsAnalysisQuestion, isNavigatorChatContext, buildNav
 import {
   applyLatestLibraryEditionsToPayload,
 } from "./isoStandardVersion";
-import { ensureNavigatorImsSuggestions } from "./navigatorIms";
+import {
+  collectImsIntegrationStandardTokens,
+  ensureNavigatorImsSuggestions,
+  looksLikeImsRequirement as looksLikeNavigatorImsLabel,
+} from "./navigatorIms";
+import {
+  buildImsDocumentedInformationInventory,
+  imsSuggestionNeedsDocumentInventory,
+} from "./navigatorImsDocuments";
 import {
   hasRequiredNavigatorStructure,
   isValidNavigatorContent,
@@ -217,6 +225,38 @@ const generateISO = async (payload: any = {}) => {
     queryHints: navigatorQueryHints,
   });
 
+  if (isIms && grounding.imsGuideAvailable !== true) {
+    throw new ApiError(
+      httpStatus.BAD_REQUEST,
+      "Integrated Management System – A Practical Guide (IMS PG) was not found in the Documents/Standards Library. Upload the IMS Practical Guide before generating IMS documented information. Generation was not started with a generic substitute.",
+    );
+  }
+
+  if (isIms) {
+    const imsTokens = collectImsIntegrationStandardTokens(specific_requirements);
+    const groundedIsoSources = (grounding.groundingSources || []).filter(
+      (s) =>
+        s.mode !== "ims_guide" &&
+        !/practical\s+guide|integrated\s+management\s+system/i.test(
+          String(s.standard || ""),
+        ),
+    );
+    if (
+      imsTokens.length > 0 &&
+      groundedIsoSources.length === 0 &&
+      (!grounding.excerpt || !/ISO STANDARD\s*\(/i.test(grounding.excerpt))
+    ) {
+      const missing =
+        grounding.missingEditions && grounding.missingEditions.length > 0
+          ? grounding.missingEditions.join("; ")
+          : imsTokens.join(", ");
+      throw new ApiError(
+        httpStatus.BAD_REQUEST,
+        `None of the selected ISO standards for this IMS could be retrieved from the Standards Library (requested: ${missing}). No silent substitution was applied.`,
+      );
+    }
+  }
+
   if (isIms && grounding.missingEditions && grounding.missingEditions.length > 0) {
     // IMS may list several standards — do not block the whole generate when one
     // edition is absent. Continue with available standards; never silently swap years.
@@ -282,6 +322,17 @@ const generateISO = async (payload: any = {}) => {
     grounded_standard: grounding.standardTitle || undefined,
   };
 
+  if (isIms || grounding.isIms) {
+    aiPayload.is_ims = true;
+    const imsTokens = collectImsIntegrationStandardTokens(specific_requirements);
+    if (imsTokens.length) {
+      aiPayload.ims_integration_standards = imsTokens;
+    }
+    if (grounding.imsGuideTitle) {
+      aiPayload.ims_guide_title = grounding.imsGuideTitle;
+    }
+  }
+
   // Remove undefined keys to keep payload compact
   Object.keys(aiPayload).forEach((key) => {
     if (aiPayload[key] === undefined || aiPayload[key] === "") {
@@ -308,6 +359,7 @@ const generateISO = async (payload: any = {}) => {
     document_taxonomy,
     iso_standard: specific_requirements,
     grounded_standard: grounding.standardTitle,
+    is_ims: Boolean(grounding.isIms || isIms),
     ims_guide_title: grounding.imsGuideTitle,
     ims_guide_available: isIms ? grounding.imsGuideAvailable === true : undefined,
     missing_editions:
@@ -2620,6 +2672,55 @@ const generateContext = async (payload: any = {}) => {
   }
 };
 
+/**
+ * Source-grounded IMS Documents & Records for Navigator Step 3.
+ * Uses IMS Practical Guide + selected standards only (deep inventory retrieval).
+ */
+const getNavigatorImsDocuments = async (payload: any = {}) => {
+  const specificRequirements = String(
+    payload.specific_requirements ||
+      payload.standard ||
+      payload.ims_label ||
+      "",
+  ).trim();
+  if (!looksLikeNavigatorImsLabel(specificRequirements)) {
+    throw new ApiError(
+      httpStatus.BAD_REQUEST,
+      "specific_requirements must be an Integrated Management Systems selection.",
+    );
+  }
+  const tokens = collectImsIntegrationStandardTokens(specificRequirements);
+  if (tokens.length < 2) {
+    throw new ApiError(
+      httpStatus.BAD_REQUEST,
+      "IMS selection must list at least two ISO standards.",
+    );
+  }
+
+  const inventory = await buildImsDocumentedInformationInventory(
+    specificRequirements,
+  );
+
+  if (inventory.imsGuideAvailable === false) {
+    throw new ApiError(
+      httpStatus.BAD_REQUEST,
+      "Integrated Management System Practical Guide was not found in the library. Documents & Records cannot be generated without that source.",
+    );
+  }
+
+  return {
+    standard: `Integrated Management Systems (${tokens.join(", ")})`,
+    documents: inventory.documents,
+    records: inventory.records,
+    ims_inventory_pending: false,
+    ims_guide_title: inventory.imsGuideTitle,
+    ims_guide_available: inventory.imsGuideAvailable,
+    missing_editions: inventory.missingEditions || [],
+    grounding_sources: inventory.groundingSources || [],
+    excerpt_chars: inventory.excerptChars || 0,
+  };
+};
+
 // 🔥 ISO SUGGESTIONS
 const getISOSuggestions = async (payload: any = {}) => {
   try {
@@ -2645,12 +2746,26 @@ const getISOSuggestions = async (payload: any = {}) => {
       .join(" ");
     // 1) Remap editions to latest ACTIVE library (IMS-safe multi-token rewrite)
     // 2) Ensure IMS suggestion is present when multiple standards apply
+    // Documents & Records for IMS are enriched on-demand (navigator/ims-documents).
     const withEditions = applyLatestLibraryEditionsToPayload(
       response.data,
       library,
       { dropUnavailableFamilies: true },
     );
-    return ensureNavigatorImsSuggestions(withEditions, sourceText, library);
+    const ensured = ensureNavigatorImsSuggestions(
+      withEditions,
+      sourceText,
+      library,
+    );
+    // Mark pending inventory explicitly for any IMS row still needing enrichment.
+    if (Array.isArray(ensured?.suggestions)) {
+      ensured.suggestions = ensured.suggestions.map((sug: any) => {
+        if (!looksLikeNavigatorImsLabel(String(sug?.standard || ""))) return sug;
+        if (!imsSuggestionNeedsDocumentInventory(sug)) return sug;
+        return { ...sug, ims_inventory_pending: true };
+      });
+    }
+    return ensured;
   } catch (error: any) {
     if (error?.code === "ECONNABORTED") {
       throw new ApiError(
@@ -2858,6 +2973,7 @@ export const AIAssistantService = {
   analyzeBenchmarkText,
   generateContext,
   getISOSuggestions,
+  getNavigatorImsDocuments,
   getBenchmarkAISuggestions,
   generateFollowup,
 };

@@ -22,6 +22,7 @@ export type NormalizedNavigatorDocument = {
     document_taxonomy?: string;
     iso_standard?: string;
     grounded_standard?: string;
+    is_ims?: boolean;
     ims_guide_title?: string;
     ims_guide_available?: boolean;
     missing_editions?: string[];
@@ -382,6 +383,7 @@ export function normalizeNavigatorResponse(
     document_taxonomy?: string;
     iso_standard?: string;
     grounded_standard?: string;
+    is_ims?: boolean;
     ims_guide_title?: string;
     ims_guide_available?: boolean;
     missing_editions?: string[];
@@ -480,6 +482,7 @@ export function normalizeNavigatorResponse(
       document_taxonomy: meta.document_taxonomy,
       iso_standard: meta.iso_standard,
       grounded_standard: meta.grounded_standard,
+      is_ims: meta.is_ims,
       ims_guide_title: meta.ims_guide_title,
       ims_guide_available: meta.ims_guide_available,
       missing_editions: meta.missing_editions,

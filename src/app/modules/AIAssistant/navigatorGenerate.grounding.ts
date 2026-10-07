@@ -5,6 +5,7 @@ import {
   resolveLibraryStandardEdition,
 } from "./isoStandardVersion";
 import {
+  collectImsIntegrationStandardTokens,
   collectIsoTokensFromText,
   looksLikeImsRequirement,
 } from "./navigatorIms";
@@ -30,14 +31,19 @@ const GROUNDING_CHAR_CAP = 6000;
 const CLAUSE_WINDOW = 2800;
 /** Cap for optional supporting Library document excerpt. */
 const SUPPORTING_DOC_CAP = 1500;
-/** Cap for IMS Practical Guide excerpt. */
-const IMS_GUIDE_CAP = 3200;
+/** Cap for IMS Practical Guide excerpt (primary IMS integration source). */
+const IMS_GUIDE_CAP = 7000;
 /** Per-standard cap when grounding multiple ISOs under IMS. */
 const IMS_PER_STANDARD_CAP = 4200;
 /** Total cap across all selected standards under IMS (must not collapse to one tiny blob). */
 const IMS_TOTAL_STANDARDS_CAP = 18000;
+/** Deeper caps for IMS Documents & Records inventory extraction. */
+const IMS_INVENTORY_GUIDE_CAP = 10000;
+const IMS_INVENTORY_PER_STANDARD_CAP = 8000;
+const IMS_INVENTORY_TOTAL_STANDARDS_CAP = 32000;
+const IMS_INVENTORY_MAX_WINDOWS = 18;
 /** Cap when embedding grounding inside generation_instructions. */
-export const INSTRUCTIONS_GROUNDING_CAP = 12000;
+export const INSTRUCTIONS_GROUNDING_CAP = 14000;
 /** Max ISO families grounded in one IMS request (performance ceiling; extras are logged). */
 const IMS_MAX_STANDARDS = 10;
 
@@ -290,6 +296,8 @@ async function selectNavigatorExcerptFromStandard(params: {
   documentTitle?: string;
   maxChars: number;
   preferInventory: boolean;
+  /** Deeper documented-information retrieval for IMS inventory extraction. */
+  inventoryMaxWindows?: number;
 }): Promise<{
   excerpt: string;
   pageCount: number;
@@ -352,7 +360,12 @@ async function selectNavigatorExcerptFromStandard(params: {
     const inventory = await excerptDocumentedInformationGroundingFromBuffer(
       loaded.buffer,
       question || "documented information maintain retain",
-      { cacheKey: loaded.cacheKey, debug },
+      {
+        cacheKey: loaded.cacheKey,
+        debug,
+        maxWindows: params.inventoryMaxWindows,
+        maxChars: params.maxChars,
+      },
     );
     if (
       inventory &&
@@ -582,6 +595,8 @@ export async function getNavigatorSupportingDocExcerpt(params: {
 export async function getNavigatorImsGuideExcerpt(params?: {
   preferInventory?: boolean;
   queryHints?: string;
+  /** Wider retrieval for Documents & Records inventory (not full PDF dump). */
+  deepInventory?: boolean;
 }): Promise<{
   excerpt: string;
   title?: string;
@@ -602,6 +617,7 @@ export async function getNavigatorImsGuideExcerpt(params?: {
             { title: { contains: "integrated management" } },
             { title: { contains: "IMS" } },
             { title: { contains: "IMS PG" } },
+            { title: { contains: "Practical Guide" } },
             { tags: { contains: "IMS" } },
             { tags: { contains: "ims" } },
             { tags: { contains: "Integrated Management" } },
@@ -625,6 +641,7 @@ export async function getNavigatorImsGuideExcerpt(params?: {
             { title: { contains: "Integrated management" } },
             { title: { contains: "Integrated Management" } },
             { title: { contains: "IMS PG" } },
+            { title: { contains: "Practical Guide" } },
             { title: { contains: "IMS" } },
             { description: { contains: "Integrated Management" } },
             { description: { contains: "integrated management" } },
@@ -670,8 +687,12 @@ export async function getNavigatorImsGuideExcerpt(params?: {
     for (const doc of candidates) {
       const hay = `${doc.title} ${doc.description || ""} ${doc.tags || ""}`.toLowerCase();
       let score = 0;
+      // Prefer the client's main IMS document: "Integrated Management System – A Practical Guide (IMS PG)"
+      if (/integrated\s+management\s+system/.test(hay) && /practical\s+guide/.test(hay)) {
+        score += 20;
+      }
       if (/integrated\s+management/.test(hay)) score += 6;
-      if (/\bims\s*pg\b|\(ims\s*pg\)/.test(hay)) score += 10;
+      if (/\bims\s*pg\b|\(ims\s*pg\)/.test(hay)) score += 12;
       if (/\bims\b/.test(hay)) score += 3;
       if (/practical\s+guide/.test(hay)) score += 8;
       if (/guide|framework|handbook|manual/.test(hay)) score += 2;
@@ -697,14 +718,20 @@ export async function getNavigatorImsGuideExcerpt(params?: {
 
     if (best.fileUrl && !isPlaceholderFileUrl(best.fileUrl)) {
       const preferInventory = Boolean(params?.preferInventory);
+      const guideCap = params?.deepInventory
+        ? IMS_INVENTORY_GUIDE_CAP
+        : IMS_GUIDE_CAP;
       const retrieved = await selectNavigatorExcerptFromStandard({
         fileUrl: best.fileUrl,
         queryHints:
           params?.queryHints ||
           "integrated management system documented information common requirements",
         documentTitle: best.title,
-        maxChars: IMS_GUIDE_CAP,
+        maxChars: guideCap,
         preferInventory,
+        inventoryMaxWindows: params?.deepInventory
+          ? IMS_INVENTORY_MAX_WINDOWS
+          : undefined,
       });
       if (retrieved.excerpt) {
         return {
@@ -728,8 +755,11 @@ export async function getNavigatorImsGuideExcerpt(params?: {
     }
 
     const fallback = (best.description || best.title || "").trim();
+    const guideCap = params?.deepInventory
+      ? IMS_INVENTORY_GUIDE_CAP
+      : IMS_GUIDE_CAP;
     return {
-      excerpt: fallback.slice(0, IMS_GUIDE_CAP),
+      excerpt: fallback.slice(0, guideCap),
       title: best.title,
       id: best.id,
       version: editionYearFromTitle(best.title),
@@ -747,6 +777,7 @@ async function getMultiIsoGroundingExcerpts(params: {
   queryHints?: string;
   documentTitle?: string;
   preferInventory?: boolean;
+  deepInventory?: boolean;
 }): Promise<{
   excerpt: string;
   titles: string[];
@@ -754,7 +785,9 @@ async function getMultiIsoGroundingExcerpts(params: {
   missingEditions: string[];
   sources: NavigatorGroundingSource[];
 }> {
-  const tokens = collectIsoTokensFromText(params.specificRequirements);
+  const tokens = looksLikeImsRequirement(params.specificRequirements)
+    ? collectImsIntegrationStandardTokens(params.specificRequirements)
+    : collectIsoTokensFromText(params.specificRequirements);
   if (!tokens.length) {
     return { excerpt: "", titles: [], missingEditions: [], sources: [] };
   }
@@ -769,12 +802,19 @@ async function getMultiIsoGroundingExcerpts(params: {
     };
   }
 
+  const perStandardCap = params.deepInventory
+    ? IMS_INVENTORY_PER_STANDARD_CAP
+    : IMS_PER_STANDARD_CAP;
+  const totalStandardsCap = params.deepInventory
+    ? IMS_INVENTORY_TOTAL_STANDARDS_CAP
+    : IMS_TOTAL_STANDARDS_CAP;
+
   const blocks: string[] = [];
   const titles: string[] = [];
   const missingEditions: string[] = [];
   const sources: NavigatorGroundingSource[] = [];
   let firstId: string | undefined;
-  let remaining = IMS_TOTAL_STANDARDS_CAP;
+  let remaining = totalStandardsCap;
 
   const preferInventory =
     params.preferInventory ||
@@ -835,8 +875,11 @@ async function getMultiIsoGroundingExcerpts(params: {
           clause: params.clause,
           queryHints: params.queryHints,
           documentTitle: params.documentTitle,
-          maxChars: IMS_PER_STANDARD_CAP,
+          maxChars: perStandardCap,
           preferInventory,
+          inventoryMaxWindows: params.deepInventory
+            ? IMS_INVENTORY_MAX_WINDOWS
+            : undefined,
         });
         body = retrieved.excerpt;
         sourceMeta = {
@@ -859,7 +902,7 @@ async function getMultiIsoGroundingExcerpts(params: {
         );
       }
       if (!body) {
-        body = (match.description || "").trim().slice(0, IMS_PER_STANDARD_CAP);
+        body = (match.description || "").trim().slice(0, perStandardCap);
         sourceMeta.mode = body ? "description_fallback" : "empty";
       }
 
@@ -884,7 +927,7 @@ async function getMultiIsoGroundingExcerpts(params: {
     titles.push(item.title);
     sources.push(item.source);
     if (item.block && remaining > 200) {
-      const slice = item.block.slice(0, Math.min(IMS_PER_STANDARD_CAP + 80, remaining));
+      const slice = item.block.slice(0, Math.min(perStandardCap + 80, remaining));
       blocks.push(slice);
       remaining -= slice.length + 2;
     }
@@ -912,6 +955,11 @@ export async function getNavigatorGroundingExcerpt(params: {
   queryHints?: string;
   /** When true, skip optional supporting Library doc PDF (faster for Audit Lens). */
   skipSupporting?: boolean;
+  /**
+   * Wider documented-information retrieval for IMS Documents & Records inventory.
+   * Does not dump entire PDFs — raises window/char caps only.
+   */
+  deepInventory?: boolean;
 }): Promise<{
   excerpt: string;
   standardTitle?: string;
@@ -926,8 +974,10 @@ export async function getNavigatorGroundingExcerpt(params: {
   try {
     const isIms = looksLikeImsRequirement(params.specificRequirements);
     const skipSupporting = Boolean(params.skipSupporting);
+    const deepInventory = Boolean(params.deepInventory);
     const preferInventory =
       isIms ||
+      deepInventory ||
       looksLikeNavigatorDocumentedInfoRequest(
         params.documentTitle,
         params.queryHints,
@@ -949,10 +999,14 @@ export async function getNavigatorGroundingExcerpt(params: {
       .trim();
 
     if (isIms) {
-      const [imsGuide, multiIso, supporting] = await Promise.all([
+      // IMS path: Practical Guide (primary) + selected ISO standards only.
+      // Skip optional supporting Library docs — they often inject unrelated
+      // policy/procedure/templates and unselected standards into the source set.
+      const [imsGuide, multiIso] = await Promise.all([
         getNavigatorImsGuideExcerpt({
           preferInventory,
           queryHints,
+          deepInventory,
         }),
         getMultiIsoGroundingExcerpts({
           specificRequirements: params.specificRequirements,
@@ -960,37 +1014,27 @@ export async function getNavigatorGroundingExcerpt(params: {
           queryHints,
           documentTitle: params.documentTitle,
           preferInventory,
+          deepInventory,
         }),
-        skipSupporting
-          ? Promise.resolve({ excerpt: "", title: undefined as string | undefined })
-          : getNavigatorSupportingDocExcerpt({
-              specificRequirements: params.specificRequirements,
-              documentTitle: params.documentTitle,
-              clause: params.clause,
-            }),
       ]);
 
       const imsGuideAvailable = Boolean(imsGuide.excerpt && imsGuide.title);
       const parts: string[] = [];
       if (imsGuide.excerpt) {
         parts.push(
-          `IMS PRACTICAL GUIDE (${imsGuide.title || "Integrated Management System"}):\n${imsGuide.excerpt}`,
+          `PRIMARY IMS SOURCE — Integrated Management System Practical Guide (${imsGuide.title || "IMS Practical Guide"}):\nUse this for IMS integration methodology / structure. Combine with the selected ISO standards below.\n${imsGuide.excerpt}`,
         );
       }
       if (multiIso.excerpt) {
         parts.push(
-          `SELECTED ISO STANDARDS (IMS context — analyze together; do not concatenate independent lists):\n${multiIso.excerpt}`,
-        );
-      }
-      if (supporting.excerpt && supporting.title !== imsGuide.title) {
-        parts.push(
-          `SUPPORTING LIBRARY DOC (${supporting.title || "document"}):\n${supporting.excerpt}`,
+          `SELECTED ISO STANDARDS ONLY (IMS context — analyze together with the Practical Guide; do not concatenate independent lists; do not add unselected standards):\n${multiIso.excerpt}`,
         );
       }
 
-      const excerpt = parts
-        .join("\n\n")
-        .slice(0, IMS_GUIDE_CAP + IMS_TOTAL_STANDARDS_CAP + SUPPORTING_DOC_CAP);
+      const totalCap = deepInventory
+        ? IMS_INVENTORY_GUIDE_CAP + IMS_INVENTORY_TOTAL_STANDARDS_CAP
+        : IMS_GUIDE_CAP + IMS_TOTAL_STANDARDS_CAP;
+      const excerpt = parts.join("\n\n").slice(0, totalCap);
 
       const groundingSources: NavigatorGroundingSource[] = [...multiIso.sources];
       if (imsGuideAvailable && imsGuide.title) {
@@ -1005,14 +1049,17 @@ export async function getNavigatorGroundingExcerpt(params: {
         });
       }
 
+      const selectedLabel =
+        multiIso.titles.length > 0
+          ? multiIso.titles.join(" + ")
+          : params.specificRequirements;
       return {
         excerpt,
-        standardTitle:
-          multiIso.titles.length > 0
-            ? `IMS: ${multiIso.titles.join(" + ")}`
-            : params.specificRequirements,
+        standardTitle: imsGuideAvailable
+          ? `IMS Practical Guide + ${selectedLabel}`
+          : `IMS: ${selectedLabel}`,
         standardId: multiIso.standardId,
-        supportingTitle: supporting.title,
+        supportingTitle: undefined,
         imsGuideTitle: imsGuide.title,
         imsGuideAvailable,
         isIms: true,

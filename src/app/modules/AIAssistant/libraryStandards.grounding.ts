@@ -373,10 +373,28 @@ function scoreInventoryWindow(
 export async function excerptDocumentedInformationGroundingFromBuffer(
   buffer: Buffer | Uint8Array,
   question: string,
-  options?: { cacheKey?: string; debug?: LibraryRagChunkDebug[] },
+  options?: {
+    cacheKey?: string;
+    debug?: LibraryRagChunkDebug[];
+    /** Max non-overlapping inventory windows (default 10). */
+    maxWindows?: number;
+    /** Cap on joined inventory excerpt chars (default INVENTORY_GROUNDING_CAP). */
+    maxChars?: number;
+  },
 ): Promise<string> {
   try {
     const cacheKey = options?.cacheKey || isoPdfBufferCacheKey(buffer);
+    const maxWindows = Math.max(
+      4,
+      Math.min(40, Number(options?.maxWindows) || 10),
+    );
+    const maxChars = Math.max(
+      1200,
+      Math.min(
+        24000,
+        Number(options?.maxChars) || INVENTORY_GROUNDING_CAP,
+      ),
+    );
     const { text: raw } = await extractCachedIsoPdfText(cacheKey, buffer);
     // Preserve page markers for diagnostics / page-aware ranking.
     const text = (raw || "")
@@ -473,11 +491,11 @@ export async function excerptDocumentedInformationGroundingFromBuffer(
 
     // Prefer obligation windows first (completeness), then high-score fillers
     for (const hit of candidates.filter((c) => c.isObligation)) {
-      if (selected.length >= 10) break;
+      if (selected.length >= maxWindows) break;
       pickIfFar(hit);
     }
     for (const hit of candidates) {
-      if (selected.length >= 10) break;
+      if (selected.length >= maxWindows) break;
       pickIfFar(hit);
     }
 
@@ -515,7 +533,7 @@ export async function excerptDocumentedInformationGroundingFromBuffer(
         const slice = repairCommonIsoOcr(
           text.slice(
             bestIdx,
-            bestIdx + Math.min(INVENTORY_GROUNDING_CAP, text.length - bestIdx),
+            bestIdx + Math.min(maxChars, text.length - bestIdx),
           ),
         );
         if (options?.debug) {
@@ -537,7 +555,7 @@ export async function excerptDocumentedInformationGroundingFromBuffer(
     const parts = selected.map((hit) =>
       repairCommonIsoOcr(text.slice(hit.start, hit.start + INVENTORY_WINDOW)),
     );
-    return parts.join("\n\n---\n\n").slice(0, INVENTORY_GROUNDING_CAP);
+    return parts.join("\n\n---\n\n").slice(0, maxChars);
   } catch {
     return "";
   }

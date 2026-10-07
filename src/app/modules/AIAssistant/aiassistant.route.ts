@@ -78,6 +78,13 @@ router.post(
 );
 
 router.post(
+  "/navigator/ims-documents",
+  optionalAuth(),
+  apiUsage("AI_ASSISTANT"),
+  AIAssistantController.getNavigatorImsDocuments,
+);
+
+router.post(
   "/chat-simple",
   optionalAuth(),
   apiUsage("AI_ASSISTANT"),

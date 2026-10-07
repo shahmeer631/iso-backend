@@ -219,6 +219,18 @@ const getISOSuggestions = catchAsync(async (req, res) => {
   });
 });
 
+/** IMS Documents & Records inventory (source-grounded). */
+const getNavigatorImsDocuments = catchAsync(async (req, res) => {
+  const result = await AIAssistantService.getNavigatorImsDocuments(req.body);
+
+  sendResponse(res, {
+    statusCode: 200,
+    success: true,
+    message: "IMS documented information inventory fetched successfully",
+    data: result,
+  });
+});
+
 const getBenchmarkAISuggestions = catchAsync(async (req, res) => {
   const result = await AIAssistantService.getBenchmarkAISuggestions(
     req.body,
@@ -273,6 +285,7 @@ export const AIAssistantController = {
   analyzeBenchmarkText,
   generateContext,
   getISOSuggestions,
+  getNavigatorImsDocuments,
   getBenchmarkAISuggestions,
   generateFollowup,
 };

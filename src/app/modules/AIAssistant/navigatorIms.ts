@@ -7,6 +7,30 @@
 const ISO_TOKEN_RE =
   /\b((?:ISO(?:\s*\/\s*IEC)?|IEC)\s*\d+(?:\s*-\s*\d+)?)(?:\s*[:\-]\s*(\d{4}))?\b/gi;
 
+/**
+ * ISO families the user chose for IMS integration — parsed from the IMS card label
+ * (parenthetical list). Does not pull standards from prose outside that list.
+ */
+export function collectImsIntegrationStandardTokens(text: string): string[] {
+  const raw = (text || "").trim();
+  if (!raw) return [];
+  const imsParen = raw.match(
+    /integrated\s+management\s+systems?\s*\(([^)]+)\)/i,
+  );
+  if (imsParen?.[1]) {
+    const inner = collectIsoTokensFromText(imsParen[1]);
+    if (inner.length) return inner;
+  }
+  if (looksLikeImsRequirement(raw)) {
+    const anyParen = raw.match(/\(([^)]+)\)/);
+    if (anyParen?.[1]) {
+      const inner = collectIsoTokensFromText(anyParen[1]);
+      if (inner.length) return inner;
+    }
+  }
+  return collectIsoTokensFromText(raw);
+}
+
 export function collectIsoTokensFromText(text: string): string[] {
   if (!text) return [];
   const found: string[] = [];
@@ -32,17 +56,18 @@ function familyKeyFromToken(token: string): string {
   return token.toLowerCase().replace(/:\d{4}$/, "").replace(/\s+/g, " ").trim();
 }
 
-/** True when the selected Navigator requirement is an IMS / multi-standard context. */
+/**
+ * True when the user selected Integrated Management System in Navigator.
+ * Must NOT activate for a bare multi-standard string (regression: single-standard flow).
+ */
 export function looksLikeImsRequirement(text: string): boolean {
   const hay = (text || "").toLowerCase();
-  if (/integrated\s+management/.test(hay) || /\bims\b/.test(hay)) return true;
-  return collectIsoTokensFromText(text).length >= 2;
+  return /integrated\s+management/.test(hay) || /\bims\b/.test(hay);
 }
 
 function suggestionLooksLikeIms(sug: Record<string, unknown>): boolean {
   const hay = `${sug.standard || ""} ${sug.title || ""} ${sug.relevance || ""}`.toLowerCase();
-  if (/integrated\s+management/.test(hay) || /\bims\b/.test(hay)) return true;
-  return collectIsoTokensFromText(String(sug.standard || "")).length >= 2;
+  return /integrated\s+management/.test(hay) || /\bims\b/.test(hay);
 }
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {
@@ -50,65 +75,27 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
 }
 
 /**
- * Analysis entry-points for IMS suggestions — NOT a merged per-standard document list.
- * Selecting these triggers generate/chat retrieval over the selected uploaded standards.
+ * Placeholder IMS documents/records until source-grounded inventory enrichment runs.
+ * Must NOT use analysis headings or Clause: IMS — Step 3 shows real DI items after
+ * POST /navigator/ims-documents.
  */
-function buildImsAnalysisEntryDocuments(
+function buildImsPendingInventoryShell(
   selectedTokens: string[],
-): Array<Record<string, unknown>> {
+): {
+  documents: Array<Record<string, unknown>>;
+  records: Array<Record<string, unknown>>;
+  ims_inventory_pending: true;
+  relevanceSuffix: string;
+} {
   const label = selectedTokens.length
     ? selectedTokens.join(", ")
     : "the selected standards";
-  return [
-    {
-      title: "IMS Documented Information Requirements",
-      type: "document",
-      ims_role: "analysis",
-      taxonomy: "mandatory_document",
-      integration_note: `Analyze documented information required across ${label} together (maintain vs retain). Do not concatenate independent lists.`,
-    },
-    {
-      title: "Integrated / Common Requirements",
-      type: "document",
-      ims_role: "analysis",
-      taxonomy: "recommended",
-      integration_note:
-        "Identify requirements that can be managed through shared/integrated processes or documented information.",
-    },
-    {
-      title: "Standard-Specific Requirements",
-      type: "document",
-      ims_role: "analysis",
-      taxonomy: "recommended",
-      integration_note:
-        "Identify requirements that remain specific to individual selected standards (quality, environmental, OH&S, information security, etc.).",
-    },
-    {
-      title: "Maintain vs Retain Documented Information",
-      type: "document",
-      ims_role: "analysis",
-      taxonomy: "mandatory_document",
-      integration_note:
-        "Distinguish documented information to be maintained vs retained when the source standards state that distinction.",
-    },
-  ];
-}
-
-function buildImsAnalysisEntryRecords(
-  selectedTokens: string[],
-): Array<Record<string, unknown>> {
-  const label = selectedTokens.length
-    ? selectedTokens.join(", ")
-    : "the selected standards";
-  return [
-    {
-      title: "IMS Evidence / Records Overview",
-      type: "record",
-      ims_role: "analysis",
-      taxonomy: "mandatory_record",
-      integration_note: `Map retained documented information / evidence across ${label} from retrieved source text only.`,
-    },
-  ];
+  return {
+    documents: [],
+    records: [],
+    ims_inventory_pending: true,
+    relevanceSuffix: `Documents & Records are extracted from the IMS Practical Guide + ${label} (not analysis categories).`,
+  };
 }
 
 function locateSuggestions(payload: any): {
@@ -170,39 +157,43 @@ export function ensureNavigatorImsSuggestions(
   let next = located.list.map((sug) => {
     const standard = String(sug.standard || "").trim();
     const tokens = filterToLibrary(collectIsoTokensFromText(standard));
-    if (tokens.length >= 2 && !/integrated\s+management/i.test(standard)) {
+    // Normalize explicit IMS rows only — never rewrite individual standard cards.
+    if (
+      /integrated\s+management/i.test(standard) &&
+      tokens.length >= 2
+    ) {
       return {
         ...sug,
         standard: `Integrated Management Systems (${tokens.join(", ")})`,
         title: sug.title || "Integrated Management Systems",
       };
     }
-    if (
-      /integrated\s+management/i.test(standard) &&
-      libraryFamilyKeys.size &&
-      tokens.length >= 2
-    ) {
-      return {
-        ...sug,
-        standard: `Integrated Management Systems (${tokens.join(", ")})`,
-      };
-    }
     return sug;
   });
 
-  const fromSuggestions = next.flatMap((sug) =>
-    collectIsoTokensFromText(
-      `${sug.standard || ""} ${sug.title || ""} ${sug.relevance || ""}`,
-    ),
-  );
-  const fromSource = collectIsoTokensFromText(sourceText || "");
-  const combined: string[] = [];
+  // Source of truth for IMS standard families = Navigator suggestion cards only.
+  // Do NOT scrape ISO tokens from free-form organization context — that injects
+  // unrelated standards (e.g. 9001/14001/45001) the user never selected.
+  const fromSingleSuggestions = next
+    .filter((sug) => !suggestionLooksLikeIms(sug))
+    .flatMap((sug) =>
+      collectIsoTokensFromText(String(sug.standard || "")),
+    );
+  const fromExistingImsLabels = next
+    .filter(suggestionLooksLikeIms)
+    .flatMap((sug) =>
+      collectImsIntegrationStandardTokens(String(sug.standard || "")),
+    );
+  const selectedFamilies: string[] = [];
   const seen = new Set<string>();
-  for (const token of filterToLibrary([...fromSource, ...fromSuggestions])) {
+  for (const token of filterToLibrary([
+    ...fromExistingImsLabels,
+    ...fromSingleSuggestions,
+  ])) {
     const key = familyKeyFromToken(token);
     if (!key || seen.has(key)) continue;
     seen.add(key);
-    combined.push(token);
+    selectedFamilies.push(token);
   }
 
   const sourceImpliesIms =
@@ -211,57 +202,108 @@ export function ensureNavigatorImsSuggestions(
     );
   const hasIms = next.some(suggestionLooksLikeIms);
 
-  if (!hasIms && combined.length >= 2) {
-    const tokensForLabel = combined.slice(0, 10);
+  if (!hasIms && selectedFamilies.length >= 2) {
+    const tokensForLabel = selectedFamilies.slice(0, 10);
+    const shell = buildImsPendingInventoryShell(tokensForLabel);
     next = [
       ...next,
       {
         standard: `Integrated Management Systems (${tokensForLabel.join(", ")})`,
         title: "Integrated Management Systems",
         relevance: sourceImpliesIms
-          ? "Integrated Management Systems framework: analyze the selected ISO standards together from uploaded PDFs (common/integratable vs standard-specific). Entry documents trigger retrieval — they are not a merged document list."
-          : "Combined management system across the recommended ISO standards. Analyze together from uploaded sources; do not treat as a concatenated document list.",
-        documents: buildImsAnalysisEntryDocuments(tokensForLabel),
-        records: buildImsAnalysisEntryRecords(tokensForLabel),
+          ? `Uses the Integrated Management System Practical Guide as the primary IMS source, combined with these selected ISO standards. ${shell.relevanceSuffix}`
+          : `Uses the IMS Practical Guide + these recommended ISO standards as an integrated management system. ${shell.relevanceSuffix}`,
+        documents: shell.documents,
+        records: shell.records,
+        ims_inventory_pending: shell.ims_inventory_pending,
       },
     ];
   }
 
-  // Force EVERY IMS / multi-ISO suggestion to use analysis entry-points.
-  // AI-returned IMS rows often ship concatenated per-standard document lists —
-  // replace those so Navigator never presents "9001 list + 14001 list = IMS".
-  next = next.map((sug) => {
-    if (!suggestionLooksLikeIms(sug)) return sug;
-    const tokens = filterToLibrary(
-      collectIsoTokensFromText(String(sug.standard || "")),
-    );
-    const tokensForLabel = (tokens.length ? tokens : combined).slice(0, 10);
-    const alreadyAnalysis =
-      Array.isArray(sug.documents) &&
-      sug.documents.length > 0 &&
-      (sug.documents as unknown[]).every(
-        (d) => isPlainObject(d) && d.ims_role === "analysis",
+  // Force EVERY IMS suggestion off analysis headings / concatenated per-standard lists.
+  // Documents & Records are filled by source-grounded inventory enrichment.
+  // Drop bare "IMS" cards with no standards.
+  next = next
+    .map((sug) => {
+      if (!suggestionLooksLikeIms(sug)) return sug;
+      const tokens = filterToLibrary(
+        collectImsIntegrationStandardTokens(String(sug.standard || "")),
       );
-    if (alreadyAnalysis) {
+      const tokensForLabel = tokens.slice(0, 10);
+      if (tokensForLabel.length < 2) {
+        return null;
+      }
+      const shell = buildImsPendingInventoryShell(tokensForLabel);
+      const alreadyEnriched =
+        sug.ims_inventory_pending === false &&
+        Array.isArray(sug.documents) &&
+        (sug.documents as unknown[]).length > 0 &&
+        (sug.documents as unknown[]).every(
+          (d) =>
+            isPlainObject(d) &&
+            d.ims_role !== "analysis" &&
+            !/^ims$/i.test(String(d.clause || "")),
+        );
+      if (alreadyEnriched) {
+        return {
+          ...sug,
+          standard: `Integrated Management Systems (${tokensForLabel.join(", ")})`,
+          title: sug.title || "Integrated Management Systems",
+          ims_inventory_pending: false,
+        };
+      }
       return {
         ...sug,
+        standard: `Integrated Management Systems (${tokensForLabel.join(", ")})`,
+        title: sug.title || "Integrated Management Systems",
         relevance:
-          sug.relevance ||
-          "Analyze selected standards together from uploaded PDFs — not a merged document list.",
+          String(sug.relevance || "").trim() ||
+          `IMS Practical Guide (primary) + selected ISO standards. ${shell.relevanceSuffix}`,
+        documents: shell.documents,
+        records: shell.records,
+        ims_inventory_pending: shell.ims_inventory_pending,
       };
-    }
-    return {
-      ...sug,
-      relevance:
-        "Integrated Management Systems: analyze selected standards together from uploaded PDFs (common vs standard-specific). Entry documents trigger retrieval — not a merged per-standard document list.",
-      documents: buildImsAnalysisEntryDocuments(tokensForLabel),
-      records: buildImsAnalysisEntryRecords(tokensForLabel),
-    };
-  });
+    })
+    .filter((sug): sug is Record<string, unknown> => sug != null);
 
-  // Place IMS after individual standards for a clear select list
+  // If bare IMS rows were dropped and no valid IMS remains, inject from singles.
+  if (
+    !next.some(suggestionLooksLikeIms) &&
+    selectedFamilies.length >= 2
+  ) {
+    const tokensForLabel = selectedFamilies.slice(0, 10);
+    const shell = buildImsPendingInventoryShell(tokensForLabel);
+    next = [
+      ...next,
+      {
+        standard: `Integrated Management Systems (${tokensForLabel.join(", ")})`,
+        title: "Integrated Management Systems",
+        relevance: `Uses the IMS Practical Guide + these recommended ISO standards as an integrated management system. ${shell.relevanceSuffix}`,
+        documents: shell.documents,
+        records: shell.records,
+        ims_inventory_pending: shell.ims_inventory_pending,
+      },
+    ];
+  }
+
+  // Place IMS after individual standards. Keep distinct IMS combinations
+  // (e.g. 27001+42001 vs 9001+14001+45001); drop only identical duplicates.
   const singles = next.filter((s) => !suggestionLooksLikeIms(s));
-  const ims = next.filter(suggestionLooksLikeIms);
+  const imsRaw = next.filter(suggestionLooksLikeIms);
+  const seenImsCombo = new Set<string>();
+  const ims: Record<string, unknown>[] = [];
+  for (const sug of imsRaw) {
+    const comboKey = collectImsIntegrationStandardTokens(String(sug.standard || ""))
+      .map(familyKeyFromToken)
+      .filter(Boolean)
+      .sort()
+      .join("|");
+    // Require a real multi-standard combo — never keep a bare IMS object.
+    if (!comboKey || comboKey.split("|").length < 2) continue;
+    if (seenImsCombo.has(comboKey)) continue;
+    seenImsCombo.add(comboKey);
+    ims.push(sug);
+  }
   next = [...singles, ...ims];
 
   // Always return a flat `{ suggestions }` shape so BFF → client unwrap is stable

@@ -200,14 +200,15 @@ export async function buildNavigatorChatGrounding(params: {
   const imsRules = isIms
     ? `
 IMS ANALYSIS RULES:
-- An Integrated Management System combines requirements from the selected standards — it is NOT itself an ISO standard and NOT a concatenated per-standard document list.
-- Analyze the retrieved standards TOGETHER.
-- Identify: (1) explicitly required documented information; (2) common/integratable requirements; (3) standard-specific requirements; (4) maintain vs retain when the source states it; (5) source standard + clause when available.
+- An Integrated Management System combines the IMS Practical Guide with the user-selected standards — it is NOT itself an ISO standard and NOT a concatenated per-standard document list.
+- PRIMARY IMS source: Integrated Management System – A Practical Guide${imsGuideTitle ? ` ("${imsGuideTitle}")` : ""} for integration methodology / IMS structure.
+- Selected ISO standards remain authoritative for standard-specific requirements. Do not introduce standards that were not selected.
+- Analyze the IMS Practical Guide + retrieved selected standards TOGETHER.
+- Identify: (1) explicitly required documented information for the IMS; (2) common/integratable requirements; (3) standard-specific requirements; (4) maintain vs retain when the source states it; (5) source standard + clause when available; (6) brief integration mapping when helpful.
 - Do NOT invent documents, clauses, or obligations. If the sources are insufficient, say so.
 - Do NOT claim two requirements are identical only because they sound similar.
-- Organize answers as Integrated/Common first, then standard-specific, then Source/Clause references when listing documented information.
-- IMS Practical Guide${imsGuideTitle ? ` ("${imsGuideTitle}")` : ""} is supporting only — selected ISO standards remain authoritative for standard-specific claims.
-${imsGuideAvailable === false ? "- IMS Practical Guide was not found; ground only on selected ISO standards + organization context.\n" : ""}${
+- Organize answers as Integrated/Common first, then standard-specific (selected families only), then Integration / Source/Clause references when listing documented information.
+${imsGuideAvailable === false ? "- IMS Practical Guide was not found in the Library. Say clearly that the IMS Practical Guide source is unavailable; do not invent IMS methodology. Ground only on selected ISO standards + organization context if present.\n" : ""}${
         missingEditions?.length
           ? `- Do not invent these unavailable editions: ${missingEditions.join("; ")}.\n`
           : ""
