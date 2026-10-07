@@ -821,16 +821,59 @@ export function resolveLibraryTask(
   return detectLibraryTask(userMessage);
 }
 
+/** Default count for Expert Studio Generate Quiz / Generate Exam Questions. */
+export const LIBRARY_STUDIO_QUESTION_COUNT = 20;
+/** Starter chips on the Library welcome screen (unchanged). */
+export const LIBRARY_STARTER_QUESTION_COUNT = 5;
+
+export type LibraryTaskInstructionOptions = {
+  questionCount?: number;
+  /** Previous-attempt question texts to exclude on Retry (not merely reshuffle). */
+  excludeQuestions?: string[];
+};
+
+/** Stable fingerprint for question identity (normalized text, not array index). */
+export function libraryQuestionFingerprint(text: string): string {
+  return String(text || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 120);
+}
+
+function buildExcludeQuestionsInstruction(excludeQuestions?: string[]): string {
+  const cleaned = (excludeQuestions || [])
+    .map((q) => String(q || "").replace(/\s+/g, " ").trim())
+    .filter((q) => q.length >= 12)
+    .slice(0, 40);
+  if (!cleaned.length) return "";
+  return [
+    "RETRY / NEW ATTEMPT — EXCLUSION LIST (do NOT repeat these questions or near-duplicates with tiny wording changes):",
+    ...cleaned.map((q, i) => `${i + 1}. ${q}`),
+    "Prefer unused requirements/themes from other clauses/pages of the source. If the source cannot support a full new set, generate as many genuinely different questions as the source supports — never pad by repeating the exclusion list.",
+  ].join("\n");
+}
+
 export function buildLibraryTaskInstructions(
   task: LibraryTaskKind,
   standardTitle: string,
+  options?: LibraryTaskInstructionOptions,
 ): string {
   const std = standardTitle || "the selected ISO standard";
+  const studioCount = Math.max(
+    5,
+    Math.min(
+      40,
+      Number(options?.questionCount) || LIBRARY_STUDIO_QUESTION_COUNT,
+    ),
+  );
+  const excludeBlock = buildExcludeQuestionsInstruction(options?.excludeQuestions);
 
   switch (task) {
     case "starter_questions":
       return [
-        `TASK: Propose exactly 5 difficult exam-style study questions about ${std}.`,
+        `TASK: Propose exactly ${LIBRARY_STARTER_QUESTION_COUNT} difficult exam-style study questions about ${std}.`,
         `Every question MUST be specifically about ${std} — use the selected standard name/year when natural.`,
         "Ground EVERY question in the SOURCE MATERIAL below (requirements from the selected standard). Do not invent clauses.",
         "Cover FIVE DIFFERENT requirement themes drawn from DIFFERENT parts of the source material (early/middle/late topics if present).",
@@ -847,20 +890,25 @@ export function buildLibraryTaskInstructions(
         '- learner-org questions ("your company", "your QMS", "in your organization")',
         "- inventing clause numbers not present in the source material",
         "- five near-duplicates of the same topic",
-        "Return ONLY a numbered list of 5 clean questions (one per line). No preamble, no answers, no internal instructions.",
+        `Return ONLY a numbered list of ${LIBRARY_STARTER_QUESTION_COUNT} clean questions (one per line). No preamble, no answers, no internal instructions.`,
       ].join("\n");
 
     case "exam_questions":
       return [
-        `TASK: Generate 5 difficult professional exam questions grounded ONLY in ${std} source material.`,
+        `TASK: Generate ${studioCount} difficult professional exam questions grounded ONLY in ${std} source material.`,
         `Every question MUST clearly relate to ${std} — never another ISO family.`,
         "Style: certification/examination questions — direct, specific, technically meaningful, challenging.",
-        "Cover DIFFERENT aspects across the set (one each where the source supports it):",
+        `Cover DIFFERENT aspects across the set of ${studioCount} (rotate these themes; do not stop after 5):`,
         "1) Requirement understanding / interpretation",
         "2) Purpose / intent of a requirement",
         "3) Evidence an auditor would expect",
         "4) Implementation / application of a requirement",
         "5) Documented information / compliance expectation",
+        "6) Roles / responsibilities",
+        "7) Monitoring, audit, or management review",
+        "8) Nonconformity / corrective action / improvement",
+        "Draw questions from DIFFERENT parts of the standard (early, middle, and late requirement themes).",
+        "All questions in this set MUST be unique — no duplicates and no near-duplicates.",
         "FORBIDDEN:",
         '- open-ended coaching ("What is your scope?", "What do you know about…?", "Can you explain…?", "How would you define…?")',
         '- questions about the learner\'s own organization ("your company", "your processes")',
@@ -868,16 +916,20 @@ export function buildLibraryTaskInstructions(
         "- inventing clause numbers or mandatory documents not supported by sources",
         "Format markdown:",
         "## Exam Questions",
-        "For each: **Q1.** question text",
+        "For each: **Q1.** … **Q2.** … through **Q" + String(studioCount) + ".** question text",
         "Optionally include *(Relevant requirement: …)* only if supported by sources.",
         "Then a short **Model answer guidance** bullet set (not a full essay).",
-      ].join("\n");
+        excludeBlock,
+      ]
+        .filter(Boolean)
+        .join("\n");
 
     case "quiz":
       return [
         `TASK: Generate a professional knowledge assessment quiz for ${std}.`,
-        "Produce 5 multiple-choice questions that are standard-specific and difficult enough to test real understanding.",
-        "Vary coverage: interpretation, purpose, evidence, implementation, documented information — do not repeat one concept.",
+        `Produce exactly ${studioCount} multiple-choice questions that are standard-specific and difficult enough to test real understanding.`,
+        "Vary coverage across interpretation, purpose, evidence, implementation, documented information, roles, audit/review, and improvement — do not repeat one concept.",
+        "Draw from DIFFERENT parts of the standard (early/middle/late). All questions MUST be unique.",
         "Each question: one clearly correct answer; 3 plausible distractors; no duplicate options; no \"longest option is correct\" pattern.",
         "Ground answers in the attached/excerpted standard. Do not invent requirements to create distractors.",
         "Format markdown exactly:",
@@ -890,8 +942,11 @@ export function buildLibraryTaskInstructions(
         "D) …",
         "**Correct answer:** X",
         "**Explanation:** brief source-grounded explanation (cite requirement/clause only if present in sources)",
-        "Repeat for Questions 2–5.",
-      ].join("\n");
+        `Repeat for Questions 2–${studioCount} (do not stop at 5).`,
+        excludeBlock,
+      ]
+        .filter(Boolean)
+        .join("\n");
 
     case "notes":
       return [
@@ -1128,7 +1183,8 @@ export function isUnusableLibraryStudioResponse(
     task === "summary" ||
     task === "eli5" ||
     task === "flashcards" ||
-    task === "quiz";
+    task === "quiz" ||
+    task === "exam_questions";
 
   if (studioTask) {
     // Notes/summary must be substantive and grounded
@@ -1624,7 +1680,7 @@ export function isOpenEndedCoachingQuestion(text: string): boolean {
 /** Keep up to `limit` exam-style questions; drop coaching / trivial / duplicates. */
 export function filterExamStyleQuestions(
   items: string[],
-  limit = 5,
+  limit = LIBRARY_STARTER_QUESTION_COUNT,
 ): string[] {
   const out: string[] = [];
   const seen = new Set<string>();
@@ -1663,7 +1719,10 @@ export function filterExamStyleQuestions(
 }
 
 /** Parse numbered / Qn question lines from a model response. */
-export function parseGeneratedExamQuestions(markdown: string, limit = 5): string[] {
+export function parseGeneratedExamQuestions(
+  markdown: string,
+  limit = LIBRARY_STARTER_QUESTION_COUNT,
+): string[] {
   const lines = String(markdown || "")
     .split(/\n+/)
     .map((l) => l.trim())
@@ -1686,6 +1745,66 @@ export function parseGeneratedExamQuestions(markdown: string, limit = 5): string
     }
   }
   return filterExamStyleQuestions(candidates, limit);
+}
+
+/**
+ * Count unique MCQ blocks in Library quiz markdown (### Question N).
+ * Used to verify Expert Studio quiz generation reached the requested count.
+ */
+export function countLibraryQuizQuestions(markdown: string): number {
+  const blocks = String(markdown || "")
+    .split(/###\s*Question\s*\d+/i)
+    .slice(1);
+  let count = 0;
+  const seen = new Set<string>();
+  for (const block of blocks) {
+    const lines = block
+      .split("\n")
+      .map((l) => l.trim())
+      .filter(Boolean);
+    if (!lines.length) continue;
+    const optionLines = lines.filter((l) => /^[A-D][\)\.\:]\s+/i.test(l));
+    if (optionLines.length < 2) continue;
+    if (!lines.some((l) => /correct\s*answer/i.test(l))) continue;
+    const firstOptIdx = lines.findIndex((l) => /^[A-D][\)\.\:]\s+/i.test(l));
+    const question = lines
+      .slice(0, firstOptIdx > 0 ? firstOptIdx : 1)
+      .join(" ")
+      .trim();
+    if (!question || question.length < 8) continue;
+    const key = libraryQuestionFingerprint(question);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    count += 1;
+  }
+  return count;
+}
+
+/** Extract question stems from Library quiz markdown (for Retry exclusion). */
+export function extractLibraryQuizQuestionTexts(markdown: string): string[] {
+  const blocks = String(markdown || "")
+    .split(/###\s*Question\s*\d+/i)
+    .slice(1);
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const block of blocks) {
+    const lines = block
+      .split("\n")
+      .map((l) => l.trim())
+      .filter(Boolean);
+    if (!lines.length) continue;
+    const firstOptIdx = lines.findIndex((l) => /^[A-D][\)\.\:]\s+/i.test(l));
+    const question = lines
+      .slice(0, firstOptIdx > 0 ? firstOptIdx : 1)
+      .join(" ")
+      .trim();
+    if (!question || question.length < 8) continue;
+    const key = libraryQuestionFingerprint(question);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(question);
+  }
+  return out;
 }
 
 /** Normalize remote flashcard payloads into the frontend deck contract. */

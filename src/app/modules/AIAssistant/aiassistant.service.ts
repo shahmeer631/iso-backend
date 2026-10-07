@@ -56,9 +56,12 @@ import {
 import {
   LIBRARY_BRIEF_HEADER,
   LIBRARY_FLASHCARD_INSTRUCTION,
+  LIBRARY_STARTER_QUESTION_COUNT,
+  LIBRARY_STUDIO_QUESTION_COUNT,
   buildLibraryAvailableSources,
   buildLibraryTaskInstructions,
   computeIsoExtractCoverage,
+  countLibraryQuizQuestions,
   excerptDocumentedInformationGroundingFromBuffer,
   excerptExamStudyGroundingFromBuffer,
   excerptAskAiQuestionSeedFromBuffer,
@@ -1419,10 +1422,40 @@ const chat = async (userId: string, payload: any = {}) => {
         : "the selected ISO standard");
 
     const libraryTask = resolveLibraryTask(finalContext, userQ);
+    const studioQuestionCount = (() => {
+      const n = Number(
+        finalContext.question_count ??
+          finalContext.num_questions ??
+          finalContext.questionCount,
+      );
+      if (Number.isFinite(n) && n >= 5 && n <= 40) return Math.floor(n);
+      return LIBRARY_STUDIO_QUESTION_COUNT;
+    })();
+    const excludeQuestions = (() => {
+      const raw =
+        finalContext.exclude_questions ||
+        finalContext.excludeQuestions ||
+        finalContext.previous_questions ||
+        [];
+      if (!Array.isArray(raw)) return [] as string[];
+      return raw
+        .map((q: unknown) => String(q || "").replace(/\s+/g, " ").trim())
+        .filter((q: string) => q.length >= 12)
+        .slice(0, 40);
+    })();
     const taskInstructions = buildLibraryTaskInstructions(
       libraryTask,
       standardTitle,
+      libraryTask === "quiz" || libraryTask === "exam_questions"
+        ? {
+            questionCount: studioQuestionCount,
+            excludeQuestions,
+          }
+        : undefined,
     );
+    // Stash for post-response validation / logging
+    finalContext._studio_question_count = studioQuestionCount;
+    finalContext._exclude_questions_count = excludeQuestions.length;
 
     const sourcesList = Array.isArray(finalContext.available_sources)
       ? finalContext.available_sources.join("; ")
@@ -1613,7 +1646,11 @@ const chat = async (userId: string, payload: any = {}) => {
       purpose: "library_standards",
       ...(clauseForBrief ? { clause: clauseForBrief } : {}),
       instruction:
-        libraryTask === "exam_questions" || libraryTask === "starter_questions"
+        libraryTask === "exam_questions"
+          ? `Generate ${studioQuestionCount} difficult exam-style questions grounded ONLY in ${standardTitle} and the provided source material. Cover different requirement themes across the standard. No open-ended coaching prompts. No invented clauses. Never use internal system terminology.`
+          : libraryTask === "quiz"
+            ? `Generate ${studioQuestionCount} multiple-choice quiz questions grounded ONLY in ${standardTitle}. Unique questions only. Never use internal system terminology.`
+          : libraryTask === "starter_questions"
           ? `Generate difficult exam-style questions grounded ONLY in ${standardTitle} and the provided source material. No open-ended coaching prompts. No invented clauses. Never use internal system terminology.`
           : pdfAttached
             ? inventoryMode
@@ -1709,7 +1746,8 @@ const chat = async (userId: string, payload: any = {}) => {
         studioTask === "summary" ||
         studioTask === "eli5" ||
         studioTask === "flashcards" ||
-        studioTask === "quiz") &&
+        studioTask === "quiz" ||
+        studioTask === "exam_questions") &&
       isUnusableLibraryStudioResponse(aiResponse.response, studioTask)
     ) {
       console.warn(
@@ -1777,8 +1815,13 @@ const chat = async (userId: string, payload: any = {}) => {
     const taskDone =
       finalContext.library_task_resolved ||
       resolveLibraryTask(finalContext, questionText || "");
+    const studioLimit =
+      Number(finalContext._studio_question_count) || LIBRARY_STUDIO_QUESTION_COUNT;
     if (taskDone === "starter_questions") {
-      const qs = parseGeneratedExamQuestions(aiResponse.response, 5);
+      const qs = parseGeneratedExamQuestions(
+        aiResponse.response,
+        LIBRARY_STARTER_QUESTION_COUNT,
+      );
       if (qs.length >= 3) {
         aiResponse.response = qs.map((q, i) => `${i + 1}. ${q}`).join("\n");
         aiResponse.suggested_followups = qs;
@@ -1787,14 +1830,29 @@ const chat = async (userId: string, payload: any = {}) => {
         `[Library] starter_questions validated count=${qs.length} standard=${finalContext.isoStandard?.title || finalContext.isoStandardId || "n/a"}`,
       );
     } else if (taskDone === "exam_questions") {
-      const qs = parseGeneratedExamQuestions(aiResponse.response, 5);
+      const qs = parseGeneratedExamQuestions(aiResponse.response, studioLimit);
       if (qs.length >= 3) {
         // Keep markdown structure but ensure suggested chips are clean
-        aiResponse.suggested_followups = qs;
+        aiResponse.suggested_followups = qs.slice(0, Math.min(8, qs.length));
       }
       console.log(
-        `[Library] exam_questions validated count=${qs.length} standard=${finalContext.isoStandard?.title || finalContext.isoStandardId || "n/a"}`,
+        `[Library] exam_questions validated count=${qs.length} requested=${studioLimit} excludePrior=${finalContext._exclude_questions_count || 0} standard=${finalContext.isoStandard?.title || finalContext.isoStandardId || "n/a"}`,
       );
+      if (qs.length > 0 && qs.length < Math.min(10, studioLimit)) {
+        console.log(
+          `[Library] exam_questions below target (${qs.length}/${studioLimit}) — returning source-supported set without fabricating duplicates`,
+        );
+      }
+    } else if (taskDone === "quiz") {
+      const quizCount = countLibraryQuizQuestions(aiResponse.response);
+      console.log(
+        `[Library] quiz validated count=${quizCount} requested=${studioLimit} excludePrior=${finalContext._exclude_questions_count || 0} standard=${finalContext.isoStandard?.title || finalContext.isoStandardId || "n/a"}`,
+      );
+      if (quizCount > 0 && quizCount < Math.min(10, studioLimit)) {
+        console.log(
+          `[Library] quiz below target (${quizCount}/${studioLimit}) — returning source-supported set without fabricating duplicates`,
+        );
+      }
     } else {
       // Normal Library chat: strip static/generic remote follow-up chips
       const remoteChips = Array.isArray(aiResponse.suggested_followups)
@@ -1802,7 +1860,7 @@ const chat = async (userId: string, payload: any = {}) => {
         : [];
       const cleaned = filterExamStyleQuestions(
         remoteChips.map((q: unknown) => String(q || "")),
-        5,
+        LIBRARY_STARTER_QUESTION_COUNT,
       );
       aiResponse.suggested_followups = cleaned;
     }
