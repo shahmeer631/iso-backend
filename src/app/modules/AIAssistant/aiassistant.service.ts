@@ -87,6 +87,7 @@ import {
   isUniversalAskGreeting,
   isVagueDocumentChatQuestion,
   sanitizeUniversalAskClientContext,
+  sanitizeUniversalAskResponse,
   UNIVERSAL_ASK_GREETING_REPLY,
   UNIVERSAL_ASK_VAGUE_QUESTION_REPLY,
 } from "./universalAsk.grounding";
@@ -627,7 +628,7 @@ const simpleChat = async (userId: string | undefined, payload: any = {}) => {
       return {
         response:
           grounding.unavailableMessage ||
-          "I couldn't find enough relevant material in the uploaded documents for this question. Name a specific standard/document or topic, open a document in the Library, or rephrase the question.",
+          "I couldn't find enough source material in the available ISOBrain library to give you a reliable answer to that specific point. Try naming a specific standard or topic.",
         sources: [],
         session_id: payload.session_id || null,
         purpose: "universal_ask",
@@ -641,7 +642,7 @@ const simpleChat = async (userId: string | undefined, payload: any = {}) => {
       purpose: "universal_ask",
       isoStandardId: grounding.standardId || safeContext.isoStandardId || undefined,
       instruction:
-        "Answer as ISOBrain Ask AI — a universal document chat. Use only the provided REFERENCE MATERIAL from uploaded ISO standards and Library documents. Answer the user's question directly. Do not run Navigator, Audit Lens, or Expert Studio workflows. If document evidence is missing, say the uploaded sources are insufficient. Never use internal system terminology.",
+        "Answer as ISOBrain Ask AI — a universal ISOBrain assistant. Use only the provided REFERENCE MATERIAL from the ISOBrain Library (and any connected documents). Answer the user's question directly and clearly. Do not invent multi-standard comparisons the sources do not support. Do not append 'could not find enough source material' after a useful grounded answer. Do not run Navigator, Audit Lens, or Expert Studio workflows. Only if the core question cannot be answered from the reference material, say briefly that you could not find enough source material in the available ISOBrain library — never say that 'uploaded documents' are insufficient, and never mention RAG/retrieval internals. Never invent ISO requirements. Never use internal system terminology.",
     };
 
     let aiResponse: any;
@@ -667,11 +668,13 @@ const simpleChat = async (userId: string | undefined, payload: any = {}) => {
       aiResponse = {
         ...(aiResponse || {}),
         response:
-          "The available source material does not provide enough information to answer this reliably.",
+          "I couldn't find enough source material in the available ISOBrain library to give you a reliable answer to that specific point.",
         sources: grounding.sources,
       };
     } else {
-      aiResponse.response = sanitizeLibraryAssistantText(aiResponse.response);
+      aiResponse.response = sanitizeUniversalAskResponse(
+        sanitizeLibraryAssistantText(aiResponse.response),
+      );
       // Only return sources that were actually retrieved — never remote-invented citations
       aiResponse.sources = grounding.sources.slice(0, 8);
     }
