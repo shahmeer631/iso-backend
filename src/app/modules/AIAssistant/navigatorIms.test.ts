@@ -991,3 +991,61 @@ test("stripUnselectedStandardMentions preserves selected tokens only", () => {
   assert.match(out, /14001/);
   assert.doesNotMatch(out, /27001/);
 });
+
+test("27001+42001 checklist maps Excel maintained vs retained and dual SoA", async () => {
+  const {
+    buildInventoryFrom27001_42001Checklist,
+    isIms27001And42001Selection,
+    mergeChecklistPreferredInventory,
+    parseChecklistStandardReference,
+  } = await import("./ims27001_42001Checklist");
+
+  const tokens = ["ISO/IEC 27001:2022", "ISO/IEC 42001:2023"];
+  assert.equal(isIms27001And42001Selection(tokens), true);
+  assert.equal(isIms27001And42001Selection(["ISO 9001:2015", "ISO 14001:2015"]), false);
+
+  const both = parseChecklistStandardReference("ISO 27001/42001 Cl. 4.3", tokens);
+  assert.equal(both.standards.length, 2);
+  assert.equal(both.clause, "4.3");
+
+  const soa27001 = parseChecklistStandardReference("ISO 27001 Cl. 6.1.3", tokens);
+  assert.equal(soa27001.standards.length, 1);
+  assert.match(soa27001.standards[0], /27001/);
+
+  const inv = buildInventoryFrom27001_42001Checklist(
+    tokens,
+    "SaaS provider operating AI recommendation systems.",
+  );
+  // Excel: 22 clauses + 18 security + 16 AI = 56; mix of docs/records
+  assert.ok(inv.documents.length + inv.records.length >= 50);
+  assert.ok(inv.documents.some((d) => /Integrated Management System Scope/i.test(d.title)));
+  assert.ok(
+    inv.documents.filter((d) => /Statement of Applicability/i.test(d.title)).length >= 2,
+  );
+  assert.ok(inv.documents.some((d) => /Malware|Endpoint/i.test(d.title) && /27001/.test(d.standard || "")));
+  assert.ok(inv.documents.some((d) => /AI Policy/i.test(d.title) && /42001/.test(d.standard || "")));
+  assert.ok(inv.records.some((d) => /Competency|Training/i.test(d.title)));
+  assert.ok(
+    inv.documents.every((d) => !/9001|14001|45001/i.test((d.standards || []).join(" "))),
+  );
+
+  const merged = mergeChecklistPreferredInventory(
+    {
+      documents: [
+        {
+          title: "Random Extra AI Playbook",
+          clause: "8.1",
+          type: "document",
+          standards: tokens,
+          requirement: "required",
+          taxonomy: "mandatory_document",
+        },
+      ],
+      records: [],
+      additional: [],
+    },
+    tokens,
+  );
+  assert.ok(merged.documents.some((d) => /Random Extra AI Playbook/i.test(d.title)));
+  assert.ok(merged.documents.some((d) => /Scope Statement/i.test(d.title)));
+});

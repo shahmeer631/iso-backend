@@ -12,6 +12,7 @@ import {
   collectImsIntegrationStandardTokens,
   looksLikeImsRequirement,
 } from "./navigatorIms";
+import { mergeChecklistPreferredInventory } from "./ims27001_42001Checklist";
 
 export type ImsDocumentedInfoItem = {
   title: string;
@@ -1792,6 +1793,12 @@ export async function buildImsDocumentedInformationInventory(
   normalized = groundClausesAgainstExcerpt(normalized, grounding.excerpt);
   normalized = validateImsInventoryBuckets(normalized, selectedTokens);
   normalized = stabilizePredeterminedInventoryItems(normalized);
+  // Client Excel checklist for 27001+42001 IMS (video / attached workbook)
+  normalized = mergeChecklistPreferredInventory(
+    normalized,
+    selectedTokens,
+    orgContext,
+  );
   normalized = lockInventoryToSelectedStandards(normalized, selectedTokens);
   normalized = enrichOrganizationalApplications(normalized, orgContext);
   // Final lock after org enrichment (prevents unselected ISO mentions in application text)
