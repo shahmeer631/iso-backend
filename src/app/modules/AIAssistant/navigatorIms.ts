@@ -56,6 +56,77 @@ function familyKeyFromToken(token: string): string {
   return token.toLowerCase().replace(/:\d{4}$/, "").replace(/\s+/g, " ").trim();
 }
 
+function digitsFromToken(token: string): string | undefined {
+  return token.match(/(\d{4,5})/)?.[1];
+}
+
+/**
+ * Compatible IMS discipline clusters. Auto-built IMS cards must stay within one
+ * cluster so QHSE (9001/14001/45001) is never silently merged with ISMS/AI (27001/42001).
+ * Explicit AI-returned IMS combos that already sit inside one cluster are preserved.
+ */
+const IMS_COMPAT_CLUSTERS: string[][] = [
+  ["9001", "14001", "45001", "50001"],
+  ["27001", "27701", "27017", "27018"],
+  ["27001", "42001"],
+  ["42001"],
+];
+
+function clusterKeyForDigits(digits: string): string {
+  for (let i = 0; i < IMS_COMPAT_CLUSTERS.length; i++) {
+    if (IMS_COMPAT_CLUSTERS[i].includes(digits)) return `c${i}`;
+  }
+  return `other:${digits}`;
+}
+
+/**
+ * Split tokens into IMS-compatible groups (≥2 tokens each).
+ * Prevents one mega-IMS card that mixes unrelated management-system families.
+ */
+export function clusterTokensForImsCards(tokens: string[]): string[][] {
+  const byCluster = new Map<string, string[]>();
+  for (const token of tokens) {
+    const digits = digitsFromToken(token);
+    if (!digits) continue;
+    const key = clusterKeyForDigits(digits);
+    const arr = byCluster.get(key) || [];
+    if (!arr.some((t) => familyKeyFromToken(t) === familyKeyFromToken(token))) {
+      arr.push(token);
+    }
+    byCluster.set(key, arr);
+  }
+  // Merge 27001-only leftovers into 27001+42001 cluster when both exist as separate keys
+  const ismsAi = byCluster.get("c2") || [];
+  const ismsOnly = byCluster.get("c1") || [];
+  if (ismsAi.length && ismsOnly.length) {
+    const merged = [...ismsAi];
+    for (const t of ismsOnly) {
+      if (!merged.some((x) => familyKeyFromToken(x) === familyKeyFromToken(t))) {
+        merged.push(t);
+      }
+    }
+    byCluster.set("c2", merged);
+    byCluster.delete("c1");
+  }
+
+  return [...byCluster.values()].filter((group) => group.length >= 2);
+}
+
+/** True when tokens span more than one compatible IMS cluster (polluted combo). */
+export function imsTokensCrossIncompatibleClusters(tokens: string[]): boolean {
+  const keys = new Set<string>();
+  for (const token of tokens) {
+    const digits = digitsFromToken(token);
+    if (!digits) continue;
+    keys.add(clusterKeyForDigits(digits));
+  }
+  // c1 (isms controls) + c2 (isms+ai) are compatible enough; treat as one
+  if (keys.has("c1") && keys.has("c2")) {
+    keys.delete("c1");
+  }
+  return keys.size > 1;
+}
+
 /**
  * True when the user selected Integrated Management System in Navigator.
  * Must NOT activate for a bare multi-standard string (regression: single-standard flow).
@@ -200,41 +271,54 @@ export function ensureNavigatorImsSuggestions(
     /integrated\s+management|\bims\b|multi[- ]standard|combined\s+management/i.test(
       sourceText || "",
     );
-  const hasIms = next.some(suggestionLooksLikeIms);
 
-  if (!hasIms && selectedFamilies.length >= 2) {
-    const tokensForLabel = selectedFamilies.slice(0, 10);
+  const buildImsCard = (
+    tokensForLabel: string[],
+    relevance?: string,
+  ): Record<string, unknown> => {
     const shell = buildImsPendingInventoryShell(tokensForLabel);
-    next = [
-      ...next,
-      {
-        standard: `Integrated Management Systems (${tokensForLabel.join(", ")})`,
-        title: "Integrated Management Systems",
-        relevance: sourceImpliesIms
+    return {
+      standard: `Integrated Management Systems (${tokensForLabel.join(", ")})`,
+      title: "Integrated Management Systems",
+      relevance:
+        relevance ||
+        (sourceImpliesIms
           ? `Uses the Integrated Management System Practical Guide as the primary IMS source, combined with these selected ISO standards. ${shell.relevanceSuffix}`
-          : `Uses the IMS Practical Guide + these recommended ISO standards as an integrated management system. ${shell.relevanceSuffix}`,
-        documents: shell.documents,
-        records: shell.records,
-        ims_inventory_pending: shell.ims_inventory_pending,
-      },
-    ];
-  }
+          : `Uses the IMS Practical Guide + these recommended ISO standards as an integrated management system. ${shell.relevanceSuffix}`),
+      documents: shell.documents,
+      records: shell.records,
+      ims_inventory_pending: shell.ims_inventory_pending,
+    };
+  };
 
   // Force EVERY IMS suggestion off analysis headings / concatenated per-standard lists.
-  // Documents & Records are filled by source-grounded inventory enrichment.
-  // Drop bare "IMS" cards with no standards.
-  next = next
-    .map((sug) => {
-      if (!suggestionLooksLikeIms(sug)) return sug;
-      const tokens = filterToLibrary(
-        collectImsIntegrationStandardTokens(String(sug.standard || "")),
-      );
-      const tokensForLabel = tokens.slice(0, 10);
-      if (tokensForLabel.length < 2) {
-        return null;
-      }
+  // Split polluted cross-cluster IMS cards (e.g. 9001+27001) into compatible groups.
+  const expanded: Record<string, unknown>[] = [];
+  for (const sug of next) {
+    if (!suggestionLooksLikeIms(sug)) {
+      expanded.push(sug);
+      continue;
+    }
+    const tokens = filterToLibrary(
+      collectImsIntegrationStandardTokens(String(sug.standard || "")),
+    );
+    if (tokens.length < 2) continue;
+
+    // Split only when a compatible multi-standard cluster can be separated from
+    // unrelated extras (e.g. QHSE triple + 27001). Keep small explicit pairs
+    // like 9001+27001 that survive library filtering as a single AI-proposed card.
+    const clustered = clusterTokensForImsCards(tokens);
+    const shouldSplit =
+      imsTokensCrossIncompatibleClusters(tokens) &&
+      (clustered.length > 1 ||
+        (clustered.length === 1 && clustered[0].length < tokens.length));
+    const groups = shouldSplit ? clustered : [tokens.slice(0, 10)];
+
+    for (const tokensForLabel of groups) {
+      if (tokensForLabel.length < 2) continue;
       const shell = buildImsPendingInventoryShell(tokensForLabel);
       const alreadyEnriched =
+        groups.length === 1 &&
         sug.ims_inventory_pending === false &&
         Array.isArray(sug.documents) &&
         (sug.documents as unknown[]).length > 0 &&
@@ -245,45 +329,36 @@ export function ensureNavigatorImsSuggestions(
             !/^ims$/i.test(String(d.clause || "")),
         );
       if (alreadyEnriched) {
-        return {
+        expanded.push({
           ...sug,
           standard: `Integrated Management Systems (${tokensForLabel.join(", ")})`,
           title: sug.title || "Integrated Management Systems",
           ims_inventory_pending: false,
-        };
+        });
+      } else {
+        expanded.push({
+          ...sug,
+          standard: `Integrated Management Systems (${tokensForLabel.join(", ")})`,
+          title: sug.title || "Integrated Management Systems",
+          relevance:
+            String(sug.relevance || "").trim() ||
+            `IMS Practical Guide (primary) + selected ISO standards. ${shell.relevanceSuffix}`,
+          documents: shell.documents,
+          records: shell.records,
+          ims_inventory_pending: shell.ims_inventory_pending,
+        });
       }
-      return {
-        ...sug,
-        standard: `Integrated Management Systems (${tokensForLabel.join(", ")})`,
-        title: sug.title || "Integrated Management Systems",
-        relevance:
-          String(sug.relevance || "").trim() ||
-          `IMS Practical Guide (primary) + selected ISO standards. ${shell.relevanceSuffix}`,
-        documents: shell.documents,
-        records: shell.records,
-        ims_inventory_pending: shell.ims_inventory_pending,
-      };
-    })
-    .filter((sug): sug is Record<string, unknown> => sug != null);
+    }
+  }
+  next = expanded;
 
-  // If bare IMS rows were dropped and no valid IMS remains, inject from singles.
-  if (
-    !next.some(suggestionLooksLikeIms) &&
-    selectedFamilies.length >= 2
-  ) {
-    const tokensForLabel = selectedFamilies.slice(0, 10);
-    const shell = buildImsPendingInventoryShell(tokensForLabel);
-    next = [
-      ...next,
-      {
-        standard: `Integrated Management Systems (${tokensForLabel.join(", ")})`,
-        title: "Integrated Management Systems",
-        relevance: `Uses the IMS Practical Guide + these recommended ISO standards as an integrated management system. ${shell.relevanceSuffix}`,
-        documents: shell.documents,
-        records: shell.records,
-        ims_inventory_pending: shell.ims_inventory_pending,
-      },
-    ];
+  // Inject clustered IMS cards from individual suggestions when none remain.
+  // Never dump all families into one mega-IMS (QHSE must not absorb ISMS/AI).
+  if (!next.some(suggestionLooksLikeIms)) {
+    const clusters = clusterTokensForImsCards(selectedFamilies);
+    for (const tokensForLabel of clusters) {
+      next = [...next, buildImsCard(tokensForLabel)];
+    }
   }
 
   // Place IMS after individual standards. Keep distinct IMS combinations

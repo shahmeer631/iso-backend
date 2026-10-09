@@ -21,6 +21,7 @@ import {
 } from "./isoStandardVersion";
 import {
   collectImsIntegrationStandardTokens,
+  collectIsoTokensFromText,
   ensureNavigatorImsSuggestions,
   looksLikeImsRequirement as looksLikeNavigatorImsLabel,
 } from "./navigatorIms";
@@ -326,11 +327,20 @@ const generateISO = async (payload: any = {}) => {
     grounded_standard: grounding.standardTitle || undefined,
   };
 
+  // Lock generation scope to the user's explicit selection (never invent families).
+  const lockedStandards = isIms
+    ? collectImsIntegrationStandardTokens(specific_requirements)
+    : collectIsoTokensFromText(specific_requirements);
+  if (lockedStandards.length) {
+    aiPayload.locked_standards = lockedStandards;
+    aiPayload.selected_standards = lockedStandards;
+    aiPayload.allow_unselected_standards = false;
+  }
+
   if (isIms || grounding.isIms) {
     aiPayload.is_ims = true;
-    const imsTokens = collectImsIntegrationStandardTokens(specific_requirements);
-    if (imsTokens.length) {
-      aiPayload.ims_integration_standards = imsTokens;
+    if (lockedStandards.length) {
+      aiPayload.ims_integration_standards = lockedStandards;
     }
     if (grounding.imsGuideTitle) {
       aiPayload.ims_guide_title = grounding.imsGuideTitle;
@@ -2758,8 +2768,26 @@ const getNavigatorImsDocuments = async (payload: any = {}) => {
     );
   }
 
+  const organizationContext = String(
+    payload.organization_context ||
+      payload.context ||
+      (typeof payload.organization_context_structured === "object"
+        ? [
+            payload.organization_context_structured?.what,
+            payload.organization_context_structured?.where,
+            payload.organization_context_structured?.why,
+            payload.organization_context_structured?.when,
+            payload.organization_context_structured?.whom,
+          ]
+            .filter(Boolean)
+            .join(" ")
+        : "") ||
+      "",
+  ).trim();
+
   const inventory = await buildImsDocumentedInformationInventory(
     specificRequirements,
+    { organizationContext },
   );
 
   if (inventory.imsGuideAvailable === false) {
@@ -2773,6 +2801,7 @@ const getNavigatorImsDocuments = async (payload: any = {}) => {
     standard: `Integrated Management Systems (${tokens.join(", ")})`,
     documents: inventory.documents,
     records: inventory.records,
+    additional: inventory.additional || [],
     ims_inventory_pending: false,
     ims_guide_title: inventory.imsGuideTitle,
     ims_guide_available: inventory.imsGuideAvailable,
