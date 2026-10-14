@@ -1049,3 +1049,150 @@ test("27001+42001 checklist maps Excel maintained vs retained and dual SoA", asy
   assert.ok(merged.documents.some((d) => /Random Extra AI Playbook/i.test(d.title)));
   assert.ok(merged.documents.some((d) => /Scope Statement/i.test(d.title)));
 });
+
+test("9001+14001+45001 QHSE checklist matches client downloadfile order and buckets", async () => {
+  const {
+    buildInventoryFromQhse9001_14001_45001Checklist,
+    isImsQhse9001_14001_45001Selection,
+    mergeQhseChecklistPreferredInventory,
+    parseQhseChecklistStandardReference,
+  } = await import("./ims9001_14001_45001Checklist");
+
+  const tokens = [
+    "ISO 9001:2026",
+    "ISO 14001:2026",
+    "ISO 45001:2018",
+  ];
+  assert.equal(isImsQhse9001_14001_45001Selection(tokens), true);
+  assert.equal(
+    isImsQhse9001_14001_45001Selection(["ISO/IEC 27001:2022", "ISO/IEC 42001:2023"]),
+    false,
+  );
+
+  const common = parseQhseChecklistStandardReference(
+    "ISO 9001/14001/45001 Cl. 4.3",
+    tokens,
+  );
+  assert.equal(common.standards.length, 3);
+  assert.equal(common.clause, "4.3");
+
+  const only9001 = parseQhseChecklistStandardReference("ISO 9001 Cl. 8.3", tokens);
+  assert.equal(only9001.standards.length, 1);
+  assert.match(only9001.standards[0], /9001/);
+
+  const only14001 = parseQhseChecklistStandardReference(
+    "ISO 14001 Cl. 6.1.2",
+    tokens,
+  );
+  assert.equal(only14001.standards.length, 1);
+  assert.match(only14001.standards[0], /14001/);
+
+  const only45001 = parseQhseChecklistStandardReference(
+    "ISO 45001 Cl. 5.4",
+    tokens,
+  );
+  assert.equal(only45001.standards.length, 1);
+  assert.match(only45001.standards[0], /45001/);
+
+  const inv = buildInventoryFromQhse9001_14001_45001Checklist(
+    tokens,
+    "Dubai International Airport (DXB) airport operations.",
+  );
+  // downloadfile.docx: 15 common + 10 × 9001 + 5 × 14001 + 7 × 45001 = 37
+  assert.equal(inv.documents.length + inv.records.length, 37);
+
+  // Scope first among documents (client requirement)
+  assert.match(inv.documents[0].title, /Scope of the IMS/i);
+  assert.equal(inv.documents[0].standards?.length, 3);
+
+  assert.ok(
+    inv.documents.some((d) => /Integrated Management Policy/i.test(d.title)),
+  );
+  assert.ok(
+    inv.documents.some(
+      (d) =>
+        /Legal & Compliance Obligations Register/i.test(d.title) &&
+        (d.standards || []).length === 3,
+    ),
+  );
+  assert.ok(
+    inv.documents.some(
+      (d) =>
+        /Process Operation & Execution/i.test(d.title) &&
+        /9001/.test(d.standard || ""),
+    ),
+  );
+  assert.ok(
+    inv.documents.some(
+      (d) =>
+        /Environmental Aspects/i.test(d.title) && /14001/.test(d.standard || ""),
+    ),
+  );
+  assert.ok(
+    inv.documents.some(
+      (d) =>
+        /OH&S Hazard & Risk Register/i.test(d.title) &&
+        /45001/.test(d.standard || ""),
+    ),
+  );
+  assert.ok(inv.records.some((d) => /Evidence of Competence/i.test(d.title)));
+  assert.ok(
+    inv.records.some((d) => /Customer Satisfaction Data/i.test(d.title)),
+  );
+  assert.ok(
+    inv.documents.every(
+      (d) => !/27001|42001/i.test((d.standards || []).join(" ")),
+    ),
+  );
+
+  // Section order within documents: common before 9001-specific before 14001 before 45001
+  const docTitles = inv.documents.map((d) => d.title);
+  const scopeIdx = docTitles.findIndex((t) => /Scope of the IMS/i.test(t));
+  const processIdx = docTitles.findIndex((t) =>
+    /Process Operation & Execution/i.test(t),
+  );
+  const aspectsIdx = docTitles.findIndex((t) =>
+    /Environmental Aspects/i.test(t),
+  );
+  const hazardIdx = docTitles.findIndex((t) =>
+    /OH&S Hazard & Risk Register/i.test(t),
+  );
+  assert.ok(scopeIdx >= 0 && processIdx > scopeIdx);
+  assert.ok(aspectsIdx > processIdx);
+  assert.ok(hazardIdx > aspectsIdx);
+
+  const merged = mergeQhseChecklistPreferredInventory(
+    {
+      documents: [
+        {
+          title: "Random Extra QHSE Playbook",
+          clause: "8.1",
+          type: "document",
+          standards: tokens,
+          requirement: "required",
+          taxonomy: "mandatory_document",
+        },
+        {
+          title: "Scope of the Management System",
+          clause: "4.3",
+          type: "document",
+          standards: tokens,
+          requirement: "required",
+          taxonomy: "mandatory_document",
+        },
+      ],
+      records: [],
+      additional: [],
+    },
+    tokens,
+  );
+  assert.ok(
+    merged.documents.some((d) => /Random Extra QHSE Playbook/i.test(d.title)),
+  );
+  assert.ok(merged.documents.some((d) => /Scope of the IMS/i.test(d.title)));
+  // Duplicate scope from AI should be dropped
+  assert.equal(
+    merged.documents.filter((d) => /scope/i.test(d.title)).length,
+    1,
+  );
+});

@@ -13,6 +13,7 @@ import {
   looksLikeImsRequirement,
 } from "./navigatorIms";
 import { mergeChecklistPreferredInventory } from "./ims27001_42001Checklist";
+import { mergeQhseChecklistPreferredInventory } from "./ims9001_14001_45001Checklist";
 
 export type ImsDocumentedInfoItem = {
   title: string;
@@ -1795,6 +1796,12 @@ export async function buildImsDocumentedInformationInventory(
   normalized = stabilizePredeterminedInventoryItems(normalized);
   // Client Excel checklist for 27001+42001 IMS (video / attached workbook)
   normalized = mergeChecklistPreferredInventory(
+    normalized,
+    selectedTokens,
+    orgContext,
+  );
+  // Client QHSE checklist for 9001+14001+45001 (downloadfile.docx / Oct 13 video)
+  normalized = mergeQhseChecklistPreferredInventory(
     normalized,
     selectedTokens,
     orgContext,
