@@ -31,6 +31,11 @@ router.get(
   auth(UserRole.USER),
   UserDashboardController.getUserBillingOverview,
 );
+router.get(
+  "/enrollment/:courseId",
+  auth(UserRole.USER, UserRole.SUPER_ADMIN),
+  UserDashboardController.checkEnrollment,
+);
 router.post(
   "/",
   auth(UserRole.USER, UserRole.SUPER_ADMIN),

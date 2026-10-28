@@ -29,6 +29,15 @@ model User {
   isDeleted            Boolean    @default(false)
   tokenVersion         Int        @default(0)
 
+  // Phase 1 — onboarding / personalization profile (role enum above is auth-only)
+  industry              String?
+  professionalRole      String?
+  targetStandardIds     String[]  @default([])
+  /// null = legacy user (do not force wizard); false = incomplete; true = done
+  onboardingCompleted   Boolean?
+  onboardingStep        Int?      @default(1)
+  onboardingCompletedAt DateTime?
+
   totalSpent       Float? @default(0)
   enrollmentsCount Int?   @default(0)
 
@@ -56,10 +65,130 @@ model User {
   stripeCustomerId String?       @unique
   certificates     Certificate[]
   groupUsers       GroupUser[]
-  masteryLabs      MasteryLab[]
-  chatSessions     ChatSession[]
+  masteryLabs       MasteryLab[]
+  chatSessions      ChatSession[]
+  activitySessions  ActivitySession[]
+  resumeState       UserResumeState?
+
+  /// Phase 3 — denormalized XP total; ledger is source of truth
+  xpTotal           Int               @default(0)
+  xpLedgers         XpLedger[]
+  milestones        UserMilestone[]
 
   @@map("Users")
+}
+
+/// Phase 3 — immutable XP award ledger (amount always server-controlled).
+model XpLedger {
+  id         String   @id @default(auto()) @map("_id") @db.ObjectId
+  userId     String   @db.ObjectId
+  eventType  String
+  amount     Int
+  /// Deterministic unique key per user, e.g. COURSE_COMPLETE:<courseId>
+  eventKey   String
+  sourceType String?
+  sourceId   String?
+  /// Non-sensitive metadata only (never prompts/responses)
+  meta       Json?
+  createdAt  DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@unique([userId, eventKey])
+  @@index([userId, createdAt])
+  @@index([userId, eventType])
+  @@map("XpLedgers")
+}
+
+/// Phase 3 — persisted milestone progress / completion for a user.
+model UserMilestone {
+  id           String    @id @default(auto()) @map("_id") @db.ObjectId
+  userId       String    @db.ObjectId
+  milestoneKey String
+  progress     Int       @default(0)
+  target       Int
+  completed    Boolean   @default(false)
+  completedAt  DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@unique([userId, milestoneKey])
+  @@index([userId, completed])
+  @@map("UserMilestones")
+}
+
+/// Phase 2 — eligible active-time sessions (heartbeat engine). Durations in whole seconds.
+enum ActivitySource {
+  ACADEMY
+  LIBRARY
+  AI_TOOL
+}
+
+enum ActivitySessionStatus {
+  ACTIVE
+  IDLE
+  CLOSED
+}
+
+model ActivitySession {
+  id              String                @id @default(auto()) @map("_id") @db.ObjectId
+  userId          String                @db.ObjectId
+  /// Client-generated UUID stable for one browser tab/context
+  clientSessionId String
+  source          ActivitySource
+  status          ActivitySessionStatus @default(ACTIVE)
+
+  courseId      String? @db.ObjectId
+  lessonId      String? @db.ObjectId
+  isoStandardId String? @db.ObjectId
+  documentId    String? @db.ObjectId
+  /// Allowlisted AI tool key, e.g. ISO_NAVIGATOR
+  aiToolId      String?
+  resourceLabel String?
+  path          String?
+
+  startedAt     DateTime @default(now())
+  lastSeenAt    DateTime @default(now())
+  /// Accumulated eligible active seconds (server-credited intervals only)
+  activeSeconds Int      @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@unique([userId, clientSessionId])
+  @@index([userId, lastSeenAt])
+  @@index([userId, source, lastSeenAt])
+  @@map("ActivitySessions")
+}
+
+model UserResumeState {
+  id     String @id @default(auto()) @map("_id") @db.ObjectId
+  userId String @unique @db.ObjectId
+
+  source          ActivitySource
+  courseId        String? @db.ObjectId
+  lessonId        String? @db.ObjectId
+  isoStandardId   String? @db.ObjectId
+  documentId      String? @db.ObjectId
+  aiToolId        String?
+  resourceLabel   String?
+  path            String?
+  activitySessionId String? @db.ObjectId
+
+  /// Single-writer lease: only this clientSessionId may credit active time while unexpired.
+  focusClientSessionId String?
+  focusExpiresAt       DateTime?
+
+  updatedAt DateTime @updatedAt
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@map("UserResumeStates")
 }
 
 enum PlanStatus {
@@ -612,6 +741,9 @@ model Certificate {
   downloadCount Int                 @default(0) // 🔥 ADD THIS
 
   issuedAt DateTime @default(now())
+
+  /// Phase 3.2 — prevent duplicate certificate races (requires non-prod index sync)
+  @@unique([userId, courseId])
 }
 
 model CertificateTemplate {
@@ -656,9 +788,34 @@ model MasteryLab {
   riskManagement Float?
   governance     Float?
 
+  /// Links submit scoring to the issued question set (Phase 3.1)
+  examSessionId String? @db.ObjectId
+
   createdAt  DateTime  @default(now())
   category   Category? @relation(fields: [categoryId], references: [id])
   categoryId String?   @db.ObjectId
+}
+
+/// Phase 3.1/3.2 — trusted Mastery Lab question set issued at generation time.
+model MasteryExamSession {
+  id     String  @id @default(auto()) @map("_id") @db.ObjectId
+  userId String? @db.ObjectId
+  guestId String?
+
+  /// Trusted questions: [{ id, question, options, answer }]
+  questions Json
+  metadata  Json?
+
+  createdAt  DateTime  @default(now())
+  /// Set only after a MasteryLab result is successfully persisted for this session.
+  consumedAt DateTime?
+  /// Soft lock for concurrent submit (compare-and-set). Stale locks are reclaimable.
+  inFlightAt    DateTime?
+  inFlightToken String?
+
+  @@index([userId, createdAt])
+  @@index([guestId, createdAt])
+  @@map("MasteryExamSessions")
 }
 
 model ApiUsage {

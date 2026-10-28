@@ -13,7 +13,7 @@ router.post(
 
 router.post(
   "/quiz-generate",
-  // optionalAuth(),
+  optionalAuth(),
   // apiUsage(),
   QuizController.generateQuizByUser,
 );

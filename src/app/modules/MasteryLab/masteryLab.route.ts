@@ -14,4 +14,10 @@ router.post(
 
 router.get("/leaderboard", MasteryLabController.getLeaderboard);
 
+router.delete(
+  "/leaderboard",
+  auth(UserRole.SUPER_ADMIN),
+  MasteryLabController.resetLeaderboard,
+);
+
 export const MasteryLabRoute = router;

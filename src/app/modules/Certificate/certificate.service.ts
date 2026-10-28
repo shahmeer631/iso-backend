@@ -118,9 +118,14 @@ export const issueCertificate = async (userId: string, courseId: string) => {
   const existing = await prisma.certificate.findFirst({ where: { userId, courseId } });
   if (existing) return;
 
-  return prisma.certificate.create({
+  const created = await prisma.certificate.create({
     data: { userId, courseId, templateId: course.certificateTemplate.id },
   });
+
+  const { XpService } = await import("../Gamification/xp.service");
+  await XpService.awardCertificate(userId, courseId);
+
+  return created;
 };
 
 const getUserCertificates = async (userId: string) => {
@@ -228,9 +233,14 @@ const issueCertificateManually = async (userId: string, courseId: string, templa
   const existing = await prisma.certificate.findFirst({ where: { userId, courseId } });
   if (existing) throw new Error("Certificate already exists for this user and course");
 
-  return prisma.certificate.create({
+  const created = await prisma.certificate.create({
     data: { userId, courseId, templateId, downloadCount: 0 },
   });
+
+  const { XpService } = await import("../Gamification/xp.service");
+  await XpService.awardCertificate(userId, courseId);
+
+  return created;
 };
 
 const getSingleCertificate = async (id: string) => {

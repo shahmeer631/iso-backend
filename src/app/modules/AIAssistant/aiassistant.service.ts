@@ -1917,7 +1917,7 @@ const chat = async (userId: string, payload: any = {}) => {
       },
     });
 
-    await prisma.chatMessage.create({
+    const assistantMessage = await prisma.chatMessage.create({
       data: {
         sessionId: session.id,
         role: "assistant",
@@ -1931,6 +1931,12 @@ const chat = async (userId: string, payload: any = {}) => {
       where: { id: session.id },
       data: { updatedAt: new Date() },
     });
+
+    // Phase 3 — XP keyed to persisted assistant message id (no prompt/response in ledger)
+    if (assistantMessage?.id) {
+      const { XpService } = await import("../Gamification/xp.service");
+      await XpService.awardAiChatMessage(userId, assistantMessage.id);
+    }
   }
   latency.saveMs = Date.now() - tSave;
   latency.totalMs = Date.now() - tReq;
@@ -2592,7 +2598,10 @@ const getAuditStep = async (payload: any = {}) => {
   }
 
   mark("total", t0);
-  return normalized;
+  return {
+    ...normalized,
+    stepNumber,
+  };
 };
 
 /**

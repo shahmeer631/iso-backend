@@ -2,6 +2,61 @@ import prisma from "../../../shared/prisma";
 import ApiError from "../../../errors/ApiErrors";
 import httpStatus from "http-status";
 import { getEffectiveAccess, userHasFeatureAccess } from "../../../helpars/effectiveAccess";
+import {
+  formatDurationLabel,
+  sumVideoDurationsSeconds,
+} from "../../../helpars/learningDuration";
+import { ActivityService } from "../Activity/activity.service";
+
+type LessonWithVideo = {
+  id: string;
+  title?: string | null;
+  video?: { duration?: string | null; title?: string | null } | null;
+};
+
+const clampProgress = (value: number) =>
+  Math.min(100, Math.max(0, Math.round(value)));
+
+/**
+ * Phase 2: Learning time = sum of ActivitySession.activeSeconds (heartbeat engine).
+ * Do not mix catalog video durations into "time spent learning".
+ */
+const learningSecondsForUser = (userId: string) =>
+  ActivityService.sumActiveSecondsForUser(userId);
+
+const learningSecondsForCourse = (userId: string, courseId: string) =>
+  ActivityService.sumActiveSecondsForCourse(userId, courseId);
+
+/**
+ * Read-only enrollment check — does not create an enrollment.
+ */
+const checkEnrollment = async (userId: string, courseId: string) => {
+  if (!courseId) {
+    throw new ApiError(httpStatus.BAD_REQUEST, "courseId is required");
+  }
+
+  const course = await prisma.course.findUnique({
+    where: { id: courseId },
+    select: { id: true },
+  });
+
+  if (!course) {
+    throw new ApiError(httpStatus.NOT_FOUND, "Course not found");
+  }
+
+  const existing = await prisma.enrollment.findFirst({
+    where: { userId, courseId },
+    select: { id: true, createdAt: true },
+  });
+
+  return {
+    courseId,
+    enrolled: !!existing,
+    isEnrolled: !!existing,
+    enrollmentId: existing?.id ?? null,
+    enrolledAt: existing?.createdAt ?? null,
+  };
+};
 
 const enrollCourse = async (userId: string, courseId: string) => {
   // 1. course check
@@ -60,21 +115,33 @@ const getUserDashboard = async (userId: string) => {
   const enrollments = await prisma.enrollment.findMany({
     where: { userId },
     include: {
-      course: { include: { lessons: true } },
+      course: {
+        include: {
+          lessons: {
+            select: {
+              id: true,
+              title: true,
+              order: true,
+              video: { select: { duration: true, title: true } },
+            },
+            orderBy: { order: "asc" },
+          },
+        },
+      },
     },
   });
 
   let totalCourses = enrollments.length;
   let completedCourses = 0;
   let totalProgress = 0;
-  let totalTime = 0;
+  const totalLearningSeconds = await learningSecondsForUser(userId);
 
   const continueLearning: any[] = [];
 
   for (const enroll of enrollments) {
     const course = enroll.course;
-
-    const totalLessons = course.lessons.length;
+    const lessons = course.lessons as LessonWithVideo[];
+    const totalLessons = lessons.length;
 
     const completedLessons = await prisma.lessonProgress.count({
       where: { userId, courseId: course.id, completed: true },
@@ -83,16 +150,30 @@ const getUserDashboard = async (userId: string) => {
     const progress =
       totalLessons === 0
         ? 0
-        : Math.round((completedLessons / totalLessons) * 100);
+        : clampProgress((completedLessons / totalLessons) * 100);
 
     totalProgress += progress;
 
     if (progress === 100) completedCourses++;
 
-    const time = totalLessons * 10;
-    totalTime += time;
+    const courseLearningSeconds = await learningSecondsForCourse(
+      userId,
+      course.id,
+    );
 
     if (progress < 100) {
+      const completedRows = await prisma.lessonProgress.findMany({
+        where: { userId, courseId: course.id, completed: true },
+        select: { lessonId: true },
+      });
+      const completedIds = new Set(completedRows.map((row) => row.lessonId));
+      const lastCompleted = [...lessons]
+        .reverse()
+        .find((lesson) => completedIds.has(lesson.id));
+      const nextIncomplete = lessons.find(
+        (lesson) => !completedIds.has(lesson.id),
+      );
+
       continueLearning.push({
         courseId: course.id,
         title: course.title,
@@ -102,16 +183,21 @@ const getUserDashboard = async (userId: string) => {
         progress,
         totalLessons,
         completedLessons,
-        totalTime: `${time}h`,
+        totalTime: formatDurationLabel(courseLearningSeconds),
 
-        lastWatched: "Internal Auditing Best Practices",
-        nextLesson: "Corrective Actions",
+        lastWatched:
+          lastCompleted?.title || lastCompleted?.video?.title || null,
+        nextLessonId: nextIncomplete?.id || null,
+        nextLesson:
+          nextIncomplete?.title || nextIncomplete?.video?.title || null,
+        /** User Dashboard has no lesson player; deep-link to My Courses filtered by id. */
+        href: `/user/courses?courseId=${encodeURIComponent(course.id)}`,
       });
     }
   }
 
   const avgProgress =
-    totalCourses === 0 ? 0 : Math.round(totalProgress / totalCourses);
+    totalCourses === 0 ? 0 : clampProgress(totalProgress / totalCourses);
 
   const certificates = await prisma.certificate.count({
     where: { userId },
@@ -122,12 +208,12 @@ const getUserDashboard = async (userId: string) => {
       enrolledCourses: totalCourses,
       certificatesEarned: certificates,
       avgProgress,
-      totalLearningTime: `${totalTime}h`,
+      totalLearningTime: formatDurationLabel(totalLearningSeconds),
     },
 
     continueLearning: continueLearning.slice(0, 3),
 
-    // 🔥 UI SECTION
+    // Placeholder marketing widgets (not derived from activity records)
     recentResources: [
       {
         title: "ISO 9001:2015 Standard PDF",
@@ -151,20 +237,20 @@ const getUserDashboard = async (userId: string) => {
       },
     ],
 
-    recentAchievements: [
-      {
-        title: "Completed 10 Courses",
-        date: "2024-02-15",
-      },
-      {
-        title: "ISO 9001 Certified",
-        date: "2024-02-10",
-      },
-      {
-        title: "100 Hours Learned",
-        date: "2024-02-01",
-      },
-    ],
+    // Phase 3 — real XP / milestone completions (empty for legacy users with no ledger)
+    recentAchievements: await (async () => {
+      try {
+        const { XpService } = await import("../Gamification/xp.service");
+        const summary = await XpService.getXpSummary(userId);
+        return (summary.recent || []).map((row) => ({
+          id: row.id,
+          title: `${row.eventType.replace(/_/g, " ")} (+${row.amount} XP)`,
+          date: row.createdAt.toISOString().slice(0, 10),
+        }));
+      } catch {
+        return [] as Array<{ id: string; title: string; date: string }>;
+      }
+    })(),
   };
 };
 
@@ -174,7 +260,10 @@ const getMyCourses = async (userId: string) => {
     include: {
       course: {
         include: {
-          lessons: true,
+          lessons: {
+            include: { video: { select: { duration: true } } },
+            orderBy: { order: "asc" },
+          },
           category: true,
         },
       },
@@ -184,12 +273,13 @@ const getMyCourses = async (userId: string) => {
   let total = enrollments.length;
   let inProgress = 0;
   let completed = 0;
-  let totalTime = 0;
+  const totalLearningSeconds = await learningSecondsForUser(userId);
 
   const courses = await Promise.all(
     enrollments.map(async (enroll) => {
       const course = enroll.course;
-      const totalLessons = course.lessons.length;
+      const lessons = course.lessons as LessonWithVideo[];
+      const totalLessons = lessons.length;
 
       const completedLessons = await prisma.lessonProgress.count({
         where: {
@@ -202,13 +292,18 @@ const getMyCourses = async (userId: string) => {
       const progress =
         totalLessons === 0
           ? 0
-          : Math.round((completedLessons / totalLessons) * 100);
+          : clampProgress((completedLessons / totalLessons) * 100);
 
       if (progress === 100) completed++;
       else inProgress++;
 
-      const time = totalLessons * 10;
-      totalTime += time;
+      const learningSeconds = await learningSecondsForCourse(
+        userId,
+        course.id,
+      );
+
+      // Catalog length remains separate from tracked active time
+      const catalogSeconds = sumVideoDurationsSeconds(lessons);
 
       return {
         courseId: course.id,
@@ -219,7 +314,8 @@ const getMyCourses = async (userId: string) => {
 
         totalLessons,
         completedLessons,
-        duration: `${time}h`,
+        duration: formatDurationLabel(catalogSeconds),
+        totalTime: formatDurationLabel(learningSeconds),
         progress,
 
         status:
@@ -237,7 +333,7 @@ const getMyCourses = async (userId: string) => {
       totalEnrolled: total,
       inProgress,
       completed,
-      totalHours: `${totalTime}h`,
+      totalHours: formatDurationLabel(totalLearningSeconds),
     },
     courses,
   };
@@ -247,20 +343,29 @@ const getMyProgress = async (userId: string) => {
   const enrollments = await prisma.enrollment.findMany({
     where: { userId },
     include: {
-      course: { include: { lessons: true } },
+      course: {
+        include: {
+          lessons: {
+            include: { video: { select: { duration: true } } },
+            orderBy: { order: "asc" },
+          },
+        },
+      },
     },
   });
 
   let totalCourses = enrollments.length;
   let completedCourses = 0;
   let totalProgress = 0;
-  let totalTime = 0;
+  const totalLearningSeconds = await learningSecondsForUser(userId);
+  const weeklyActivity = await ActivityService.getWeeklyActiveHours(userId);
 
   const courseProgress: any[] = [];
 
   for (const enroll of enrollments) {
     const course = enroll.course;
-    const totalLessons = course.lessons.length;
+    const lessons = course.lessons as LessonWithVideo[];
+    const totalLessons = lessons.length;
 
     const completedLessons = await prisma.lessonProgress.count({
       where: { userId, courseId: course.id, completed: true },
@@ -269,14 +374,16 @@ const getMyProgress = async (userId: string) => {
     const progress =
       totalLessons === 0
         ? 0
-        : Math.round((completedLessons / totalLessons) * 100);
+        : clampProgress((completedLessons / totalLessons) * 100);
 
     totalProgress += progress;
 
     if (progress === 100) completedCourses++;
 
-    const time = totalLessons * 10;
-    totalTime += time;
+    const learningSeconds = await learningSecondsForCourse(
+      userId,
+      course.id,
+    );
 
     let grade = "C";
     if (progress >= 90) grade = "A+";
@@ -293,24 +400,24 @@ const getMyProgress = async (userId: string) => {
       totalLessons,
       completedLessons,
 
-      totalTime: `${time}h`,
-      lastActivity: "2 hours ago",
-      deadline: "2026-04-30",
+      totalTime: formatDurationLabel(learningSeconds),
+      lastActivity: null,
+      deadline: null,
     });
   }
 
   const avgProgress =
-    totalCourses === 0 ? 0 : Math.round(totalProgress / totalCourses);
+    totalCourses === 0 ? 0 : clampProgress(totalProgress / totalCourses);
 
   return {
     stats: {
       avgProgress,
       activeCourses: totalCourses,
       completedCourses,
-      totalTime: `${totalTime}h`,
+      totalTime: formatDurationLabel(totalLearningSeconds),
     },
 
-    weeklyActivity: [40, 60, 30, 80, 50, 90, 70],
+    weeklyActivity,
 
     courseProgress,
   };
@@ -427,6 +534,7 @@ const getUserBillingOverview = async (userId: string) => {
 };
 
 export const UserDashboardServices = {
+  checkEnrollment,
   enrollCourse,
   getUserDashboard,
   getMyCourses,

@@ -16,7 +16,15 @@ const generateQuiz = catchAsync(async (req, res) => {
 });
 
 const generateQuizByUser = catchAsync(async (req, res) => {
-  const result = await QuizService.generateQuiz(req.body);
+  const userId = (req as any).user?.id || null;
+  const guestId =
+    typeof req.body?.guestId === "string" ? req.body.guestId : null;
+
+  const result = await QuizService.generateQuiz({
+    ...req.body,
+    userId,
+    guestId,
+  });
 
   sendResponse(res, {
     statusCode: httpStatus.OK,

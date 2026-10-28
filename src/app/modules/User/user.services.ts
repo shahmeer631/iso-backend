@@ -32,6 +32,8 @@ const createUserIntoDb = async (email: string) => {
         role: "USER",
         isEmailVerified: false,
         stripeCustomerId: stripeCustomer.id, // 🔥 FIX
+        onboardingCompleted: false,
+        onboardingStep: 1,
       },
     });
   }
@@ -249,8 +251,10 @@ const getMyProfile = async (userId: string) => {
     })
     .map((p) => p.id);
 
+  const { password: _password, ...safeUser } = user;
+
   return {
-    ...user,
+    ...safeUser,
     hasSubscriptionHistory: accessCount > 0,
     effectiveAccess,
     features: effectiveAccess.features,
@@ -258,6 +262,7 @@ const getMyProfile = async (userId: string) => {
     groupPlans: effectiveAccess.groupPlans,
     subscriptionPlans: effectiveAccess.subscriptionPlans,
     purchasedPlanIds: grantedPlanIds,
+    needsOnboarding: user.onboardingCompleted === false,
   };
 };
 

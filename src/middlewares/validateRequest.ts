@@ -1,12 +1,15 @@
 import { NextFunction, Request, Response } from "express";
-import { AnyZodObject } from "zod/v3";
 
+type ParsableSchema = {
+  parseAsync: (data: unknown) => Promise<unknown>;
+};
 
 const validateRequest =
-  (schema: AnyZodObject) =>
+  (schema: ParsableSchema) =>
   async (req: Request, res: Response, next: NextFunction) => {
     try {
-      await schema.parseAsync(req.body);
+      const parsed = await schema.parseAsync(req.body);
+      req.body = parsed;
       return next();
     } catch (err) {
       next(err);

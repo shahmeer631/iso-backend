@@ -1,16 +1,24 @@
 import ApiError from "../../../errors/ApiErrors";
 import prisma from "../../../shared/prisma";
 import httpStatus from "http-status";
+import { scoreLessonQuizStrict } from "../Gamification/xp.integrity";
 
+type LessonAnswerSubmission = {
+  questionId?: string;
+  selected?: string;
+};
+
+/**
+ * Mark a lesson complete using server-authoritative rules:
+ * - Lessons with a Quiz require trusted QuizQuestion answers (client `passed` ignored).
+ * - Lessons without a quiz are informational and may be marked complete when enrolled.
+ */
 const markLessonComplete = async (
   userId: string,
   lessonId: string,
-  passed: boolean,
+  _clientPassed?: boolean,
+  answers?: LessonAnswerSubmission[],
 ) => {
-  if (!passed) {
-    throw new ApiError(httpStatus.BAD_REQUEST, "Quiz not passed");
-  }
-
   const lesson = await prisma.lesson.findUnique({
     where: { id: lessonId },
     select: { courseId: true },
@@ -35,6 +43,27 @@ const markLessonComplete = async (
       "You are not enrolled in this course",
     );
   }
+
+  const quiz = await prisma.quiz.findUnique({
+    where: { lessonId },
+    include: { questions: true },
+  });
+
+  if (quiz && quiz.questions.length > 0) {
+    const trusted = quiz.questions.map((q) => ({
+      id: q.id,
+      answer: q.answer,
+      options: q.options || [],
+    }));
+    const scored = scoreLessonQuizStrict(trusted, answers || []);
+    if (!scored.passed) {
+      throw new ApiError(
+        httpStatus.BAD_REQUEST,
+        "Lesson quiz not passed — answers must match the issued questions",
+      );
+    }
+  }
+  // Informational lessons (no quiz): allow completion without client pass flag
 
   const existing = await prisma.lessonProgress.findFirst({
     where: {
@@ -86,6 +115,19 @@ const markLessonComplete = async (
     },
   });
 
+  // Align enrollment.completed with full lesson completion, then finalize rewards
+  // (XP + certificate) with Phase 3.2 idempotent recovery semantics.
+  if (progress >= 100 && totalLessons > 0) {
+    if (!enrollment.completed) {
+      await prisma.enrollment.update({
+        where: { id: enrollment.id },
+        data: { progress: 100, completed: true },
+      });
+    }
+    const { CourseService } = await import("../courses/course.service");
+    await CourseService.finalizeCourseCompletionRewards(userId, courseId);
+  }
+
   return {
     progress: Math.round(progress),
     completedLessons,
@@ -136,9 +178,7 @@ const getCourseWithProgress = async (userId: string, courseId: string) => {
 
   const lessons = course.lessons.map((lesson) => {
     const completed = progressMap.get(lesson.id) || false;
-
     const isUnlocked = lesson.order === 1 || previousCompleted === true;
-
     previousCompleted = completed;
 
     return {

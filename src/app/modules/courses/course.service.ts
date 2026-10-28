@@ -1,5 +1,7 @@
 import slugify from "slugify";
+import httpStatus from "http-status";
 import prisma from "../../../shared/prisma";
+import ApiError from "../../../errors/ApiErrors";
 import { parseIsoEdition } from "../AIAssistant/isoStandardVersion";
 
 const createCourse = async (payload: any) => {
@@ -276,8 +278,99 @@ const deleteCourse = async (id: string) => {
   });
 };
 
+/**
+ * Phase 3.2 — idempotent course rewards after legitimate completion.
+ * Safe to call on first complete and on "Already completed" retries.
+ */
+const finalizeCourseCompletionRewards = async (
+  userId: string,
+  courseId: string,
+) => {
+  const { XpService } = await import("../Gamification/xp.service");
+  const { isPrismaUniqueConflict } = await import(
+    "../Activity/activity.accounting"
+  );
+
+  // Ledger unique key makes this a no-op when XP already exists
+  await XpService.awardCourseComplete(userId, courseId);
+
+  const course = await prisma.course.findUnique({
+    where: { id: courseId },
+    include: { certificateTemplate: true },
+  });
+
+  if (!course?.certificateTemplate?.autoIssue) {
+    return { certificateIssued: false };
+  }
+
+  const existing = await prisma.certificate.findFirst({
+    where: { userId, courseId },
+  });
+  if (existing) {
+    await XpService.awardCertificate(userId, courseId);
+    return { certificateIssued: true, certificateId: existing.id };
+  }
+
+  try {
+    const created = await prisma.certificate.create({
+      data: {
+        userId,
+        courseId,
+        templateId: course.certificateTemplate.id,
+      },
+    });
+    await XpService.awardCertificate(userId, courseId);
+    return { certificateIssued: true, certificateId: created.id };
+  } catch (err) {
+    // Concurrent create: unique (userId, courseId) when index is applied
+    if (isPrismaUniqueConflict(err)) {
+      const again = await prisma.certificate.findFirst({
+        where: { userId, courseId },
+      });
+      if (again) {
+        await XpService.awardCertificate(userId, courseId);
+        return { certificateIssued: true, certificateId: again.id };
+      }
+    }
+    console.error(
+      "[Course] certificate create failed after completion",
+      String((err as Error)?.message || err).slice(0, 200),
+    );
+    return { certificateIssued: false };
+  }
+};
+
+const assertCourseLessonsComplete = async (
+  userId: string,
+  courseId: string,
+) => {
+  const totalLessons = await prisma.lesson.count({ where: { courseId } });
+  if (totalLessons <= 0) {
+    throw new ApiError(
+      httpStatus.BAD_REQUEST,
+      "This course has no lessons; completion cannot be verified",
+    );
+  }
+
+  const completedLessons = await prisma.lessonProgress.count({
+    where: {
+      userId,
+      completed: true,
+      lesson: { courseId },
+    },
+  });
+
+  if (completedLessons < totalLessons) {
+    throw new ApiError(
+      httpStatus.BAD_REQUEST,
+      `Course incomplete: ${completedLessons}/${totalLessons} lessons completed`,
+    );
+  }
+
+  return { totalLessons, completedLessons };
+};
+
 const completeCourse = async (userId: string, courseId: string) => {
-  // 🔍 find enrollment
   const enrollment = await prisma.enrollment.findFirst({
     where: { userId, courseId },
   });
@@ -286,12 +379,14 @@ const completeCourse = async (userId: string, courseId: string) => {
     throw new Error("Enrollment not found");
   }
 
-  // ✅ already completed
+  // Phase 3.2 — already completed: still retry missing XP / certificate (idempotent)
   if (enrollment.completed) {
+    await finalizeCourseCompletionRewards(userId, courseId);
     return { message: "Already completed" };
   }
 
-  // 🔥 mark completed
+  await assertCourseLessonsComplete(userId, courseId);
+
   await prisma.enrollment.update({
     where: { id: enrollment.id },
     data: {
@@ -300,39 +395,7 @@ const completeCourse = async (userId: string, courseId: string) => {
     },
   });
 
-  // 🔍 course + template
-  const course = await prisma.course.findUnique({
-    where: { id: courseId },
-    include: { certificateTemplate: true },
-  });
-
-  console.log("COURSE:", course);
-  console.log("TEMPLATE:", course?.certificateTemplate);
-
-  // 🔥 AUTO ISSUE CERTIFICATE
-  if (!course?.certificateTemplate) {
-    console.log("❌ No template assigned to course");
-  }
-
-  if (course?.certificateTemplate && course.certificateTemplate.autoIssue) {
-    console.log("✅ Auto issue triggered");
-
-    const exists = await prisma.certificate.findFirst({
-      where: { userId, courseId },
-    });
-
-    if (!exists) {
-      console.log("🆕 Creating certificate...");
-
-      await prisma.certificate.create({
-        data: {
-          userId,
-          courseId,
-          templateId: course.certificateTemplate.id,
-        },
-      });
-    }
-  }
+  await finalizeCourseCompletionRewards(userId, courseId);
 
   return { message: "Course completed successfully" };
 };
@@ -345,4 +408,6 @@ export const CourseService = {
   updateCourse,
   deleteCourse,
   completeCourse,
+  finalizeCourseCompletionRewards,
+  assertCourseLessonsComplete,
 };

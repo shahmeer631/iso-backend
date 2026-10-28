@@ -8,8 +8,13 @@ import prisma from "../../../shared/prisma";
 const generateISO = catchAsync(async (req, res) => {
   const userId = req.user?.id;
 
-
   const result = await AIAssistantService.generateISO(req.body);
+
+  // Phase 3 — only after validated Navigator content returned
+  if (userId) {
+    const { XpService } = await import("../Gamification/xp.service");
+    await XpService.awardAiNavigator(userId);
+  }
 
   sendResponse(res, {
     statusCode: 200,
@@ -22,6 +27,14 @@ const generateISO = catchAsync(async (req, res) => {
 const simpleChat = catchAsync(async (req, res) => {
   const userId = req.user?.id;
   const result = await AIAssistantService.simpleChat(userId, req.body);
+
+  // Phase 3 — Universal Ask / grounded navigator chat only (daily or per-message caps in service)
+  if (userId && result?.grounded === true) {
+    const { XpService } = await import("../Gamification/xp.service");
+    if (result.purpose === "universal_ask") {
+      await XpService.awardUniversalAsk(userId);
+    }
+  }
 
   sendResponse(res, {
     statusCode: 200,
@@ -147,8 +160,20 @@ const getAuditContext = catchAsync(async (req, res) => {
 const getAuditStep = catchAsync(async (req, res) => {
   const userId = req.user?.id;
 
-
   const result = await AIAssistantService.getAuditStep(req.body);
+
+  if (userId) {
+    // Only the server-validated step on the successful result may mint XP —
+    // never raw client body identifiers alone.
+    const { resolveAuthoritativeAuditStep } = await import(
+      "../Gamification/xp.integrity"
+    );
+    const step = resolveAuthoritativeAuditStep(result?.stepNumber);
+    if (step != null) {
+      const { XpService } = await import("../Gamification/xp.service");
+      await XpService.awardAiAuditStep(userId, step);
+    }
+  }
 
   sendResponse(res, {
     statusCode: 200,
@@ -161,11 +186,15 @@ const getAuditStep = catchAsync(async (req, res) => {
 const analyzeBenchmarkFile = catchAsync(async (req, res) => {
   const userId = req.user?.id;
 
-
   const result = await AIAssistantService.analyzeBenchmarkFile(
     req.file,
     req.body,
   );
+
+  if (userId) {
+    const { XpService } = await import("../Gamification/xp.service");
+    await XpService.awardAiBenchmark(userId);
+  }
 
   sendResponse(res, {
     statusCode: 200,
@@ -178,8 +207,12 @@ const analyzeBenchmarkFile = catchAsync(async (req, res) => {
 const analyzeBenchmarkText = catchAsync(async (req, res) => {
   const userId = req.user?.id;
 
-
   const result = await AIAssistantService.analyzeBenchmarkText(req.body);
+
+  if (userId) {
+    const { XpService } = await import("../Gamification/xp.service");
+    await XpService.awardAiBenchmark(userId);
+  }
 
   sendResponse(res, {
     statusCode: 200,

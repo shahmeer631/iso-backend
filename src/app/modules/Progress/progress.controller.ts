@@ -5,12 +5,13 @@ import httpStatus from "http-status";
 
 const markLessonComplete = catchAsync(async (req, res) => {
   const userId = req.user.id;
-  const { lessonId, passed } = req.body;
+  const { lessonId, passed, answers } = req.body;
 
   const result = await ProgressServices.markLessonComplete(
     userId,
     lessonId,
     passed,
+    answers,
   );
 
   sendResponse(res, {

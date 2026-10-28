@@ -250,6 +250,8 @@ const googleLogin = async (idToken: string) => {
         profileImage: picture || null,
         isEmailVerified: true,
         status: "ACTIVE",
+        onboardingCompleted: false,
+        onboardingStep: 1,
       },
     });
   } else {
@@ -323,6 +325,8 @@ const linkedinLogin = async (accessToken: string) => {
         profileImage: picture || null,
         isEmailVerified: true,
         status: "ACTIVE",
+        onboardingCompleted: false,
+        onboardingStep: 1,
       },
     });
   } else {
@@ -391,6 +395,8 @@ const facebookLogin = async (accessToken: string) => {
         profileImage,
         isEmailVerified: true,
         status: "ACTIVE",
+        onboardingCompleted: false,
+        onboardingStep: 1,
       },
     });
   } else {

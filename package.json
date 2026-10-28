@@ -5,10 +5,10 @@
   "scripts": {
     "start": "node ./dist/server.js",
     "dev": "ts-node-dev --respawn --transpile-only src/server.ts",
-    "build": "tsc && mkdir -p dist/app/modules/Certificate && cp -r src/app/modules/Certificate/templates dist/app/modules/Certificate/",
+    "build": "tsc && node scripts/copy-certificate-templates.js",
     "generate": "ts-node src/generate-module.ts",
     "postinstall": "prisma generate",
-    "test": "tsx --test src/app/modules/AIAssistant/isoStandardVersion.test.ts src/helpars/effectiveAccess.test.ts src/app/modules/AIAssistant/auditLens.normalize.test.ts src/app/modules/AIAssistant/navigatorIms.test.ts src/app/modules/AIAssistant/navigatorGenerate.ims.test.ts src/app/modules/AIAssistant/navigatorChat.test.ts"
+    "test": "tsx --test src/app/modules/AIAssistant/isoStandardVersion.test.ts src/helpars/effectiveAccess.test.ts src/helpars/learningDuration.test.ts src/app/modules/Onboarding/onboarding.validation.test.ts src/app/modules/Activity/activity.accounting.test.ts src/app/modules/Activity/activity.validation.test.ts src/app/modules/Gamification/xp.policy.test.ts src/app/modules/Gamification/xp.service.test.ts src/app/modules/Gamification/xp.integrity.test.ts src/app/modules/Gamification/xp.chatSlots.test.ts src/app/modules/MasteryLab/masteryExam.claim.test.ts src/app/modules/courses/course.completion.test.ts src/app/modules/Personalization/personalization.ranking.test.ts src/app/modules/Personalization/personalization.contracts.test.ts src/app/modules/AIAssistant/auditLens.normalize.test.ts src/app/modules/AIAssistant/navigatorIms.test.ts src/app/modules/AIAssistant/navigatorGenerate.ims.test.ts src/app/modules/AIAssistant/navigatorChat.test.ts"
   },
   "keywords": [],
   "author": "",

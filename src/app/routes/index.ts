@@ -25,6 +25,9 @@ import { ReviewRoutes } from "../modules/Review/review.route";
 import { UserDashboardRoutes } from "../modules/UserDashboard/dashboard.route";
 import { CertificateRoutes } from "../modules/Certificate/certificate.route";
 import { MasteryLabRoute } from "../modules/MasteryLab/masteryLab.route";
+import { ActivityRoutes } from "../modules/Activity/activity.route";
+import { XpRoutes } from "../modules/Gamification/xp.route";
+import { PersonalizationRoutes } from "../modules/Personalization/personalization.route";
 
 const router = express.Router();
 
@@ -133,7 +136,20 @@ const moduleRoutes = [
     path: "/mastery-labs",
     route: MasteryLabRoute,
   },
+  {
+    path: "/activity",
+    route: ActivityRoutes,
+  },
+  {
+    path: "/xp",
+    route: XpRoutes,
+  },
+  {
+    path: "/personalization",
+    route: PersonalizationRoutes,
+  },
 ];
+
 
 
 moduleRoutes.forEach((route) => router.use(route.path, route.route));

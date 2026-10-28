@@ -30,7 +30,19 @@ const getLeaderboard = catchAsync(async (req, res) => {
   });
 });
 
+const resetLeaderboard = catchAsync(async (req, res) => {
+  const result = await MasteryLabService.resetLeaderboard();
+
+  sendResponse(res, {
+    statusCode: 200,
+    success: true,
+    message: "Leaderboard reset successfully",
+    data: result,
+  });
+});
+
 export const MasteryLabController = {
   submitMasteryLab,
   getLeaderboard,
+  resetLeaderboard,
 };

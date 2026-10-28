@@ -3,6 +3,20 @@ import sendResponse from "../../../shared/sendResponse";
 import httpStatus from "http-status";
 import { UserDashboardServices } from "./dashboard.service";
 
+const checkEnrollment = catchAsync(async (req, res) => {
+  const userId = req.user.id;
+  const courseId = String(req.params.courseId || req.query.courseId || "");
+
+  const result = await UserDashboardServices.checkEnrollment(userId, courseId);
+
+  sendResponse(res, {
+    statusCode: httpStatus.OK,
+    success: true,
+    message: result.enrolled ? "User is enrolled" : "User is not enrolled",
+    data: result,
+  });
+});
+
 const enroll = catchAsync(async (req, res) => {
   const userId = req.user.id;
   const { courseId } = req.body;
@@ -81,6 +95,7 @@ const getUserBillingOverview = catchAsync(async (req, res) => {
 });
 
 export const UserDashboardController = {
+  checkEnrollment,
   enroll,
   getMyCoursesController,
   getUserDashboard,
