@@ -339,7 +339,7 @@ const generateQuiz = async (payload: any) => {
       suggestedStandards: normalizedStandards,
       difficulty_intent: "extremely difficult",
       difficulty_instructions:
-        "Generate extremely difficult, scenario-based ISO competency questions. Avoid obvious or textbook answers. Require multi-clause reasoning, trade-offs, audit judgment, and realistic workplace edge cases. Distractors must be plausible to experienced practitioners.",
+        "Generate EXTREMELY DIFFICULT, scenario-based ISO competency questions at lead-auditor / certification exam level. Ban obvious definitions, benefits, or textbook recall. Every item must require multi-clause reasoning, trade-offs, incomplete-evidence judgment, or realistic workplace edge cases. Distractors must be highly plausible to experienced practitioners; never make the correct option linguistically obvious.",
       timestamp: Date.now(),
     }),
   );

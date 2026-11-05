@@ -3,28 +3,19 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Certificate</title>
+    <title>CPD Certificate of Competency</title>
     <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-        
-        @page {
-            size: 1280px 897px;
-            margin: 0;
-        }
-        
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        @page { size: 1536px 1024px; margin: 0; }
         body {
-            width: 1280px;
-            height: 897px;
+            width: 1536px;
+            height: 1024px;
             margin: 0;
             padding: 0;
             position: relative;
             overflow: hidden;
+            background: #f7f5f0;
         }
-        
         .template-image {
             width: 100%;
             height: 100%;
@@ -32,43 +23,70 @@
             top: 0;
             left: 0;
         }
-        
-        /* Recipient Name - on the blank line */
+        .cover {
+            position: absolute;
+            background: #f7f5f0;
+        }
+        /* Cover baked-in placeholders on the new landscape layout */
+        .cover-name { left: 260px; top: 355px; width: 1010px; height: 70px; }
+        .cover-date { left: 280px; top: 708px; width: 240px; height: 28px; }
+        .cover-industry { left: 700px; top: 638px; width: 300px; height: 26px; }
+        .cover-mgmt { left: 700px; top: 676px; width: 300px; height: 26px; }
+        .cover-job { left: 700px; top: 714px; width: 340px; height: 26px; }
+        .cover-cert-id { left: 720px; top: 845px; width: 420px; height: 40px; }
+
         .recipient-name {
             position: absolute;
-            left: 110px;
-            top: 340px; /* Moved up from 365px */
-            font-family: Georgia, serif;
-            font-size: 45px;
+            left: 260px;
+            top: 358px;
+            width: 1010px;
+            text-align: center;
+            font-family: Georgia, "Times New Roman", serif;
+            font-size: 44px;
             font-weight: bold;
-            color: #b8860b; /* Beautiful dark gold color */
-            letter-spacing: 1px;
-            text-transform: uppercase;
+            color: #b8860b;
+            letter-spacing: 0.4px;
+            line-height: 1.15;
         }
-        
-        /* Certificate Number - on the blank line after "Unique Cert. No.:" */
+        .field-value {
+            position: absolute;
+            font-family: Arial, Helvetica, sans-serif;
+            font-size: 15px;
+            font-weight: 600;
+            color: #1a2744;
+            line-height: 1.2;
+        }
+        .date-value { left: 280px; top: 712px; width: 240px; }
+        .industry-value { left: 700px; top: 642px; width: 300px; }
+        .mgmt-value { left: 700px; top: 680px; width: 300px; }
+        .job-value { left: 700px; top: 718px; width: 340px; }
         .cert-number {
             position: absolute;
-            left: 788px; /* Moved slightly more right */
-            top: 793px;
-            width: 250px;
-            text-align: center;
-            font-family: Georgia, serif;
-            font-size: 16px;
-            font-weight: bold;
-            color: #2d2d2d;
-            letter-spacing: 0.5px;
+            left: 720px;
+            top: 850px;
+            width: 420px;
+            font-family: Arial, Helvetica, sans-serif;
+            font-size: 13px;
+            font-weight: 700;
+            color: #1a2744;
+            letter-spacing: 0.2px;
+            white-space: nowrap;
         }
     </style>
 </head>
 <body>
-    <!-- Template background image (includes QR code) -->
     <img src="{{TEMPLATE_IMAGE}}" class="template-image" alt="Certificate Template" />
-    
-    <!-- Dynamic recipient name -->
+    <div class="cover cover-name"></div>
+    <div class="cover cover-date"></div>
+    <div class="cover cover-industry"></div>
+    <div class="cover cover-mgmt"></div>
+    <div class="cover cover-job"></div>
+    <div class="cover cover-cert-id"></div>
     <div class="recipient-name">{{RECIPIENT_NAME}}</div>
-    
-    <!-- Dynamic certificate number -->
-    <div class="cert-number">{{CERT_NUMBER}}</div>
+    <div class="field-value date-value">{{ISSUED_DATE}}</div>
+    <div class="field-value industry-value">{{INDUSTRY}}</div>
+    <div class="field-value mgmt-value">{{MANAGEMENT_LEVEL}}</div>
+    <div class="field-value job-value">{{JOB_FUNCTION}}</div>
+    <div class="cert-number">Certificate ID: {{CERT_NUMBER}}</div>
 </body>
 </html>

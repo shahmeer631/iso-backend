@@ -136,6 +136,28 @@ const getUserCertificates = async (userId: string) => {
   });
 };
 
+const isMasteryCertificateCourse = (course?: {
+  title?: string | null;
+  slug?: string | null;
+} | null) => {
+  const title = (course?.title || "").toLowerCase();
+  const slug = (course?.slug || "").toLowerCase();
+  return (
+    title.includes("mastery") ||
+    slug.includes("mastery") ||
+    slug.includes("certificate-of-competency")
+  );
+};
+
+const formatCertificateDate = (value?: Date | null) => {
+  const date = value instanceof Date ? value : new Date();
+  return date.toLocaleDateString("en-GB", {
+    day: "numeric",
+    month: "long",
+    year: "numeric",
+  });
+};
+
 const previewCertificate = async (userId: string, courseId: string) => {
   const user = await prisma.user.findUnique({ where: { id: userId } });
   const course = await prisma.course.findUnique({
@@ -147,10 +169,26 @@ const previewCertificate = async (userId: string, courseId: string) => {
     throw new Error("Certificate template not found");
   }
 
+  const masteryAttempt = isMasteryCertificateCourse(course)
+    ? await prisma.masteryLab.findFirst({
+        where: { userId },
+        orderBy: { createdAt: "desc" },
+        select: {
+          industry: true,
+          management_level: true,
+          department: true,
+        },
+      })
+    : null;
+
   return {
     studentName: `${user?.firstName || ""} ${user?.lastName || ""}`.trim(),
     courseName: course.title,
     template: course.certificateTemplate,
+    isMastery: isMasteryCertificateCourse(course),
+    industry: masteryAttempt?.industry || user?.industry || "",
+    managementLevel: masteryAttempt?.management_level || "",
+    jobFunction: masteryAttempt?.department || "",
     issuedAt: new Date(),
   };
 };
@@ -159,10 +197,9 @@ const generateCertificatePDF = async (userId: string, courseId: string) => {
   const data = await previewCertificate(userId, courseId);
   const cert = await prisma.certificate.findFirst({ where: { userId, courseId } });
 
-  // Generate unique certificate number (e.g., ISO-23424)
-  // We use the last 5 characters of the DB ID to create a unique numeric sequence, or random if temporary
+  // Prefer full certificate UUID to match the Mastery Lab CPD design.
   const certificateNo = cert?.id
-    ? `ISO-${parseInt(cert.id.slice(-5), 16)}`
+    ? String(cert.id)
     : `ISO-${Math.floor(10000 + Math.random() * 90000)}`;
 
   // Paths
@@ -189,14 +226,19 @@ const generateCertificatePDF = async (userId: string, courseId: string) => {
     templateImageSource = `data:image/png;base64,${templateImageBuffer.toString("base64")}`;
   }
 
-  // Prepare recipient name
-  const recipientName = (data.studentName || "Recipient Name").toUpperCase();
+  // Title case looks closer to the CPD design than all-caps.
+  const recipientName = data.studentName || "Recipient Name";
+  const issuedDate = formatCertificateDate(cert?.issuedAt || data.issuedAt);
 
   // Replace placeholders in HTML
   htmlContent = htmlContent
     .replace(/{{TEMPLATE_IMAGE}}/g, templateImageSource)
     .replace(/{{RECIPIENT_NAME}}/g, recipientName)
-    .replace(/{{CERT_NUMBER}}/g, certificateNo);
+    .replace(/{{CERT_NUMBER}}/g, certificateNo)
+    .replace(/{{ISSUED_DATE}}/g, issuedDate)
+    .replace(/{{INDUSTRY}}/g, data.industry || "—")
+    .replace(/{{MANAGEMENT_LEVEL}}/g, data.managementLevel || "—")
+    .replace(/{{JOB_FUNCTION}}/g, data.jobFunction || "—");
 
   // Generate PDF using Puppeteer
   const browser = await puppeteer.launch({
@@ -205,17 +247,17 @@ const generateCertificatePDF = async (userId: string, courseId: string) => {
   });
 
   const page = await browser.newPage();
-  
-  // Set viewport to match template size
-  await page.setViewport({ width: 1280, height: 897 });
-  
+
+  // Match the updated CPD Mastery Lab certificate canvas (landscape 1536x1024)
+  await page.setViewport({ width: 1536, height: 1024 });
+
   // Load HTML content
   await page.setContent(htmlContent, { waitUntil: "networkidle0" });
-  
+
   // Generate PDF
   const pdfBuffer = await page.pdf({
-    width: "1280px",
-    height: "897px",
+    width: "1536px",
+    height: "1024px",
     printBackground: true,
     margin: { top: 0, right: 0, bottom: 0, left: 0 },
   });
