@@ -15,10 +15,26 @@ const generateQuiz = catchAsync(async (req, res) => {
   });
 });
 
+const resolveGuestId = (req: any): string | null => {
+  const fromBody =
+    typeof req.body?.guestId === "string" ? req.body.guestId.trim() : "";
+  if (fromBody) return fromBody;
+
+  const header = req.headers?.["x-guest-id"];
+  const fromHeader = Array.isArray(header) ? header[0] : header;
+  if (typeof fromHeader === "string" && fromHeader.trim()) {
+    return fromHeader.trim();
+  }
+
+  const fromCookie =
+    typeof req.cookies?.guestId === "string" ? req.cookies.guestId.trim() : "";
+  return fromCookie || null;
+};
+
 const generateQuizByUser = catchAsync(async (req, res) => {
   const userId = (req as any).user?.id || null;
-  const guestId =
-    typeof req.body?.guestId === "string" ? req.body.guestId : null;
+  // Prefer authenticated identity; otherwise bind the exam session to a stable guest id
+  const guestId = userId ? null : resolveGuestId(req);
 
   const result = await QuizService.generateQuiz({
     ...req.body,

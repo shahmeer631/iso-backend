@@ -40,6 +40,46 @@ import {
   foldAuditInstructionsIntoPayload,
 } from "./auditLens.prompt";
 import {
+  resolveAiLanguage,
+  buildLocaleOutputInstructions,
+} from "../../../helpars/locales";
+import { translateText } from "../../../helpars/translationService";
+
+/** If AI returns English while another language was requested, translate user-facing markdown. */
+async function maybeTranslateAiMarkdown(
+  content: string,
+  language: string,
+): Promise<string> {
+  const lang = String(language || "English").trim().toLowerCase();
+  if (!content?.trim() || lang === "english" || lang === "en") return content;
+  // Heuristic: mostly Latin letters → likely English fallback from upstream
+  const letters = content.replace(/[^a-zA-Z\u0600-\u06FF\u0900-\u097F]/g, "");
+  const latin = (content.match(/[a-zA-Z]/g) || []).length;
+  if (letters.length > 80 && latin / Math.max(letters.length, 1) > 0.85) {
+    const locale =
+      lang.startsWith("span") || lang === "es"
+        ? "es"
+        : lang.startsWith("arab") || lang === "ar"
+          ? "ar"
+          : lang.startsWith("fr")
+            ? "fr"
+            : lang.startsWith("it")
+              ? "it"
+              : lang.startsWith("hin") || lang === "hi"
+                ? "hi"
+                : null;
+    if (!locale) return content;
+    const translated = await translateText({
+      text: content.slice(0, 4500),
+      targetLocale: locale,
+      sourceLocale: "en",
+      contentType: "ai_markdown",
+    });
+    if (translated.translated) return translated.text;
+  }
+  return content;
+}
+import {
   isValidAuditGuidance,
   hasAuditCaseStudyContent,
   ensureHypotheticalCaseStudyLabel,
@@ -191,7 +231,7 @@ const generateISO = async (payload: any = {}) => {
   const clause = payload.clause ? String(payload.clause).trim() : undefined;
   const document_taxonomy = payload.document_taxonomy as DocumentTaxonomy | undefined;
   const tone = String(payload.tone || "professional").trim();
-  const language = String(payload.language || "English").trim();
+  const language = resolveAiLanguage(payload);
 
   if (!organization_context || organization_context.length < 10) {
     throw new ApiError(
@@ -284,23 +324,26 @@ const generateISO = async (payload: any = {}) => {
     }
   }
 
-  const generation_instructions = buildGenerationInstructions({
-    orgContext: organization_context,
-    structured,
-    isoStandard: specific_requirements,
-    clause,
-    documentTitle: document_title,
-    outputType: output_type,
-    taxonomy: document_taxonomy,
-    tone,
-    language,
-    groundingExcerpt: grounding.excerpt || undefined,
-    instructionsGroundingCap: INSTRUCTIONS_GROUNDING_CAP,
-    isIms: grounding.isIms || isIms,
-    imsGuideTitle: grounding.imsGuideTitle,
-    imsGuideAvailable: grounding.imsGuideAvailable,
-    missingEditions: grounding.missingEditions,
-  });
+  const generation_instructions = [
+    buildGenerationInstructions({
+      orgContext: organization_context,
+      structured,
+      isoStandard: specific_requirements,
+      clause,
+      documentTitle: document_title,
+      outputType: output_type,
+      taxonomy: document_taxonomy,
+      tone,
+      language,
+      groundingExcerpt: grounding.excerpt || undefined,
+      instructionsGroundingCap: INSTRUCTIONS_GROUNDING_CAP,
+      isIms: grounding.isIms || isIms,
+      imsGuideTitle: grounding.imsGuideTitle,
+      imsGuideAvailable: grounding.imsGuideAvailable,
+      missingEditions: grounding.missingEditions,
+    }),
+    buildLocaleOutputInstructions(language),
+  ].join("\n\n");
 
   const folded = foldInstructionsIntoPayload({
     organization_context,
@@ -409,6 +452,14 @@ const generateISO = async (payload: any = {}) => {
       httpStatus.BAD_GATEWAY,
       "ISO Navigator returned an empty or invalid document. Please try again.",
     );
+  }
+
+  // Translation fallback when upstream returns English despite another language
+  if (normalized.content) {
+    normalized = {
+      ...normalized,
+      content: await maybeTranslateAiMarkdown(normalized.content, language),
+    };
   }
 
   return normalized;
@@ -2462,6 +2513,7 @@ const getAuditStep = async (payload: any = {}) => {
     return "";
   });
 
+  const language = resolveAiLanguage(payload);
   const generation_instructions = buildAuditStepInstructions({
     stepNumber,
     stepTitle,
@@ -2469,6 +2521,7 @@ const getAuditStep = async (payload: any = {}) => {
     lockedContext,
     groundingExcerpt: groundingExcerpt || undefined,
     guidelineExcerpt: guidelineExcerpt || undefined,
+    language,
   });
 
   const folded = foldAuditInstructionsIntoPayload({
@@ -2486,6 +2539,7 @@ const getAuditStep = async (payload: any = {}) => {
 
   const aiPayload: Record<string, unknown> = {
     ...folded,
+    language,
     // Keep top-level copies for any external service that does read them
     grounding_excerpt: groundingExcerpt || undefined,
     guideline_excerpt: guidelineExcerpt || undefined,

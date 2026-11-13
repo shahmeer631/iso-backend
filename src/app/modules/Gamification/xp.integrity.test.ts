@@ -120,6 +120,9 @@ describe("Phase 3.1 XP integrity helpers", () => {
     ]);
     assert.equal(missing.rightAns, 1);
     assert.equal(missing.wrongAns, 1);
+    assert.equal(missing.unanswered, 1);
+    assert.equal(missing.progress, 50);
+    assert.equal(missing.score, 50);
     assert.ok(missing.score < 70);
   });
 

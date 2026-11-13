@@ -3,6 +3,24 @@ import { randomUUID } from "crypto";
 import prisma from "../../../shared/prisma";
 import FormData from "form-data";
 import { TrustedExamQuestion } from "../Gamification/xp.integrity";
+import { filterValidatedMasteryQuestions } from "./masteryQuestionValidation";
+import {
+  MASTERY_DEFAULT_DIFFICULTY,
+  normalizeQuizDifficulty,
+} from "./quizDifficulty";
+
+export { MASTERY_DEFAULT_DIFFICULTY, normalizeQuizDifficulty };
+
+const EXPERT_DIFFICULTY_INSTRUCTIONS = [
+  "Generate EXTREMELY DIFFICULT, EXPERT-LEVEL scenario-based ISO competency questions at lead-auditor / certification-exam depth.",
+  "Ban obvious definitions, benefits, acronym expansions, and textbook recall.",
+  "Every item must require multi-clause reasoning, trade-offs, incomplete-evidence judgment, monitoring vs implementation distinctions, nonconformity classification, corrective-action / root-cause thinking, or management-system integration.",
+  "Provide exactly FOUR single-select options (A–D). Exactly one option is defensibly correct under the stated conditions.",
+  "Distractors must be professionally plausible: common implementation mistakes, incomplete compliance approaches, confusion between related requirements, or incorrect interpretations — never absurd or obviously wrong.",
+  "Keep option length, grammar, specificity, and technical detail reasonably consistent; do not make the correct answer linguistically obvious or unusually detailed.",
+  "Ground every requirement claim in the attached source material. Do not invent clause numbers or treat guidance notes as normative shall-requirements.",
+  "If the sources cannot support an expert question, omit that item rather than fabricating content.",
+].join(" ");
 
 const generateQuizAndSave = async (lessonId: string, payload: any) => {
   // check lesson exists
@@ -140,31 +158,6 @@ const generateQuizAndSave = async (lessonId: string, payload: any) => {
 //   return aiResponse.data;
 // };
 
-const normalizeQuizDifficulty = (raw?: string) => {
-  const value = String(raw || "")
-    .trim()
-    .toLowerCase();
-
-  // AI service accepts beginner | intermediate | professional
-  if (["beginner", "easy"].includes(value)) return "beginner";
-  if (["intermediate", "medium"].includes(value)) return "intermediate";
-  if (
-    [
-      "professional",
-      "advanced",
-      "hard",
-      "expert",
-      "extremely difficult",
-      "extremely_difficult",
-      "extreme",
-    ].includes(value)
-  ) {
-    return "professional";
-  }
-
-  return "professional";
-};
-
 const isUsableFileUrl = (url?: string | null) => {
   if (!url) return false;
   const lower = url.toLowerCase();
@@ -212,7 +205,10 @@ const generateQuiz = async (payload: any) => {
     throw new Error("industry, management_level, department required");
   }
 
-  const resolvedDifficulty = normalizeQuizDifficulty(difficulty);
+  // Default omitted difficulty to EXPERT
+  const resolvedDifficulty = normalizeQuizDifficulty(
+    difficulty || MASTERY_DEFAULT_DIFFICULTY,
+  );
 
   // 🔥 STEP 1: AI suggestion api
   const suggestionRes = await axios.post(
@@ -331,21 +327,22 @@ const generateQuiz = async (payload: any) => {
 
   const formData = new FormData();
 
-  // 🔥 full context — keep extreme difficulty intent even when mapped to professional
+  // EXPERT intent is always explicit — even when AI API difficulty enum is "professional"
   formData.append(
     "context",
     JSON.stringify({
       ...parsedContext,
       suggestedStandards: normalizedStandards,
+      difficulty_level: "EXPERT",
       difficulty_intent: "extremely difficult",
-      difficulty_instructions:
-        "Generate EXTREMELY DIFFICULT, scenario-based ISO competency questions at lead-auditor / certification exam level. Ban obvious definitions, benefits, or textbook recall. Every item must require multi-clause reasoning, trade-offs, incomplete-evidence judgment, or realistic workplace edge cases. Distractors must be highly plausible to experienced practitioners; never make the correct option linguistically obvious.",
+      difficulty_instructions: EXPERT_DIFFICULTY_INSTRUCTIONS,
       timestamp: Date.now(),
     }),
   );
 
   formData.append("num_questions", String(Math.min(num_questions || 5, 30)));
   formData.append("difficulty", resolvedDifficulty);
+  formData.append("difficulty_level", "EXPERT");
 
   // 🔥 attach files with timeouts; skip failures instead of hanging the request
   let attachedCount = 0;
@@ -404,27 +401,30 @@ const generateQuiz = async (payload: any) => {
       ? aiResponse.data.questions
       : [];
 
-    const trustedQuestions: TrustedExamQuestion[] = rawQuestions.map(
-      (q: any, idx: number) => {
-        const optionsObj = q?.options || {};
-        const options = Array.isArray(optionsObj)
-          ? optionsObj.map((text: string, i: number) => ({
-              label: String.fromCharCode(65 + i),
-              text: String(text ?? ""),
-            }))
-          : Object.entries(optionsObj).map(([label, text]) => ({
-              label: String(label),
-              text: String(text ?? ""),
-            }));
-
-        return {
-          id: String(q.id || randomUUID()),
-          question: String(q.question || `Question ${idx + 1}`),
-          options,
-          answer: String(q.correct_answer ?? q.correctAnswer ?? ""),
-        };
-      },
+    const { accepted, rejected } = filterValidatedMasteryQuestions(
+      rawQuestions,
+      () => randomUUID(),
     );
+
+    if (rejected.length) {
+      console.warn(
+        `[MasteryQuiz] Rejected ${rejected.length}/${rawQuestions.length} questions:`,
+        rejected.map((r) => `#${r.index}: ${r.reason}`).join("; "),
+      );
+    }
+
+    if (accepted.length === 0) {
+      throw new Error(
+        "Quiz generation produced no valid expert-level questions after validation. Please retry.",
+      );
+    }
+
+    const trustedQuestions: TrustedExamQuestion[] = accepted.map((q) => ({
+      id: q.id,
+      question: q.question,
+      options: q.options,
+      answer: q.answer,
+    }));
 
     const metadata = {
       industry,
@@ -432,6 +432,11 @@ const generateQuiz = async (payload: any) => {
       department,
       suggestedStandards: normalizedStandards,
       difficulty: resolvedDifficulty,
+      difficulty_level: "EXPERT",
+      validation: {
+        accepted: accepted.length,
+        rejected: rejected.length,
+      },
     };
 
     // Persist trusted answer key server-side (Phase 3.1)
@@ -448,16 +453,16 @@ const generateQuiz = async (payload: any) => {
     // Return questions with stable ids; clients may still see correct_answer for UX
     // but submit scoring ignores client-supplied keys and uses MasteryExamSession.
     const clientQuestions = trustedQuestions.map((q, idx) => {
-      const raw = rawQuestions[idx] || {};
+      const raw = accepted[idx];
       const optionsRecord = Object.fromEntries(
         q.options.map((o) => [o.label, o.text]),
       );
       return {
-        ...raw,
         id: q.id,
         question: q.question,
         options: optionsRecord,
         correct_answer: q.answer,
+        explanation: raw?.explanation || "",
       };
     });
 
@@ -466,6 +471,7 @@ const generateQuiz = async (payload: any) => {
       examSessionId,
       questions: clientQuestions,
       metadata,
+      validation: metadata.validation,
     };
   } catch (aiErr: any) {
     const detail =

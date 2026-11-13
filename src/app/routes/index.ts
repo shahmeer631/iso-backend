@@ -28,6 +28,8 @@ import { MasteryLabRoute } from "../modules/MasteryLab/masteryLab.route";
 import { ActivityRoutes } from "../modules/Activity/activity.route";
 import { XpRoutes } from "../modules/Gamification/xp.route";
 import { PersonalizationRoutes } from "../modules/Personalization/personalization.route";
+import { ApiUsageRoutes } from "../modules/ApiUsage/apiUsage.route";
+import { TranslationRoutes } from "../modules/Translation/translation.route";
 
 const router = express.Router();
 
@@ -147,6 +149,14 @@ const moduleRoutes = [
   {
     path: "/personalization",
     route: PersonalizationRoutes,
+  },
+  {
+    path: "/api-usage",
+    route: ApiUsageRoutes,
+  },
+  {
+    path: "/translation",
+    route: TranslationRoutes,
   },
 ];
 

@@ -2,6 +2,7 @@ import express from "express";
 import { CourseController } from "./course.controller";
 import auth from "../../../middlewares/auth";
 import { hasAccess } from "../../../middlewares/hasAccess";
+import { optionalAuth } from "../../../middlewares/optionalAuth";
 import { UserRole } from "@prisma/client";
 
 const router = express.Router();
@@ -9,10 +10,11 @@ const router = express.Router();
 router.get("/all", CourseController.getAllCoursesName);
 router.post("/", auth(UserRole.SUPER_ADMIN), CourseController.createCourse);
 router.get("/", CourseController.getCourses);
+// Freemium: visitors & free users may load course shell + first two lessons;
+// premium lesson bodies are redacted in the controller/service layer.
 router.get(
   "/:id",
-  auth(UserRole.SUPER_ADMIN, UserRole.USER),
-  hasAccess("COURSES"),
+  optionalAuth(),
   CourseController.getSingleCourse,
 );
 router.patch("/:id", auth(UserRole.SUPER_ADMIN), CourseController.updateCourse);

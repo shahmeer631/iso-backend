@@ -3,6 +3,7 @@ import { CourseService } from "./course.service";
 import catchAsync from "../../../shared/catchAsync";
 import sendResponse from "../../../shared/sendResponse";
 import ApiError from "../../../errors/ApiErrors";
+import { applyAcademyLessonAccessToCourse } from "../../../helpars/academyLessonAccess";
 
 const createCourse = catchAsync(async (req, res) => {
   const result = await CourseService.createCourse(req.body);
@@ -17,13 +18,25 @@ const createCourse = catchAsync(async (req, res) => {
 
 const getCourses = catchAsync(async (req, res) => {
   const result = await CourseService.getCourses(req.query);
+  const locale = String(
+    req.query.locale || req.headers["x-locale"] || "en",
+  );
+  let data = result.data;
+  if (locale && locale !== "en" && Array.isArray(data)) {
+    const { localizeCourseRecord } = await import(
+      "../../../helpars/contentLocalization"
+    );
+    data = await Promise.all(
+      data.map((course: any) => localizeCourseRecord(course, locale)),
+    );
+  }
 
   sendResponse(res, {
     statusCode: httpStatus.OK,
     success: true,
     message: "Courses retrieved successfully",
     meta: result.meta,
-    data: result.data,
+    data,
   });
 });
 
@@ -39,18 +52,38 @@ const getAllCoursesName = catchAsync(async (req, res) => {
 });
 
 const getSingleCourse = catchAsync(async (req, res) => {
-  const userId = req.user?.id;
-  const role = req.user?.role;
-
-  // 🔥 ADMIN BYPASS logic moved to middleware
+  const userId = (req as any).user?.id as string | undefined;
 
   const result = await CourseService.getSingleCourse(req.params.id);
+  if (!result) {
+    throw new ApiError(httpStatus.NOT_FOUND, "Course not found");
+  }
+
+  const secured = await applyAcademyLessonAccessToCourse(result, userId);
+  const locale = String(
+    req.query.locale || req.headers["x-locale"] || "en",
+  );
+  let data: any = secured;
+  if (locale && locale !== "en") {
+    const {
+      localizeCourseRecord,
+      localizeLessonRecord,
+    } = await import("../../../helpars/contentLocalization");
+    data = await localizeCourseRecord(secured as any, locale);
+    if (Array.isArray(data?.lessons)) {
+      data.lessons = await Promise.all(
+        data.lessons.map((lesson: any) =>
+          localizeLessonRecord(lesson, locale),
+        ),
+      );
+    }
+  }
 
   sendResponse(res, {
     statusCode: 200,
     success: true,
     message: "Course fetched successfully",
-    data: result,
+    data,
   });
 });
 

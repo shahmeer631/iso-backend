@@ -71,17 +71,49 @@ export const selectedMatchesTrustedAnswer = (
   return false;
 };
 
+export type MasteryExamScoreResult = {
+  /** Correct answers (never includes unanswered). */
+  rightAns: number;
+  /**
+   * Backward-compatible field: incorrect + unanswered (= total - rightAns).
+   * Prefer incorrectAns + unanswered for UI breakdowns.
+   */
+  wrongAns: number;
+  /** Answered but incorrect (excludes unanswered). */
+  incorrectAns: number;
+  unanswered: number;
+  answered: number;
+  total: number;
+  /** Test score: (correct / total) × 100. Unanswered are not correct. */
+  score: number;
+  /** Quiz progress: (answered / total) × 100. Independent of correctness. */
+  progress: number;
+};
+
 /**
  * Score Mastery Lab answers against a trusted issued question set.
  * Client-supplied correct_answer values are ignored.
+ *
+ * Score and progress are separate:
+ * - score = correct / total × 100
+ * - progress = answered / total × 100
  */
 export const scoreAgainstTrustedExam = (
   trusted: TrustedExamQuestion[],
   submitted: SubmittedExamAnswer[],
-): { rightAns: number; wrongAns: number; total: number; score: number } => {
+): MasteryExamScoreResult => {
   const total = trusted.length;
   if (total === 0) {
-    return { rightAns: 0, wrongAns: 0, total: 0, score: 0 };
+    return {
+      rightAns: 0,
+      wrongAns: 0,
+      incorrectAns: 0,
+      unanswered: 0,
+      answered: 0,
+      total: 0,
+      score: 0,
+      progress: 0,
+    };
   }
 
   const byId = new Map(trusted.map((q) => [q.id, q]));
@@ -90,10 +122,14 @@ export const scoreAgainstTrustedExam = (
   );
 
   let rightAns = 0;
+  let incorrectAns = 0;
   const usedTrustedIds = new Set<string>();
 
   for (const row of submitted || []) {
-    const selected = String(row.selected_answer ?? row.selectedAnswer ?? "");
+    const selected = String(row.selected_answer ?? row.selectedAnswer ?? "").trim();
+    // Empty selection is unanswered — do not mark the question as attempted
+    if (!selected) continue;
+
     let match: TrustedExamQuestion | undefined;
     if (row.questionId && byId.has(String(row.questionId))) {
       match = byId.get(String(row.questionId));
@@ -104,13 +140,30 @@ export const scoreAgainstTrustedExam = (
     usedTrustedIds.add(match.id);
     if (selectedMatchesTrustedAnswer(selected, match.answer, match.options)) {
       rightAns += 1;
+    } else {
+      incorrectAns += 1;
     }
   }
 
-  // Unanswered trusted questions count as wrong
+  const answered = rightAns + incorrectAns;
+  const unanswered = Math.max(0, total - answered);
+  // Historical DB field: non-correct slots (incorrect + unanswered)
   const wrongAns = total - rightAns;
-  const score = Number(((rightAns / total) * 100).toFixed(2));
-  return { rightAns, wrongAns, total, score };
+  const score =
+    total > 0 ? Number(((rightAns / total) * 100).toFixed(2)) : 0;
+  const progress =
+    total > 0 ? Number(((answered / total) * 100).toFixed(2)) : 0;
+
+  return {
+    rightAns,
+    wrongAns,
+    incorrectAns,
+    unanswered,
+    answered,
+    total,
+    score,
+    progress,
+  };
 };
 
 /** Lesson quiz: all questions must be answered correctly to mark complete. */

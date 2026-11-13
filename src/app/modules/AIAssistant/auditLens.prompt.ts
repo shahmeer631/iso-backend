@@ -3,6 +3,7 @@
  * Do not reorder — client sequence is fixed.
  */
 import { INSTRUCTIONS_GROUNDING_CAP } from "./navigatorGenerate.grounding";
+import { buildLocaleOutputInstructions } from "../../../helpars/locales";
 
 export const AUDIT_STEP_META: Record<
   number,
@@ -182,6 +183,7 @@ export function buildAuditStepInstructions(input: {
   lockedContext: any;
   groundingExcerpt?: string;
   guidelineExcerpt?: string;
+  language?: string;
 }): string {
   const meta = AUDIT_STEP_META[input.stepNumber];
   const stepTitle = input.stepTitle || meta?.title || `Step ${input.stepNumber}`;
@@ -246,7 +248,7 @@ ${guidelineBlock}
 ============================================================
 OUTPUT REQUIREMENTS (concise — relevance over volume)
 ============================================================
-Every section must help THIS step. Prefer bullets, checklists, and short tables. No textbook filler. No repetition.
+${input.language ? `${buildLocaleOutputInstructions(input.language)}\n` : ""}Every section must help THIS step. Prefer bullets, checklists, and short tables. No textbook filler. No repetition.
 Ground Specification / Requirement and Documented Information in the STANDARD REQUIREMENT SOURCE when present.
 Distinguish mandatory documented information vs records vs recommended evidence when the source supports that distinction.
 

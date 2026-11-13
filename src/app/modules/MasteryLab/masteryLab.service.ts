@@ -362,6 +362,10 @@ const finalizeConsume = async (sessionIds: string[], claimToken: string) => {
   });
 };
 
+const isValidGuestId = (value?: string | null): value is string =>
+  typeof value === "string" &&
+  /^guest_[a-zA-Z0-9_-]{8,64}$/.test(value.trim());
+
 const formatSubmitResponse = (
   result: any,
   extras: {
@@ -373,23 +377,148 @@ const formatSubmitResponse = (
     certificateIssued: boolean;
     certificate: any;
     passed: boolean;
+    progress?: number;
+    answered?: number;
+    incorrectAns?: number;
+    unanswered?: number;
   },
-) => ({
-  ...result,
-  overallScore: extras.overallScore,
-  benchmark: {
-    industryAverage: extras.benchmarkAverage,
-    comparison: extras.comparison,
-  },
-  weakStandards: extras.weakStandards,
-  aiFeedback: extras.aiFeedback,
-  certificateIssued: extras.certificateIssued,
-  certificate: extras.certificate,
-  passed: extras.passed,
+) => {
+  const total = Number(result?.total) || 0;
+  const rightAns = Number(result?.rightAns) || 0;
+  const hasBreakdown =
+    Number.isFinite(Number(extras.answered)) ||
+    Number.isFinite(Number(extras.incorrectAns)) ||
+    Number.isFinite(Number(extras.unanswered));
+  const answered = hasBreakdown
+    ? Math.min(
+        total,
+        Number(
+          extras.answered ??
+            rightAns + Math.max(0, Number(extras.incorrectAns) || 0),
+        ),
+      )
+    : undefined;
+  const incorrectAns = hasBreakdown
+    ? Number(
+        extras.incorrectAns ??
+          Math.max(0, (answered ?? 0) - rightAns),
+      )
+    : undefined;
+  const unanswered = hasBreakdown
+    ? Number(
+        extras.unanswered ??
+          Math.max(0, total - (answered ?? 0)),
+      )
+    : undefined;
+  const progress = Number.isFinite(Number(extras.progress))
+    ? Number(extras.progress)
+    : answered !== undefined && total > 0
+      ? Number(((answered / total) * 100).toFixed(2))
+      : undefined;
+  const score = Number(extras.overallScore);
+
+  return {
+    ...result,
+    // Authoritative test score — never confused with progress
+    score,
+    overallScore: score,
+    ...(progress !== undefined ? { progress } : {}),
+    ...(answered !== undefined ? { answered } : {}),
+    ...(incorrectAns !== undefined ? { incorrectAns } : {}),
+    ...(unanswered !== undefined ? { unanswered } : {}),
+    rightAns,
+    // Keep wrongAns as non-correct slots for historical consumers
+    wrongAns: Number(result?.wrongAns) || Math.max(0, total - rightAns),
+    total,
+    metrics: {
+      ...(progress !== undefined ? { progress } : {}),
+      score,
+      correct: rightAns,
+      ...(incorrectAns !== undefined ? { incorrect: incorrectAns } : {}),
+      ...(unanswered !== undefined ? { unanswered } : {}),
+      ...(answered !== undefined ? { answered } : {}),
+      total,
+    },
+    benchmark: {
+      industryAverage: extras.benchmarkAverage,
+      comparison: extras.comparison,
+    },
+    weakStandards: extras.weakStandards,
+    aiFeedback: extras.aiFeedback,
+    certificateIssued: extras.certificateIssued,
+    certificate: extras.certificate,
+    passed: extras.passed,
+    requiresAuth: false,
+    completed: true,
+  };
+};
+
+/**
+ * Freemium Feature 3 — anonymous visitors may complete scoring, but must not
+ * receive score / feedback payloads until they authenticate and claim the result.
+ */
+export const redactMasteryResultForAnonymous = (result: {
+  id: string;
+}) => ({
+  requiresAuth: true,
+  completed: true,
+  resultId: result.id,
+  message:
+    "Your assessment has been completed! Create a free account or log in to view your results.",
 });
 
+const metricsFromStoredResult = (result: any) => {
+  const stored =
+    result?.aiFeedback?.scoring_metrics &&
+    typeof result.aiFeedback.scoring_metrics === "object"
+      ? result.aiFeedback.scoring_metrics
+      : null;
+  if (!stored) {
+    // Historical rows only stored rightAns / wrongAns / total / score.
+    // Progress cannot be reconstructed when unanswered was folded into wrongAns.
+    return {};
+  }
+  const answered = Number(stored.answered);
+  const incorrectAns = Number(stored.incorrect);
+  const unanswered = Number(stored.unanswered);
+  const progress = Number(stored.progress);
+  return {
+    answered: Number.isFinite(answered) ? answered : undefined,
+    incorrectAns: Number.isFinite(incorrectAns) ? incorrectAns : undefined,
+    unanswered: Number.isFinite(unanswered) ? unanswered : undefined,
+    progress: Number.isFinite(progress) ? progress : undefined,
+  };
+};
+
+const buildResultPayload = (result: any) => {
+  const overallScore = Number(result.score) || 0;
+  const passed = overallScore >= MASTERY_PASS_SCORE;
+  const metrics = metricsFromStoredResult(result);
+  return formatSubmitResponse(result, {
+    overallScore,
+    comparison: overallScore < 78 ? "Below Average" : "Above Average",
+    benchmarkAverage: 78,
+    weakStandards: Array.isArray(result.suggestedStandards)
+      ? result.suggestedStandards.slice(
+          Math.floor(result.suggestedStandards.length / 2),
+        )
+      : [],
+    aiFeedback: result.aiFeedback || {},
+    certificateIssued: false,
+    certificate: null,
+    passed,
+    ...metrics,
+  });
+};
+
 const submitMasteryLab = async (payload: any) => {
-  const { userId, timeTaken, metadata, answers = [], guestId } = payload;
+  const { userId, timeTaken, metadata, answers = [] } = payload;
+  const guestId =
+    !userId && isValidGuestId(payload.guestId)
+      ? payload.guestId.trim()
+      : !userId
+        ? payload.guestId || null
+        : null;
 
   const examSessionIds: string[] = Array.isArray(payload.examSessionIds)
     ? payload.examSessionIds
@@ -412,6 +541,10 @@ const submitMasteryLab = async (payload: any) => {
 
   if (loaded.kind === "idempotent") {
     const existing = loaded.existingResult;
+    // Anonymous callers never receive score details — claim after login instead
+    if (!userId) {
+      return redactMasteryResultForAnonymous(existing);
+    }
     const passed = existing.score >= MASTERY_PASS_SCORE;
     // Safe XP retry if pass was recorded but award soft-failed previously
     if (passed && userId) {
@@ -427,6 +560,7 @@ const submitMasteryLab = async (payload: any) => {
         Math.floor(suggestedStandards.length / 2),
       ),
       aiFeedback: existing.aiFeedback,
+      ...metricsFromStoredResult(existing),
       certificateIssued: false,
       certificate: null,
       passed,
@@ -467,7 +601,16 @@ const submitMasteryLab = async (payload: any) => {
       throw new ApiError(httpStatus.BAD_REQUEST, "Invalid answers");
     }
 
-    const { rightAns, wrongAns, total, score: overallScore } = scored;
+    const {
+      rightAns,
+      wrongAns,
+      total,
+      score: overallScore,
+      progress,
+      answered,
+      incorrectAns,
+      unanswered,
+    } = scored;
     const benchmarkAverage = 78;
     const comparison =
       overallScore < benchmarkAverage ? "Below Average" : "Above Average";
@@ -494,12 +637,34 @@ const submitMasteryLab = async (payload: any) => {
           },
           results: sanitizedResults,
           score: overallScore,
+          progress,
+          metrics: {
+            correct: rightAns,
+            incorrect: incorrectAns,
+            unanswered,
+            answered,
+            total,
+          },
         },
       );
       aiFeedback = aiResponse?.data || {};
     } catch (err) {
       console.warn("Mastery Lab AI feedback failed:", (err as Error)?.message);
     }
+
+    // Persist metrics snapshot inside aiFeedback without schema migration
+    const aiFeedbackWithMetrics = {
+      ...(aiFeedback && typeof aiFeedback === "object" ? aiFeedback : {}),
+      scoring_metrics: {
+        progress,
+        score: overallScore,
+        correct: rightAns,
+        incorrect: incorrectAns,
+        unanswered,
+        answered,
+        total,
+      },
+    };
 
     const result = await prisma.masteryLab.create({
       data: {
@@ -510,7 +675,7 @@ const submitMasteryLab = async (payload: any) => {
         wrongAns,
         total,
         score: overallScore,
-        aiFeedback,
+        aiFeedback: aiFeedbackWithMetrics,
         industry,
         management_level,
         department,
@@ -533,15 +698,24 @@ const submitMasteryLab = async (payload: any) => {
       await XpService.awardMasteryExamPass(userId, result.id);
     }
 
+    // Freemium: score is stored, but anonymous clients only get a claim handle
+    if (!userId) {
+      return redactMasteryResultForAnonymous(result);
+    }
+
     return formatSubmitResponse(result, {
       overallScore,
       comparison,
       benchmarkAverage,
       weakStandards,
-      aiFeedback,
+      aiFeedback: aiFeedbackWithMetrics,
       certificateIssued: certResult.certificateIssued,
       certificate: certResult.certificate,
       passed,
+      progress,
+      answered,
+      incorrectAns,
+      unanswered,
     });
   } catch (err) {
     // Release soft lock so the legitimate owner can retry after recoverable failures
@@ -603,8 +777,94 @@ const resetLeaderboard = async () => {
   return { deleted: result.count };
 };
 
+const getMasteryLabResult = async (userId: string, resultId: string) => {
+  const result = await prisma.masteryLab.findUnique({
+    where: { id: resultId },
+  });
+
+  if (!result) {
+    throw new ApiError(httpStatus.NOT_FOUND, "Assessment result not found");
+  }
+
+  if (!result.userId || result.userId !== userId) {
+    throw new ApiError(
+      httpStatus.FORBIDDEN,
+      "You are not authorized to view this assessment result",
+    );
+  }
+
+  return buildResultPayload(result);
+};
+
+/**
+ * Securely attach a guest-completed Mastery Lab attempt to the authenticated user.
+ * Requires matching guestId — arbitrary result IDs cannot be claimed.
+ */
+const claimMasteryLabResult = async (
+  userId: string,
+  resultId: string,
+  guestId: string,
+) => {
+  if (!isValidGuestId(guestId)) {
+    throw new ApiError(httpStatus.BAD_REQUEST, "Invalid guest identity");
+  }
+
+  const result = await prisma.masteryLab.findUnique({
+    where: { id: resultId },
+  });
+
+  if (!result) {
+    throw new ApiError(httpStatus.NOT_FOUND, "Assessment result not found");
+  }
+
+  if (result.userId && result.userId === userId) {
+    return buildResultPayload(result);
+  }
+
+  if (result.userId && result.userId !== userId) {
+    throw new ApiError(
+      httpStatus.FORBIDDEN,
+      "This assessment result belongs to another account",
+    );
+  }
+
+  if (!result.guestId || result.guestId !== guestId.trim()) {
+    throw new ApiError(
+      httpStatus.FORBIDDEN,
+      "Pending assessment attempt could not be verified for this session",
+    );
+  }
+
+  const updated = await prisma.masteryLab.update({
+    where: { id: resultId },
+    data: { userId },
+  });
+
+  const passed = updated.score >= MASTERY_PASS_SCORE;
+  if (passed) {
+    try {
+      const { XpService } = await import("../Gamification/xp.service");
+      await XpService.awardMasteryExamPass(userId, updated.id);
+    } catch (err) {
+      console.error(
+        "[MasteryLab] XP award after claim failed",
+        String((err as Error)?.message || err).slice(0, 200),
+      );
+    }
+    await issueMasteryCertificateIfEligible(userId, updated.score, {
+      industry: updated.industry || undefined,
+      management_level: updated.management_level || undefined,
+      department: updated.department || undefined,
+    });
+  }
+
+  return buildResultPayload(updated);
+};
+
 export const MasteryLabService = {
   submitMasteryLab,
   getLeaderboard,
   resetLeaderboard,
+  getMasteryLabResult,
+  claimMasteryLabResult,
 };

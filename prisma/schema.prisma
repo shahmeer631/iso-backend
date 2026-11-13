@@ -819,13 +819,22 @@ model MasteryExamSession {
 }
 
 model ApiUsage {
-  id        String   @id @default(auto()) @map("_id") @db.ObjectId
-  userId    String?  @db.ObjectId
-  guestId   String?
-  ip        String?
-  count     Int      @default(0)
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  id              String    @id @default(auto()) @map("_id") @db.ObjectId
+  userId          String?   @db.ObjectId
+  guestId         String?
+  ip              String?
+  count           Int       @default(0)
+  /// Freemium Feature 4: shared lifetime free steps across ISO Navigator, Audit Lens, Benchmark AI
+  assistantStepCount Int    @default(0)
+  /// Start of the current rolling 24h usage window
+  windowStartAt   DateTime?
+  /// When the current window expires and the counter may reset
+  windowExpiresAt DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  @@index([userId])
+  @@index([guestId])
 }
 
 enum AffiliateStatus {
@@ -897,4 +906,32 @@ enum BundleItemType {
   COURSE
   DOCUMENT
   ISO_STANDARD
+}
+
+/// Hybrid localization — Google Translation cache + reviewed overrides
+model TranslationCache {
+  id String @id @default(auto()) @map("_id") @db.ObjectId
+
+  /// Stable key: contentType:contentId:field OR text:<sha256>
+  contentKey   String
+  sourceLocale String   @default("en")
+  targetLocale String
+  sourceHash   String
+  sourceText   String?
+  translatedText String
+  provider     String   @default("google")
+  contentType  String?
+  contentId    String?
+  field        String?
+  /// pending | machine_translated | review_required | reviewed | failed
+  status       String   @default("machine_translated")
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  expiresAt DateTime?
+
+  @@index([contentKey, targetLocale, sourceHash])
+  @@index([contentType, contentId, targetLocale])
+  @@index([targetLocale, status])
+  @@map("TranslationCache")
 }

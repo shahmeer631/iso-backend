@@ -4,29 +4,32 @@ import { fileUploader } from "../../../helpars/fileUploader";
 import auth from "../../../middlewares/auth";
 import { UserRole } from "@prisma/client";
 import { apiUsage } from "../../../middlewares/apiUsage";
+import { assistantStepUsage } from "../../../middlewares/assistantStepUsage";
 import { optionalAuth } from "../../../middlewares/optionalAuth";
 
 const router = express.Router();
 
+// General website qualifying call (Feature 5) — not one of the three Feature 4 assistants
 router.post(
   "/flashcards",
   optionalAuth(),
-  apiUsage("AI_ASSISTANT"),
+  apiUsage(),
   fileUploader.upload.single("file"),
   AIAssistantController.generateFlashcards,
 );
 
+// ── Feature 4 assistants: shared 5 free steps ONLY (do NOT consume Feature 5 daily) ──
 router.post(
   "/audit/context",
   optionalAuth(),
-  apiUsage("AI_ASSISTANT"),
+  assistantStepUsage(),
   AIAssistantController.getAuditContext,
 );
 
 router.post(
   "/audit/step",
   optionalAuth(),
-  apiUsage("AI_ASSISTANT"),
+  assistantStepUsage(),
   AIAssistantController.getAuditStep,
 );
 
@@ -51,21 +54,21 @@ router.get(
 router.post(
   "/context-generator",
   optionalAuth(),
-  apiUsage("AI_ASSISTANT"),
+  assistantStepUsage(),
   AIAssistantController.generateContext,
 );
 
 router.post(
   "/iso-suggestions",
   optionalAuth(),
-  apiUsage("AI_ASSISTANT"),
+  assistantStepUsage(),
   AIAssistantController.getISOSuggestions,
 );
 
 router.post(
   "/benchmark-ai/iso-suggestions",
   optionalAuth(),
-  apiUsage("AI_ASSISTANT"),
+  assistantStepUsage(),
   fileUploader.upload.single("file"),
   AIAssistantController.getBenchmarkAISuggestions,
 );
@@ -73,38 +76,39 @@ router.post(
 router.post(
   "/navigator/generate",
   optionalAuth(),
-  apiUsage("AI_ASSISTANT"),
+  assistantStepUsage(),
   AIAssistantController.generateISO,
 );
 
 router.post(
   "/navigator/ims-documents",
   optionalAuth(),
-  apiUsage("AI_ASSISTANT"),
+  assistantStepUsage(),
   AIAssistantController.getNavigatorImsDocuments,
 );
 
+// Assistant follow-up chat counts toward Feature 4 step pool, not Feature 5 daily
 router.post(
   "/chat-simple",
   optionalAuth(),
-  apiUsage("AI_ASSISTANT"),
+  assistantStepUsage(),
   fileUploader.upload.none(),
   AIAssistantController.simpleChat,
 );
 
+// Universal / shared chat — general website Feature 5 allowance
 router.post(
   "/chat",
   optionalAuth(),
-  apiUsage("AI_ASSISTANT"),
+  apiUsage(),
   fileUploader.upload.single("file"),
-  // auth(UserRole.USER),
   AIAssistantController.chat,
 );
 
 router.post(
   "/benchmark/analyze-file",
   optionalAuth(),
-  apiUsage("AI_ASSISTANT"),
+  assistantStepUsage(),
   fileUploader.upload.single("file"),
   AIAssistantController.analyzeBenchmarkFile,
 );
@@ -112,25 +116,22 @@ router.post(
 router.post(
   "/benchmark/analyze-text",
   optionalAuth(),
-  apiUsage("AI_ASSISTANT"),
+  assistantStepUsage(),
   AIAssistantController.analyzeBenchmarkText,
 );
 
 router.post(
   "/quiz/followup",
   optionalAuth(),
-  apiUsage("AI_ASSISTANT"),
+  // Enrichment for an already-metered turn — do not count
   AIAssistantController.generateFollowup,
 );
 
-// ── LIBRARY ROUTES (LIBRARY feature — Plus plan and above) ──────────────
-// These are the same as /chat and /flashcards but check for "LIBRARY" feature
-// Used by: ISO Standards chat page (/library/iso-standards/chat/...)
-
+// ── Library (rest of website — Feature 5 daily allowance) ──────────────
 router.post(
   "/library/chat",
   optionalAuth(),
-  apiUsage("LIBRARY"),
+  apiUsage(),
   fileUploader.upload.single("file"),
   AIAssistantController.chat,
 );
@@ -138,14 +139,14 @@ router.post(
 router.post(
   "/library/warm-pdf",
   optionalAuth(),
-  apiUsage("LIBRARY"),
+  // Internal PDF cache warm — must not consume freemium quota
   AIAssistantController.warmLibraryIsoPdf,
 );
 
 router.post(
   "/library/flashcards",
   optionalAuth(),
-  apiUsage("LIBRARY"),
+  apiUsage(),
   fileUploader.upload.single("file"),
   AIAssistantController.generateFlashcards,
 );

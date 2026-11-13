@@ -314,7 +314,11 @@ async function resolveCourseIsoStandardId(
   return byTitle?.id || null;
 }
 
-async function assertCourseAccess(userId: string | undefined, courseId: string) {
+async function assertCourseAccess(
+  userId: string | undefined,
+  courseId: string,
+  lessonId?: string,
+) {
   if (!userId) {
     throw new ApiError(
       httpStatus.UNAUTHORIZED,
@@ -329,26 +333,36 @@ async function assertCourseAccess(userId: string | undefined, courseId: string) 
 
   if (user?.role === "SUPER_ADMIN") return;
 
-  // Respect existing subscription ∪ group effective access (COURSES).
+  // Premium COURSES entitlement: keep enrollment gate
   const canUseCourses = await userHasFeatureAccess(userId, "COURSES");
-  if (!canUseCourses) {
-    throw new ApiError(
-      httpStatus.FORBIDDEN,
-      "Upgrade your plan to access Course AI.",
-    );
+  if (canUseCourses) {
+    const enrollment = await prisma.enrollment.findFirst({
+      where: { userId, courseId },
+      select: { id: true },
+    });
+
+    if (!enrollment) {
+      throw new ApiError(
+        httpStatus.FORBIDDEN,
+        "You must be enrolled in this course to use Course AI.",
+      );
+    }
+    return;
   }
 
-  const enrollment = await prisma.enrollment.findFirst({
-    where: { userId, courseId },
-    select: { id: true },
-  });
-
-  if (!enrollment) {
-    throw new ApiError(
-      httpStatus.FORBIDDEN,
-      "You must be enrolled in this course to use Course AI.",
+  // Freemium: allow Course AI only for the first two free lessons of this course
+  if (lessonId) {
+    const { canAccessLessonContent } = await import(
+      "../../../helpars/academyLessonAccess"
     );
+    const decision = await canAccessLessonContent(userId, courseId, lessonId);
+    if (decision.allowed) return;
   }
+
+  throw new ApiError(
+    httpStatus.FORBIDDEN,
+    "Unlock this lesson with Premium access.",
+  );
 }
 
 /**
@@ -452,7 +466,8 @@ export async function enrichCourseLearningContext(params: {
     return { context: ctx };
   }
 
-  if (courseId) {
+  // Defer freemium check until lesson is known when possible so free lessons remain usable.
+  if (courseId && !lessonId) {
     await assertCourseAccess(params.userId, courseId);
   }
 
@@ -521,6 +536,12 @@ export async function enrichCourseLearningContext(params: {
         .filter(Boolean)
         .slice(0, 8);
 
+      await assertCourseAccess(
+        params.userId,
+        lessonRow.courseId,
+        lessonRow.id,
+      );
+
       lesson = {
         id: lessonRow.id,
         title: lessonRow.title,
@@ -531,7 +552,6 @@ export async function enrichCourseLearningContext(params: {
       };
 
       if (!course) {
-        await assertCourseAccess(params.userId, lessonRow.courseId);
         course = await prisma.course.findUnique({
           where: { id: lessonRow.courseId },
           select: {

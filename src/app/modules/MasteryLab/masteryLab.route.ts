@@ -6,10 +6,23 @@ import { optionalAuth } from "../../../middlewares/optionalAuth";
 
 const router = express.Router();
 
+// Freemium Feature 3: anyone may submit; results stay gated for anonymous visitors
 router.post(
   "/submit",
-  auth(UserRole.USER),
+  optionalAuth(),
   MasteryLabController.submitMasteryLab,
+);
+
+router.get(
+  "/results/:id",
+  auth(UserRole.USER, UserRole.SUPER_ADMIN),
+  MasteryLabController.getMasteryLabResult,
+);
+
+router.post(
+  "/claim",
+  auth(UserRole.USER, UserRole.SUPER_ADMIN),
+  MasteryLabController.claimMasteryLabResult,
 );
 
 router.get("/leaderboard", MasteryLabController.getLeaderboard);

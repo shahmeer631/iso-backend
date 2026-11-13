@@ -2,6 +2,12 @@ import httpStatus from "http-status";
 import { LessonService } from "./lesson.service";
 import catchAsync from "../../../shared/catchAsync";
 import sendResponse from "../../../shared/sendResponse";
+import ApiError from "../../../errors/ApiErrors";
+import {
+  applyAcademyLessonAccessToLessonList,
+  assertCanAccessLessonContent,
+  canAccessLessonContent,
+} from "../../../helpars/academyLessonAccess";
 
 const createLesson = catchAsync(async (req, res) => {
   const result = await LessonService.createLesson(req.body);
@@ -16,14 +22,16 @@ const createLesson = catchAsync(async (req, res) => {
 
 const getLessonsByCourse = catchAsync(async (req, res) => {
   const { courseId } = req.params;
+  const userId = (req as any).user?.id as string | undefined;
 
   const result = await LessonService.getLessonsByCourse(courseId);
+  const secured = await applyAcademyLessonAccessToLessonList(result, userId);
 
   sendResponse(res, {
     statusCode: httpStatus.OK,
     success: true,
     message: "Lessons retrieved successfully",
-    data: result,
+    data: secured,
   });
 });
 
@@ -40,14 +48,33 @@ const getAllLessons = catchAsync(async (req, res) => {
 
 const getSingleLesson = catchAsync(async (req, res) => {
   const { id } = req.params;
+  const userId = (req as any).user?.id as string | undefined;
 
   const result = await LessonService.getSingleLesson(id);
+  if (!result) {
+    throw new ApiError(httpStatus.NOT_FOUND, "Lesson not found");
+  }
+
+  await assertCanAccessLessonContent(userId, result.courseId, result.id);
+
+  const decision = await canAccessLessonContent(
+    userId,
+    result.courseId,
+    result.id,
+  );
+
+  const payload = {
+    ...result,
+    isLocked: false,
+    isFreePreview: decision.isFreePreview,
+    freeAccessRank: decision.rank,
+  };
 
   sendResponse(res, {
     statusCode: httpStatus.OK,
     success: true,
     message: "Lesson retrieved successfully",
-    data: result,
+    data: payload,
   });
 });
 
