@@ -17,7 +17,13 @@ export const corsOptions = {
     "https://api.isobrain.ai",
   ],
   methods: ["GET", "POST", "PUT", "DELETE", "PATCH"],
-  allowedHeaders: ["Content-Type", "Authorization", "X-Guest-Id"],
+  allowedHeaders: [
+    "Content-Type",
+    "Authorization",
+    "X-Guest-Id",
+    "X-Locale",
+    "Accept-Language",
+  ],
   exposedHeaders: [
     "X-Api-Usage-Limit",
     "X-Api-Usage-Used",
