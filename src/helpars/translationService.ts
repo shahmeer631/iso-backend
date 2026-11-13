@@ -623,7 +623,7 @@ export async function translateUserFacingFields<T extends Record<string, any>>(
 
   if (!items.length) return obj;
   const translated = await translateBatch(items);
-  const out = { ...obj };
+  const out: Record<string, unknown> = { ...obj };
   let ti = 0;
   for (const f of fields) {
     if (typeof obj[f] === "string" && String(obj[f]).trim()) {
@@ -631,7 +631,7 @@ export async function translateUserFacingFields<T extends Record<string, any>>(
       ti += 1;
     }
   }
-  return out;
+  return out as T;
 }
 
 export function getTranslationStatus(): {
