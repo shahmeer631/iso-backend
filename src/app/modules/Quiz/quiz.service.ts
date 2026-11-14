@@ -12,9 +12,11 @@ import {
 export { MASTERY_DEFAULT_DIFFICULTY, normalizeQuizDifficulty };
 
 const EXPERT_DIFFICULTY_INSTRUCTIONS = [
-  "Generate EXTREMELY DIFFICULT, EXPERT-LEVEL scenario-based ISO competency questions at lead-auditor / certification-exam depth.",
+  "Generate EXTREMELY DIFFICULT, EXPERT-LEVEL scenario-based ISO competency questions at certification / professional-practice depth.",
   "Ban obvious definitions, benefits, acronym expansions, and textbook recall.",
-  "Every item must require multi-clause reasoning, trade-offs, incomplete-evidence judgment, monitoring vs implementation distinctions, nonconformity classification, corrective-action / root-cause thinking, or management-system integration.",
+  "CRITICAL COMPETENCY MIX (mandatory): Across the full quiz, cover THREE pillars — (1) REQUIREMENTS / interpretation of shall-requirements, (2) IMPLEMENTATION / how to embed controls in processes and documented information, and (3) AUDITING / evidence evaluation and nonconformity judgment. Do NOT make every question about auditing, conformity statements, or auditor actions.",
+  "Target balance for a 10-question set: roughly 3–4 requirements, 3–4 implementation, and 2–3 auditing. For other lengths, keep approximately one-third of items in each pillar.",
+  "Every item must require multi-clause reasoning, trade-offs, incomplete-evidence judgment, monitoring vs implementation distinctions, nonconformity classification, corrective-action / root-cause thinking, or management-system integration — applied to the assigned pillar.",
   "Provide exactly FOUR single-select options (A–D). Exactly one option is defensibly correct under the stated conditions.",
   "Distractors must be professionally plausible: common implementation mistakes, incomplete compliance approaches, confusion between related requirements, or incorrect interpretations — never absurd or obviously wrong.",
   "Keep option length, grammar, specificity, and technical detail reasonably consistent; do not make the correct answer linguistically obvious or unusually detailed.",

@@ -2770,16 +2770,84 @@ const analyzeBenchmarkText = async (payload: any = {}) => {
   return response.data;
 };
 
+const isUrlContentBlockedError = (message: unknown): boolean => {
+  const text = String(message || "");
+  return (
+    /failed to extract content/i.test(text) ||
+    /\b403\b/.test(text) ||
+    /forbidden/i.test(text) ||
+    /access denied/i.test(text) ||
+    /blocked/i.test(text)
+  );
+};
+
+const buildContextFallbackTextFromUrl = (urlString: string): string => {
+  try {
+    const parsed = new URL(urlString);
+    const host = parsed.hostname.replace(/^www\./i, "");
+    const brandHint = host.split(".")[0]?.replace(/[-_]+/g, " ") || host;
+    return [
+      `Organization website: ${parsed.origin}/`,
+      `Company / brand hint: ${brandHint}`,
+      `Domain: ${host}`,
+      "The website blocked automated page extraction.",
+      "Generate ISO Navigator organization-context options (what / where / why / when / whom)",
+      "for this real-world organization based on the domain and publicly known operations.",
+      "Do not invent unrelated industries.",
+    ].join(" ");
+  } catch {
+    return `Organization associated with ${urlString}. Generate ISO Navigator context options for this organization.`;
+  }
+};
+
+const postContextGenerator = async (body: { text?: string; url?: string }) => {
+  const response = await axios.post(
+    `${process.env.AI_BASE_URL}/discovery/context-generator`,
+    body,
+    { timeout: CONTEXT_GENERATOR_TIMEOUT_MS },
+  );
+  return response.data;
+};
+
 // 🔥 CONTEXT GENERATOR
 const generateContext = async (payload: any = {}) => {
-  try {
-    const response = await axios.post(
-      `${process.env.AI_BASE_URL}/discovery/context-generator`,
-      payload,
-      { timeout: CONTEXT_GENERATOR_TIMEOUT_MS },
+  const rawText =
+    typeof payload?.text === "string" ? payload.text.trim() : "";
+  let rawUrl = typeof payload?.url === "string" ? payload.url.trim() : "";
+
+  // Normalize host-only URLs so the upstream AI service does not 400.
+  if (!rawUrl && rawText && /^[a-z0-9.-]+\.[a-z]{2,}([/:?].*)?$/i.test(rawText)) {
+    rawUrl = rawText;
+  }
+  if (rawUrl && !/^https?:\/\//i.test(rawUrl)) {
+    rawUrl = `https://${rawUrl}`;
+  }
+
+  const body: { text?: string; url?: string } = {};
+  if (rawUrl) {
+    try {
+      // eslint-disable-next-line no-new
+      new URL(rawUrl);
+      body.url = rawUrl;
+    } catch {
+      throw new ApiError(
+        httpStatus.BAD_REQUEST,
+        "Please provide a valid website URL (including https://).",
+      );
+    }
+  } else if (rawText) {
+    body.text = rawText;
+  } else {
+    throw new ApiError(
+      httpStatus.BAD_REQUEST,
+      "Provide either organization text or a website URL to analyze.",
     );
-    return response.data;
+  }
+
+  try {
+    return await postContextGenerator(body);
   } catch (error: any) {
+    if (error instanceof ApiError) throw error;
     if (error?.code === "ECONNABORTED") {
       throw new ApiError(
         httpStatus.GATEWAY_TIMEOUT,
@@ -2797,12 +2865,57 @@ const generateContext = async (payload: any = {}) => {
         "AI service is unreachable. Please verify AI_BASE_URL and that the AI server is running.",
       );
     }
+
     const status = error?.response?.status || httpStatus.BAD_GATEWAY;
-    const message =
+    const upstream =
       error?.response?.data?.message ||
+      error?.response?.data?.error ||
+      error?.response?.data?.detail ||
+      (typeof error?.response?.data === "string" ? error.response.data : null) ||
       error?.message ||
+      "";
+
+    // Many corporate sites (e.g. airlines) block scrapers with 403.
+    // Fall back to text-mode generation from the domain so Navigator stays usable.
+    if (body.url && isUrlContentBlockedError(upstream)) {
+      try {
+        const fallback = await postContextGenerator({
+          text: buildContextFallbackTextFromUrl(body.url),
+        });
+        if (fallback && typeof fallback === "object") {
+          return {
+            ...fallback,
+            source: "url_blocked_text_fallback",
+            source_url: body.url,
+            warning:
+              "This website blocked automatic page reading. Suggestions were generated from the domain instead — review them carefully or paste an organization description for better accuracy.",
+          };
+        }
+      } catch (fallbackErr: any) {
+        console.warn(
+          "Context generator URL→text fallback failed:",
+          fallbackErr?.response?.data || fallbackErr?.message || fallbackErr,
+        );
+      }
+
+      throw new ApiError(
+        httpStatus.BAD_REQUEST,
+        "This website blocked automatic reading (403). Switch to Text and paste a short description of the organization, then Analyze again.",
+      );
+    }
+
+    const message =
+      (isUrlContentBlockedError(upstream)
+        ? "This website blocked automatic reading. Switch to Text and paste a short organization description instead."
+        : upstream) ||
+      (status === 400
+        ? "Could not analyze that input. Try a clearer organization description or a full https:// URL."
+        : error?.message) ||
       "Context generation failed";
-    throw new ApiError(status, message);
+    throw new ApiError(
+      isUrlContentBlockedError(upstream) ? httpStatus.BAD_REQUEST : status,
+      message,
+    );
   }
 };
 
