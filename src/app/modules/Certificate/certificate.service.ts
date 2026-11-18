@@ -286,10 +286,48 @@ const issueCertificateManually = async (userId: string, courseId: string, templa
 };
 
 const getSingleCertificate = async (id: string) => {
-  return prisma.certificate.findUnique({
+  const certificate = await prisma.certificate.findUnique({
     where: { id },
-    include: { course: true, template: true },
+    include: {
+      course: true,
+      template: true,
+      user: {
+        select: {
+          id: true,
+          firstName: true,
+          lastName: true,
+          industry: true,
+          professionalRole: true,
+        },
+      },
+    },
   });
+
+  if (!certificate) return null;
+
+  const masteryAttempt = isMasteryCertificateCourse(certificate.course)
+    ? await prisma.masteryLab.findFirst({
+        where: { userId: certificate.userId },
+        orderBy: { createdAt: "desc" },
+        select: {
+          industry: true,
+          management_level: true,
+          department: true,
+        },
+      })
+    : null;
+
+  return {
+    ...certificate,
+    studentName:
+      `${certificate.user?.firstName || ""} ${certificate.user?.lastName || ""}`.trim() ||
+      "ISOBrain Learner",
+    isMastery: isMasteryCertificateCourse(certificate.course),
+    industry: masteryAttempt?.industry || certificate.user?.industry || "",
+    managementLevel: masteryAttempt?.management_level || "",
+    jobFunction: masteryAttempt?.department || "",
+    shareUrl: `https://dashboard.isobrain.ai/certificates/${certificate.id}`,
+  };
 };
 
 export const CertificateService = {

@@ -873,25 +873,18 @@ export function buildLibraryTaskInstructions(
   switch (task) {
     case "starter_questions":
       return [
-        `TASK: Propose exactly ${LIBRARY_STARTER_QUESTION_COUNT} EXTREMELY DIFFICULT exam-style questions about ${std}.`,
-        `Difficulty bar: lead auditor / certification exam level. Never ask obvious definitions, benefits, or textbook recall.`,
-        `Every question MUST be specifically about ${std} — use the selected standard name/year when natural.`,
-        "Ground EVERY question in the SOURCE MATERIAL below (requirements from the selected standard). Do not invent clauses.",
-        "Each question should force multi-requirement reasoning, trade-offs, edge cases, or audit judgment — not a single obvious fact.",
-        "Cover DIFFERENT requirement themes drawn from DIFFERENT parts of the source material (early/middle/late topics if present).",
-        "Use a useful mixture of styles across the set (not all the same type):",
-        "1) Ambiguous / conflicting interpretation of a specific requirement",
-        "2) Evidence sufficiency judgment for a clause theme",
-        "3) Integration of two related requirements under a realistic constraint",
-        "4) Nonconformity grading / auditor decision under incomplete evidence",
-        "5) Implementation trade-off that only experts would resolve correctly",
-        "FORBIDDEN (never generate these):",
-        '- "What is ISO?", "What are the benefits of…?", "Why is this standard important?"',
-        '- coaching: "What is your scope?", "What do you know about…?", "Tell me about…", "How would you define…?"',
-        '- learner-org questions ("your company", "your QMS", "in your organization")',
-        "- inventing clause numbers not present in the source material",
-        "- five near-duplicates of the same topic",
-        "- any question a junior practitioner could answer from a 1-page overview",
+        `TASK: Propose exactly ${LIBRARY_STARTER_QUESTION_COUNT} short open-ended exploration questions about ${std}.`,
+        "Style reference: NotebookLM / guided study chips — concise prompts that help a learner understand what matters in this standard.",
+        `Every question MUST be about ${std} knowledge themes drawn from the SOURCE MATERIAL (purpose, principles, key concepts, documented information, roles, performance, improvement, etc.).`,
+        "Keep each question SHORT: ideally one line, hard maximum two lines (~140 characters).",
+        "Questions should invite exploration and further learning — e.g. core principles/benefits, how concepts support a management system, how trends or related ideas connect to requirements, what learners should understand next.",
+        "Prefer curiosity prompts such as: What are…? How do…? Why does…? How can…? What should you know about…?",
+        "Vary topics across the set (do not repeat the same theme).",
+        "FORBIDDEN:",
+        "- long multi-clause auditor scenarios / exam case studies",
+        '- personal coaching about the learner\'s own company ("your organization", "your QMS", "your scope")',
+        "- inventing clause numbers not in the source material",
+        "- five near-duplicates",
         `Return ONLY a numbered list of ${LIBRARY_STARTER_QUESTION_COUNT} clean questions (one per line). No preamble, no answers, no internal instructions.`,
       ].join("\n");
 
@@ -1722,6 +1715,81 @@ export function filterExamStyleQuestions(
   return out;
 }
 
+/** Personal-org coaching that should not appear as Library starter chips. */
+export function isPersonalCoachingQuestion(text: string): boolean {
+  const q = String(text || "")
+    .trim()
+    .toLowerCase()
+    .replace(/^[\d\.\)\-\*]+\s*/, "");
+  if (!q) return true;
+  return (
+    /^what is your (scope|organization|company|qms|process)\b/.test(q) ||
+    /\bin your (own )?organization\b/.test(q) ||
+    /\byour (company|organization|qms|isms|ams|scope)\b/.test(q) ||
+    /^what do you know\b/.test(q) ||
+    /^tell me about\b/.test(q) ||
+    /^what is your approach\b/.test(q) ||
+    /^how do you (manage|ensure|handle)\b/.test(q)
+  );
+}
+
+/** Long exam/case-study stems — not NotebookLM-style exploration chips. */
+export function isLongExamScenarioQuestion(text: string): boolean {
+  const q = String(text || "").trim();
+  if (q.length > 160) return true;
+  return (
+    /\bbased on\b.+\bclause/i.test(q) ||
+    /\bhow should an auditor\b/i.test(q) ||
+    /\bnonconformit/i.test(q) && /\bauditor\b/i.test(q) ||
+    /\bunder incomplete evidence\b/i.test(q) ||
+    (q.split(/\s+/).length > 28 && /\b(auditor|scenario|trade-?off|grading)\b/i.test(q))
+  );
+}
+
+/** Keep short open-ended exploration starters (Library landing chips). */
+export function filterExplorationStarterQuestions(
+  items: string[],
+  limit = LIBRARY_STARTER_QUESTION_COUNT,
+): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of items || []) {
+    let q = String(raw || "")
+      .trim()
+      .replace(/^[\d\.\)\-\*]+\s*/, "")
+      .replace(/^\*\*q\d+\.\*\*\s*/i, "")
+      .replace(/^q\d+\.\s*/i, "")
+      .replace(/^"|"$/g, "")
+      .trim();
+    if (!q || q.length < 18) continue;
+    if (/^#{1,3}\s/.test(q)) continue;
+    if (/^model answer/i.test(q)) continue;
+    if (isPersonalCoachingQuestion(q)) continue;
+    if (isLongExamScenarioQuestion(q)) continue;
+    // Soft trim oversized model output toward a 2-line chip.
+    if (q.length > 140) {
+      const cut = q.slice(0, 137).replace(/\s+\S*$/, "").trim();
+      q = /[?]$/.test(cut) ? cut : `${cut}?`;
+    }
+    const looksExploration =
+      /^(what|how|why|which|when|where|who)\b/i.test(q) ||
+      /\b(principle|concept|benefit|purpose|requirement|documented information|role|performance|improvement|system)\b/i.test(
+        q,
+      );
+    if (!looksExploration) continue;
+    const key = q
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, " ")
+      .trim()
+      .slice(0, 80);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(q);
+    if (out.length >= limit) break;
+  }
+  return out;
+}
+
 /** Parse numbered / Qn question lines from a model response. */
 export function parseGeneratedExamQuestions(
   markdown: string,
@@ -1749,6 +1817,35 @@ export function parseGeneratedExamQuestions(
     }
   }
   return filterExamStyleQuestions(candidates, limit);
+}
+
+/** Parse starter exploration chips (short open-ended). */
+export function parseGeneratedStarterQuestions(
+  markdown: string,
+  limit = LIBRARY_STARTER_QUESTION_COUNT,
+): string[] {
+  const lines = String(markdown || "")
+    .split(/\n+/)
+    .map((l) => l.trim())
+    .filter(Boolean);
+  const candidates: string[] = [];
+  for (const line of lines) {
+    if (/^#{1,3}\s/.test(line)) continue;
+    if (/model answer/i.test(line)) continue;
+    const m =
+      line.match(/^\*\*q\s*\d+\.\*\*\s*(.+)$/i) ||
+      line.match(/^q\s*\d+[\.:)\-]\s*(.+)$/i) ||
+      line.match(/^\d+[\.:)\-]\s*(.+)$/) ||
+      line.match(/^[\-\*]\s+(.+\?)\s*$/);
+    if (m?.[1]) {
+      candidates.push(m[1].trim());
+      continue;
+    }
+    if (/\?\s*$/.test(line) && line.length > 18) {
+      candidates.push(line);
+    }
+  }
+  return filterExplorationStarterQuestions(candidates, limit);
 }
 
 /**

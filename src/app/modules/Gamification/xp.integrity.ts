@@ -166,15 +166,17 @@ export const scoreAgainstTrustedExam = (
   };
 };
 
-/** Lesson quiz: all questions must be answered correctly to mark complete. */
+/** Academy lesson quiz pass mark (50%). Progression can still continue below this. */
+export const ACADEMY_LESSON_QUIZ_PASS_RATIO = 0.5;
+
+/** Lesson quiz: pass when correct answers meet the Academy 50% mark. */
 export const scoreLessonQuizStrict = (
   trusted: Array<{ id: string; answer: string; options?: string[] }>,
   submitted: Array<{ questionId?: string; selected?: string }>,
-): { passed: boolean; rightAns: number; total: number } => {
+): { passed: boolean; rightAns: number; total: number; scorePct: number } => {
   const total = trusted.length;
-  if (total === 0) return { passed: true, rightAns: 0, total: 0 };
+  if (total === 0) return { passed: true, rightAns: 0, total: 0, scorePct: 100 };
 
-  const byId = new Map(trusted.map((q) => [q.id, q]));
   let rightAns = 0;
 
   for (const q of trusted) {
@@ -204,5 +206,7 @@ export const scoreLessonQuizStrict = (
     }, 0);
   }
 
-  return { passed: rightAns === total, rightAns, total };
+  const scorePct = Math.round((rightAns / total) * 100);
+  const passed = rightAns / total >= ACADEMY_LESSON_QUIZ_PASS_RATIO;
+  return { passed, rightAns, total, scorePct };
 };

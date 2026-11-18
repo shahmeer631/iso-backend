@@ -87,7 +87,9 @@ const getChatSessions = catchAsync(async (req, res) => {
     throw new ApiError(401, "Unauthorized");
   }
 
-  const result = await AIAssistantService.getChatSessions(userId);
+  const purpose =
+    typeof req.query?.purpose === "string" ? req.query.purpose : undefined;
+  const result = await AIAssistantService.getChatSessions(userId, purpose);
 
   sendResponse(res, {
     statusCode: 200,

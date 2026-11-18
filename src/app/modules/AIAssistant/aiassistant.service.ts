@@ -110,6 +110,7 @@ import {
   debugChunksForExcerpt,
   excerptMultiWindowChatGroundingFromBuffer,
   filterExamStyleQuestions,
+  filterExplorationStarterQuestions,
   getLibraryRelatedDocumentExcerpt,
   isDocumentedInformationInventoryQuestion,
   isStrongIsoFocusExcerpt,
@@ -119,6 +120,7 @@ import {
   logLibraryRagDebug,
   normalizeLibraryFlashcardDeck,
   parseGeneratedExamQuestions,
+  parseGeneratedStarterQuestions,
   resolveLibraryTask,
   sanitizeLibraryAssistantText,
 } from "./libraryStandards.grounding";
@@ -757,6 +759,32 @@ const simpleChat = async (userId: string | undefined, payload: any = {}) => {
   // ── ISO Navigator chat: document-grounded IMS / standard Q&A (not Universal Ask AI)
   if (isNavigatorChatContext(parsedContext)) {
     const t0 = Date.now();
+    const NAVIGATOR_SESSION_PREFIX = "ISO Navigator";
+
+    // Persist Navigator chat history for logged-in users
+    let navigatorSession: { id: string } | null = null;
+    if (userId) {
+      const incomingSessionId = String(payload.session_id || "").trim();
+      if (incomingSessionId && isValidObjectId(incomingSessionId)) {
+        const existing = await prisma.chatSession.findFirst({
+          where: { id: incomingSessionId, userId },
+          select: { id: true },
+        });
+        if (existing) navigatorSession = existing;
+      }
+      if (!navigatorSession) {
+        const titleSeed = String(questionText || "Chat").trim().slice(0, 72);
+        navigatorSession = await prisma.chatSession.create({
+          data: {
+            userId,
+            title: `${NAVIGATOR_SESSION_PREFIX} — ${titleSeed || "Chat"}`,
+            isoStandardId: null,
+          },
+          select: { id: true },
+        });
+      }
+    }
+
     const grounding = await buildNavigatorChatGrounding({
       question: questionText,
       specificRequirements:
@@ -786,21 +814,37 @@ const simpleChat = async (userId: string | undefined, payload: any = {}) => {
     });
 
     if (!grounding.hasGrounding) {
+      const noGrounding =
+        "I couldn't retrieve enough material from the selected Standards Library editions for this question. Select an ISO standard or Integrated Management Systems option in ISO Navigator, then ask again.";
       console.log(
         `[NavigatorChat] no_grounding total=${Date.now() - t0}ms retrieval=${grounding.retrievalMs}ms user=${userId || "guest"}`,
       );
-      return {
-        response:
-          "I couldn't retrieve enough material from the selected Standards Library editions for this question. Select an ISO standard or Integrated Management Systems option in ISO Navigator, then ask again.",
-        messages: [
-          {
-            role: "assistant",
-            content:
-              "I couldn't retrieve enough material from the selected Standards Library editions for this question. Select an ISO standard or Integrated Management Systems option in ISO Navigator, then ask again.",
+      if (userId && navigatorSession) {
+        await prisma.chatMessage.create({
+          data: {
+            sessionId: navigatorSession.id,
+            role: "user",
+            message: String(questionText || ""),
           },
-        ],
+        });
+        await prisma.chatMessage.create({
+          data: {
+            sessionId: navigatorSession.id,
+            role: "assistant",
+            message: noGrounding,
+            sources: [],
+          },
+        });
+        await prisma.chatSession.update({
+          where: { id: navigatorSession.id },
+          data: { updatedAt: new Date() },
+        });
+      }
+      return {
+        response: noGrounding,
+        messages: [{ role: "assistant", content: noGrounding }],
         sources: [],
-        session_id: payload.session_id || null,
+        session_id: navigatorSession?.id || null,
         purpose: "iso_navigator",
         grounded: false,
       };
@@ -816,7 +860,7 @@ const simpleChat = async (userId: string | undefined, payload: any = {}) => {
           instruction:
             "Answer as ISOBrain ISO Navigator. Use only the provided authoritative source material from uploaded Standards Library / IMS guide excerpts plus organization context. For IMS questions, analyze selected standards together — do not concatenate independent document lists. Do not invent requirements. Never use internal system terminology.",
         },
-        session_id: payload.session_id || undefined,
+        session_id: navigatorSession?.id || undefined,
       });
     } catch (error: any) {
       console.error(
@@ -830,8 +874,38 @@ const simpleChat = async (userId: string | undefined, payload: any = {}) => {
         ? sanitizeLibraryAssistantText(aiResponse.response)
         : "The available source material does not provide enough information to answer this reliably.";
 
+    if (userId && navigatorSession) {
+      await prisma.chatMessage.create({
+        data: {
+          sessionId: navigatorSession.id,
+          role: "user",
+          message: String(questionText || ""),
+        },
+      });
+      const assistantMessage = await prisma.chatMessage.create({
+        data: {
+          sessionId: navigatorSession.id,
+          role: "assistant",
+          message: answer,
+          sources: grounding.sources.slice(0, 10) as any,
+        },
+      });
+      await prisma.chatSession.update({
+        where: { id: navigatorSession.id },
+        data: { updatedAt: new Date() },
+      });
+      if (assistantMessage?.id) {
+        try {
+          const { XpService } = await import("../Gamification/xp.service");
+          await XpService.awardAiChatMessage(userId, assistantMessage.id);
+        } catch {
+          /* XP is best-effort for Navigator chat */
+        }
+      }
+    }
+
     console.log(
-      `[NavigatorChat] total=${Date.now() - t0}ms retrieval=${grounding.retrievalMs}ms ai=${Date.now() - tAi}ms user=${userId || "guest"} ims=${grounding.isIms} sources=${grounding.sources.length}`,
+      `[NavigatorChat] total=${Date.now() - t0}ms retrieval=${grounding.retrievalMs}ms ai=${Date.now() - tAi}ms user=${userId || "guest"} ims=${grounding.isIms} sources=${grounding.sources.length} session=${navigatorSession?.id || "none"}`,
     );
 
     return {
@@ -839,7 +913,7 @@ const simpleChat = async (userId: string | undefined, payload: any = {}) => {
       response: answer,
       messages: [{ role: "assistant", content: answer }],
       sources: grounding.sources.slice(0, 10),
-      session_id: payload.session_id || null,
+      session_id: navigatorSession?.id || null,
       purpose: "iso_navigator",
       grounded: true,
       standard_title: grounding.standardTitle || null,
@@ -848,6 +922,50 @@ const simpleChat = async (userId: string | undefined, payload: any = {}) => {
   }
 
   // ── Default simpleChat pass-through (Audit Lens / Benchmark / legacy)
+  const AUDIT_SESSION_PREFIX = "Audit Lens";
+  const BENCHMARK_SESSION_PREFIX = "Benchmark AI";
+  const purposeRaw = String(parsedContext?.purpose || "").toLowerCase();
+  const isAuditLensChat =
+    purposeRaw === "audit_lens" ||
+    purposeRaw === "audit-lens" ||
+    purposeRaw === "auditlens";
+  const isBenchmarkChat =
+    purposeRaw === "benchmark_ai" ||
+    purposeRaw === "benchmark-ai" ||
+    purposeRaw === "benchmark";
+
+  let toolSession: { id: string } | null = null;
+  const toolSessionPrefix = isAuditLensChat
+    ? AUDIT_SESSION_PREFIX
+    : isBenchmarkChat
+      ? BENCHMARK_SESSION_PREFIX
+      : null;
+  if (userId && toolSessionPrefix) {
+    const incomingSessionId = String(payload.session_id || "").trim();
+    if (incomingSessionId && isValidObjectId(incomingSessionId)) {
+      const existing = await prisma.chatSession.findFirst({
+        where: { id: incomingSessionId, userId },
+        select: { id: true },
+      });
+      if (existing) toolSession = existing;
+    }
+    if (!toolSession) {
+      const titleSeed = String(questionText || "Chat").trim().slice(0, 72);
+      toolSession = await prisma.chatSession.create({
+        data: {
+          userId,
+          title: `${toolSessionPrefix} — ${titleSeed || "Chat"}`,
+          isoStandardId:
+            typeof parsedContext?.isoStandardId === "string" &&
+            isValidObjectId(String(parsedContext.isoStandardId))
+              ? String(parsedContext.isoStandardId)
+              : null,
+        },
+        select: { id: true },
+      });
+    }
+  }
+
   const formData = new FormData();
 
   formData.append(
@@ -864,8 +982,10 @@ const simpleChat = async (userId: string | undefined, payload: any = {}) => {
       : JSON.stringify(payload.context || {}),
   );
 
-  if (payload.session_id) {
-    formData.append("session_id", payload.session_id);
+  if (toolSession?.id) {
+    formData.append("session_id", toolSession.id);
+  } else if (payload.session_id && isValidObjectId(String(payload.session_id))) {
+    formData.append("session_id", String(payload.session_id));
   }
 
   const response = await axios.post(
@@ -876,7 +996,53 @@ const simpleChat = async (userId: string | undefined, payload: any = {}) => {
     },
   );
 
-  return response.data;
+  const remote = response.data || {};
+  const assistantText =
+    typeof remote?.response === "string"
+      ? remote.response
+      : remote?.messages?.[remote.messages.length - 1]?.content ||
+        remote?.data?.response ||
+        "";
+
+  if (userId && toolSession && assistantText) {
+    await prisma.chatMessage.create({
+      data: {
+        sessionId: toolSession.id,
+        role: "user",
+        message: String(questionText || ""),
+      },
+    });
+    const assistantMessage = await prisma.chatMessage.create({
+      data: {
+        sessionId: toolSession.id,
+        role: "assistant",
+        message: String(assistantText),
+        sources: Array.isArray(remote?.sources) ? remote.sources : [],
+      },
+    });
+    await prisma.chatSession.update({
+      where: { id: toolSession.id },
+      data: { updatedAt: new Date() },
+    });
+    if (assistantMessage?.id) {
+      try {
+        const { XpService } = await import("../Gamification/xp.service");
+        await XpService.awardAiChatMessage(userId, assistantMessage.id);
+      } catch {
+        /* XP best-effort */
+      }
+    }
+  }
+
+  return {
+    ...remote,
+    session_id: toolSession?.id || remote?.session_id || null,
+    purpose: isAuditLensChat
+      ? "audit_lens"
+      : isBenchmarkChat
+        ? "benchmark_ai"
+        : remote?.purpose,
+  };
 };
 
 // Generate short title
@@ -906,7 +1072,7 @@ const libraryTaskVisibleLabel = (task: string): string | null => {
     case "flashcards":
       return "Generating flashcards…";
     case "starter_questions":
-      return "Suggested study questions";
+      return "Suggested questions";
     default:
       return null;
   }
@@ -1715,7 +1881,7 @@ const chat = async (userId: string, payload: any = {}) => {
           : libraryTask === "quiz"
             ? `Generate ${studioQuestionCount} multiple-choice quiz questions grounded ONLY in ${standardTitle}. Unique questions only. Never use internal system terminology.`
           : libraryTask === "starter_questions"
-          ? `Generate difficult exam-style questions grounded ONLY in ${standardTitle} and the provided source material. No open-ended coaching prompts. No invented clauses. Never use internal system terminology.`
+          ? `Generate ${LIBRARY_STARTER_QUESTION_COUNT} short open-ended exploration questions (max ~2 lines each) about what a learner should understand in ${standardTitle}. NotebookLM-style study chips. No long auditor exam scenarios. No invented clauses. Never use internal system terminology.`
           : pdfAttached
             ? inventoryMode
               ? `Answer as an ISO consultant for ${standardTitle}. The full selected ISO PDF is attached — use the entire document (all clauses/pages), not only any focus excerpt. List documented information / maintain vs retain only when supported by the attached standard. Prefer clause references. Do not invent items. Never use internal system terminology.`
@@ -1882,7 +2048,7 @@ const chat = async (userId: string, payload: any = {}) => {
     const studioLimit =
       Number(finalContext._studio_question_count) || LIBRARY_STUDIO_QUESTION_COUNT;
     if (taskDone === "starter_questions") {
-      const qs = parseGeneratedExamQuestions(
+      const qs = parseGeneratedStarterQuestions(
         aiResponse.response,
         LIBRARY_STARTER_QUESTION_COUNT,
       );
@@ -1918,11 +2084,11 @@ const chat = async (userId: string, payload: any = {}) => {
         );
       }
     } else {
-      // Normal Library chat: strip static/generic remote follow-up chips
+      // Normal Library chat: keep short NotebookLM-style exploration chips
       const remoteChips = Array.isArray(aiResponse.suggested_followups)
         ? aiResponse.suggested_followups
         : [];
-      const cleaned = filterExamStyleQuestions(
+      const cleaned = filterExplorationStarterQuestions(
         remoteChips.map((q: unknown) => String(q || "")),
         LIBRARY_STARTER_QUESTION_COUNT,
       );
@@ -2251,10 +2417,33 @@ const callAI = async (payload: any = {}) => {
   }
 };
 
-// 🔥 GET ALL SESSIONS
-const getChatSessions = async (userId: string) => {
+// 🔥 GET ALL SESSIONS (optional purpose filters Navigator / Audit Lens history)
+const getChatSessions = async (
+  userId: string,
+  purpose?: string,
+) => {
+  const p = String(purpose || "").toLowerCase();
+  const wantNavigator = p === "iso_navigator" || p === "navigator";
+  const wantAudit = p === "audit_lens" || p === "audit-lens" || p === "auditlens";
+  const wantBenchmark =
+    p === "benchmark_ai" || p === "benchmark-ai" || p === "benchmark";
   return prisma.chatSession.findMany({
-    where: { userId },
+    where: {
+      userId,
+      ...(wantNavigator
+        ? {
+            title: { startsWith: "ISO Navigator" },
+          }
+        : wantAudit
+          ? {
+              title: { startsWith: "Audit Lens" },
+            }
+          : wantBenchmark
+            ? {
+                title: { startsWith: "Benchmark AI" },
+              }
+            : {}),
+    },
     orderBy: { updatedAt: "desc" },
     select: {
       id: true,
@@ -2348,7 +2537,7 @@ const getAuditContext = async (payload: any = {}) => {
       ...payload,
       prefer_integrated_management_systems: true,
       context_instruction:
-        'Return BOTH: (1) separate options for each relevant individual ISO standard as their own criteria, AND (2) when Integrated Management Systems / multiple standards are relevant, also include one option whose criteria is explicitly labeled "Integrated Management Systems" listing those standards together. Keep individual ISO options — do not replace them with only an IMS option. Prefer the latest published edition year for each ISO family when known (do not default every option to 2015).',
+        'Return BOTH: (1) separate options for each relevant individual ISO standard as their own criteria, AND (2) when Integrated Management Systems / multiple standards are relevant, also include one option whose criteria is explicitly labeled "Integrated Management Systems" listing those standards together. Keep individual ISO options — do not replace them with only an IMS option. Prefer the latest published edition year for each ISO family when known (do not default every option to 2015). For EVERY option include: criteria, scope, objective, AND a detailed description (2–4 sentences) of what is being audited, aligned to the user-provided organization text/url when present. Descriptions must be informative enough that an auditor understands the audit focus without guessing.',
     };
 
     const response = await axios.post(
@@ -2741,14 +2930,94 @@ const generateAuditCaseStudyViaChat = async (params: {
   ).trim();
 };
 
+const resolveBenchmarkLibraryTarget = async (payload: any = {}) => {
+  const rawTarget = String(
+    payload.target_standard || payload.iso_standard || "",
+  ).trim();
+  const incomingId = String(payload.isoStandardId || "").trim();
+  let standardTitle = rawTarget;
+  let isoStandardId =
+    incomingId && isValidObjectId(incomingId) ? incomingId : undefined;
+
+  try {
+    if (isoStandardId) {
+      const row = await prisma.iSOStandard.findFirst({
+        where: { id: isoStandardId, status: "ACTIVE" },
+        select: { id: true, title: true },
+      });
+      if (row) {
+        standardTitle = row.title;
+        isoStandardId = row.id;
+      }
+    } else if (rawTarget) {
+      const resolved = await resolveNavigatorISOStandard(rawTarget);
+      if (resolved?.selected?.id) {
+        isoStandardId = resolved.selected.id;
+        standardTitle = resolved.selected.title || rawTarget;
+      }
+    }
+  } catch {
+    /* keep remote target */
+  }
+
+  let libraryExcerpt = "";
+  if (standardTitle || isoStandardId) {
+    try {
+      const grounding = await getNavigatorGroundingExcerpt({
+        specificRequirements: standardTitle || rawTarget,
+        queryHints: [
+          payload.improvement_goal,
+          "opportunities for improvement",
+          "common nonconformities",
+          "gap analysis",
+          "latest edition requirements",
+        ]
+          .filter(Boolean)
+          .join(" "),
+        skipSupporting: true,
+      });
+      libraryExcerpt = String(grounding?.excerpt || "").slice(0, 12000);
+      if (grounding?.standardId) isoStandardId = grounding.standardId;
+      if (grounding?.standardTitle) standardTitle = grounding.standardTitle;
+    } catch {
+      /* optional grounding */
+    }
+  }
+
+  return {
+    target_standard: standardTitle || rawTarget,
+    isoStandardId,
+    libraryExcerpt,
+    context_instruction: [
+      "Benchmark the uploaded protocol / document against the LATEST ACTIVE ISO Library edition of the target standard.",
+      "Do NOT use obsolete edition years when a newer Library edition exists.",
+      "Primary purpose: identify gaps, opportunities for improvement (OFIs), and areas of common non-conformities.",
+      "Return clear identified_gaps, recommendations framed as OFIs, and call out common NC themes.",
+      libraryExcerpt
+        ? "Use the attached ISO Library grounding excerpt as authoritative clause context."
+        : "",
+    ]
+      .filter(Boolean)
+      .join(" "),
+  };
+};
+
 const analyzeBenchmarkFile = async (file: any, payload: any = {}) => {
   const formData = new FormData();
+  const resolved = await resolveBenchmarkLibraryTarget(payload);
 
   formData.append("file", file.buffer, file.originalname);
   formData.append("improvement_goal", payload.improvement_goal);
-  formData.append("target_standard", payload.target_standard);
+  formData.append("target_standard", resolved.target_standard);
   formData.append("document_type", payload.document_type || "Unknown");
   formData.append("department", payload.department || "");
+  formData.append("context_instruction", resolved.context_instruction);
+  if (resolved.isoStandardId) {
+    formData.append("isoStandardId", resolved.isoStandardId);
+  }
+  if (resolved.libraryExcerpt) {
+    formData.append("iso_library_excerpt", resolved.libraryExcerpt);
+  }
 
   const response = await axios.post(
     `${process.env.AI_BASE_URL}/benchmark/analyze-file`,
@@ -2758,16 +3027,43 @@ const analyzeBenchmarkFile = async (file: any, payload: any = {}) => {
     },
   );
 
-  return response.data;
+  const data = response.data || {};
+  if (data?.data && typeof data.data === "object") {
+    data.data.standard_analyzed =
+      data.data.standard_analyzed || resolved.target_standard;
+    data.data.isoStandardId = resolved.isoStandardId || data.data.isoStandardId;
+  } else if (typeof data === "object") {
+    data.standard_analyzed = data.standard_analyzed || resolved.target_standard;
+    data.isoStandardId = resolved.isoStandardId || data.isoStandardId;
+  }
+  return data;
 };
 
 const analyzeBenchmarkText = async (payload: any = {}) => {
+  const resolved = await resolveBenchmarkLibraryTarget(payload);
+  const body = {
+    ...payload,
+    target_standard: resolved.target_standard,
+    isoStandardId: resolved.isoStandardId,
+    context_instruction: resolved.context_instruction,
+    iso_library_excerpt: resolved.libraryExcerpt || undefined,
+  };
+
   const response = await axios.post(
     `${process.env.AI_BASE_URL}/benchmark/analyze-text`,
-    payload,
+    body,
   );
 
-  return response.data;
+  const data = response.data || {};
+  if (data?.data && typeof data.data === "object") {
+    data.data.standard_analyzed =
+      data.data.standard_analyzed || resolved.target_standard;
+    data.data.isoStandardId = resolved.isoStandardId || data.data.isoStandardId;
+  } else if (typeof data === "object") {
+    data.standard_analyzed = data.standard_analyzed || resolved.target_standard;
+    data.isoStandardId = resolved.isoStandardId || data.isoStandardId;
+  }
+  return data;
 };
 
 const isUrlContentBlockedError = (message: unknown): boolean => {
@@ -3067,6 +3363,18 @@ const getBenchmarkAISuggestions = async (
 
   // 🔥 category
   formData.append("category", payload.category);
+  formData.append(
+    "context_instruction",
+    [
+      "Suggest ISO standards grounded in the uploaded protocol / organization category.",
+      "For each suggestion include: standard, title, relevance, documents, records, improvements,",
+      "AND opportunities_for_improvement (array of concrete OFIs),",
+      "AND common_nonconformities (array of typical NC themes for this standard/protocol),",
+      "AND potential_gaps (array of likely conformity gaps to investigate).",
+      "Purpose: help identify gaps and areas of common non-conformities before full benchmark analysis.",
+      "Prefer latest published edition years for each ISO family.",
+    ].join(" "),
+  );
 
   // 🔥 optional file
   if (file) {
@@ -3087,7 +3395,65 @@ const getBenchmarkAISuggestions = async (
     },
   );
 
-  return response.data;
+  // Connect suggestions to ACTIVE ISO Library editions + attach library ids
+  try {
+    const library = await prisma.iSOStandard.findMany({
+      where: { status: "ACTIVE" },
+      select: { id: true, title: true },
+      take: 200,
+    });
+    const remapped = applyLatestLibraryEditionsToPayload(
+      response.data,
+      library.map((l) => ({ title: l.title })),
+      { dropUnavailableFamilies: true },
+    );
+    const suggestions = Array.isArray(remapped?.suggestions)
+      ? remapped.suggestions
+      : Array.isArray(remapped?.data?.suggestions)
+        ? remapped.data.suggestions
+        : [];
+
+    const enriched = [];
+    for (const sug of suggestions) {
+      const label = String(sug?.standard || sug?.title || "").trim();
+      let isoStandardId: string | undefined;
+      if (label) {
+        try {
+          const resolved = await resolveNavigatorISOStandard(label);
+          isoStandardId = resolved?.selected?.id;
+          if (resolved?.selected?.title) {
+            sug.standard = resolved.selected.title;
+          }
+        } catch {
+          /* keep remote label */
+        }
+      }
+      enriched.push({
+        ...sug,
+        isoStandardId: isoStandardId || sug.isoStandardId || undefined,
+        opportunities_for_improvement:
+          sug.opportunities_for_improvement ||
+          sug.opportunities ||
+          sug.improvements ||
+          [],
+        common_nonconformities:
+          sug.common_nonconformities || sug.common_ncs || [],
+        potential_gaps: sug.potential_gaps || sug.gaps || [],
+      });
+    }
+
+    if (remapped?.suggestions) {
+      remapped.suggestions = enriched;
+      return remapped;
+    }
+    if (remapped?.data?.suggestions) {
+      remapped.data.suggestions = enriched;
+      return remapped;
+    }
+    return { success: true, data: { suggestions: enriched } };
+  } catch {
+    return response.data;
+  }
 };
 
 const generateFollowup = async (payload: any = {}) => {
@@ -3119,9 +3485,9 @@ const generateFollowup = async (payload: any = {}) => {
     try {
       const grounded = await chat("", {
         messages: [
-          "Generate exactly 5 difficult exam-style follow-up questions for this ISO standard.",
-          "Each question must be direct, technical, and answerable from the standard (purpose, evidence, responsibilities, documented information, implementation).",
-          "Do NOT generate open-ended coaching prompts such as: What is your scope?, What do you know about…, Can you explain…, How would you define…, What is ISO…?",
+          "Generate exactly 5 short open-ended follow-up questions for this ISO standard.",
+          "Each question should help the learner explore a different important theme (max two lines).",
+          "Do NOT generate long auditor exam scenarios or personal-organization coaching.",
           "Return only a numbered list of 5 questions.",
         ].join(" "),
         context: {
@@ -3130,7 +3496,7 @@ const generateFollowup = async (payload: any = {}) => {
           library_task: "starter_questions",
         },
       });
-      const qs = parseGeneratedExamQuestions(
+      const qs = parseGeneratedStarterQuestions(
         String(grounded?.response || ""),
         5,
       );

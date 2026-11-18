@@ -8,6 +8,7 @@ import {
   extractLibraryQuizQuestionTexts,
   libraryQuestionFingerprint,
   parseGeneratedExamQuestions,
+  parseGeneratedStarterQuestions,
 } from "./libraryStandards.grounding";
 
 test("LIBRARY_STUDIO_QUESTION_COUNT defaults to 20", () => {
@@ -20,9 +21,9 @@ test("buildLibraryTaskInstructions exam requests 20 by default", () => {
     "exam_questions",
     "ISO/IEC 27001:2022",
   );
-  assert.match(text, /Generate 20 difficult/);
+  assert.match(text, /Generate 20 EXTREMELY DIFFICULT/i);
   assert.match(text, /Q20/);
-  assert.doesNotMatch(text, /Generate 5 difficult/);
+  assert.doesNotMatch(text, /Generate 5 EXTREMELY DIFFICULT/i);
 });
 
 test("buildLibraryTaskInstructions quiz requests 20 by default", () => {
@@ -32,12 +33,14 @@ test("buildLibraryTaskInstructions quiz requests 20 by default", () => {
   assert.doesNotMatch(text, /Questions 2–5/);
 });
 
-test("buildLibraryTaskInstructions starter chips stay at 5", () => {
+test("buildLibraryTaskInstructions starter chips stay at 5 open-ended", () => {
   const text = buildLibraryTaskInstructions(
     "starter_questions",
     "ISO 9001:2015",
   );
-  assert.match(text, /exactly 5 difficult/);
+  assert.match(text, /exactly 5 short open-ended/);
+  assert.match(text, /two lines/i);
+  assert.doesNotMatch(text, /EXTREMELY DIFFICULT exam-style/);
 });
 
 test("buildLibraryTaskInstructions includes exclusion list on retry", () => {
@@ -61,6 +64,19 @@ test("parseGeneratedExamQuestions respects higher limit", () => {
   const qs20 = parseGeneratedExamQuestions(md, 20);
   assert.equal(qs5.length, 5);
   assert.equal(qs20.length, 20);
+});
+
+test("parseGeneratedStarterQuestions keeps short open-ended chips", () => {
+  const md = [
+    "1. What are the core quality management principles and their benefits?",
+    "2. How do fundamental concepts help in developing a quality management system?",
+    "3. How do modern trends like circular economy impact quality management?",
+    "4. A senior leadership team has established quality objectives compatible with its strategic direction and allocated resources, but process owners treat QMS requirements as a separate compliance activity and customer-impacting processes continue to be managed through informal business practices; based on ISO 9001:2026 Clauses 5.1 and 4.3, how should an auditor determine whether leadership has demonstrated effective integration rather than merely issued policy-level commitments?",
+  ].join("\n");
+  const qs = parseGeneratedStarterQuestions(md, 5);
+  assert.equal(qs.length, 3);
+  assert.ok(qs.every((q) => q.length <= 140));
+  assert.ok(qs.every((q) => !/how should an auditor/i.test(q)));
 });
 
 test("countLibraryQuizQuestions counts unique MCQ blocks", () => {

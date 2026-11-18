@@ -10,7 +10,8 @@ type LessonAnswerSubmission = {
 
 /**
  * Mark a lesson complete using server-authoritative rules:
- * - Lessons with a Quiz require trusted QuizQuestion answers (client `passed` ignored).
+ * - Lessons with a Quiz are scored against the 50% Academy pass mark.
+ * - Learners may progress after submitting answers even below 50%.
  * - Lessons without a quiz are informational and may be marked complete when enrolled.
  */
 const markLessonComplete = async (
@@ -49,19 +50,27 @@ const markLessonComplete = async (
     include: { questions: true },
   });
 
+  let quizScore: {
+    passed: boolean;
+    rightAns: number;
+    total: number;
+    scorePct: number;
+  } | null = null;
+
   if (quiz && quiz.questions.length > 0) {
     const trusted = quiz.questions.map((q) => ({
       id: q.id,
       answer: q.answer,
       options: q.options || [],
     }));
-    const scored = scoreLessonQuizStrict(trusted, answers || []);
-    if (!scored.passed) {
+    if (!answers || answers.length === 0) {
       throw new ApiError(
         httpStatus.BAD_REQUEST,
-        "Lesson quiz not passed — answers must match the issued questions",
+        "Lesson quiz answers are required before marking complete",
       );
     }
+    quizScore = scoreLessonQuizStrict(trusted, answers);
+    // Progression is allowed below the 50% pass mark; score is returned for UI.
   }
   // Informational lessons (no quiz): allow completion without client pass flag
 
@@ -132,6 +141,15 @@ const markLessonComplete = async (
     progress: Math.round(progress),
     completedLessons,
     totalLessons,
+    quizPassed: quizScore ? quizScore.passed : true,
+    quizScore: quizScore
+      ? {
+          rightAns: quizScore.rightAns,
+          total: quizScore.total,
+          scorePct: quizScore.scorePct,
+          passMarkPct: 50,
+        }
+      : null,
   };
 };
 

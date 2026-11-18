@@ -126,7 +126,7 @@ describe("Phase 3.1 XP integrity helpers", () => {
     assert.ok(missing.score < 70);
   });
 
-  it("lesson quiz ignores forged pass and requires trusted answers", () => {
+  it("lesson quiz uses 50% pass mark and ignores forged client pass", () => {
     const trusted = [
       { id: "lq1", answer: "A", options: ["Yes", "No"] },
       { id: "lq2", answer: "B", options: ["Foo", "Bar"] },
@@ -137,6 +137,13 @@ describe("Phase 3.1 XP integrity helpers", () => {
         { questionId: "lq2", selected: "A" },
       ]).passed,
       false,
+    );
+    assert.equal(
+      scoreLessonQuizStrict(trusted, [
+        { questionId: "lq1", selected: "A" },
+        { questionId: "lq2", selected: "A" },
+      ]).passed,
+      true,
     );
     assert.equal(
       scoreLessonQuizStrict(trusted, [

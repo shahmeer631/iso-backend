@@ -14,11 +14,12 @@ export { MASTERY_DEFAULT_DIFFICULTY, normalizeQuizDifficulty };
 const EXPERT_DIFFICULTY_INSTRUCTIONS = [
   "Generate EXTREMELY DIFFICULT, EXPERT-LEVEL scenario-based ISO competency questions at certification / professional-practice depth.",
   "Ban obvious definitions, benefits, acronym expansions, and textbook recall.",
-  "CRITICAL COMPETENCY MIX (mandatory): Across the full quiz, cover THREE pillars — (1) REQUIREMENTS / interpretation of shall-requirements, (2) IMPLEMENTATION / how to embed controls in processes and documented information, and (3) AUDITING / evidence evaluation and nonconformity judgment. Do NOT make every question about auditing, conformity statements, or auditor actions.",
-  "Target balance for a 10-question set: roughly 3–4 requirements, 3–4 implementation, and 2–3 auditing. For other lengths, keep approximately one-third of items in each pillar.",
-  "Every item must require multi-clause reasoning, trade-offs, incomplete-evidence judgment, monitoring vs implementation distinctions, nonconformity classification, corrective-action / root-cause thinking, or management-system integration — applied to the assigned pillar.",
+  "RACI PROFILE GROUNDING (mandatory): Every question MUST be framed for the learner's RACI-style competency profile built from the three context inputs — Industry, Management level (accountability / decision authority), and Department / job function (day-to-day responsibility). Scenario actors, decisions, and evidence MUST match that role profile (who is Responsible / Accountable / Consulted / Informed in that function).",
+  "CRITICAL COMPETENCY MIX (mandatory): Across the full quiz, cover FOUR pillars — (1) REQUIREMENTS / interpretation of shall-requirements, (2) IMPLEMENTATION / embedding controls in processes and documented information, (3) AUDITING / evidence evaluation and nonconformity judgment, and (4) DAILY USE / operational application of the relevant standards in routine work for that industry + department.",
+  "Target balance for a 10-question set: roughly 2–3 requirements, 2–3 implementation, 2–3 auditing, and 2–3 daily-use. For other lengths, keep approximately equal coverage across all four pillars. Do NOT make every question about auditing alone.",
+  "Every item must require multi-clause reasoning, trade-offs, incomplete-evidence judgment, monitoring vs implementation distinctions, nonconformity classification, corrective-action / root-cause thinking, management-system integration, OR realistic day-to-day application — applied to the assigned pillar AND the RACI profile.",
   "Provide exactly FOUR single-select options (A–D). Exactly one option is defensibly correct under the stated conditions.",
-  "Distractors must be professionally plausible: common implementation mistakes, incomplete compliance approaches, confusion between related requirements, or incorrect interpretations — never absurd or obviously wrong.",
+  "Distractors must be professionally plausible: common implementation mistakes, incomplete compliance approaches, confusion between related requirements, role/accountability mistakes, or incorrect interpretations — never absurd or obviously wrong.",
   "Keep option length, grammar, specificity, and technical detail reasonably consistent; do not make the correct answer linguistically obvious or unusually detailed.",
   "Ground every requirement claim in the attached source material. Do not invent clause numbers or treat guidance notes as normative shall-requirements.",
   "If the sources cannot support an expert question, omit that item rather than fabricating content.",
@@ -212,6 +213,23 @@ const generateQuiz = async (payload: any) => {
     difficulty || MASTERY_DEFAULT_DIFFICULTY,
   );
 
+  // RACI-style profile from the three Mastery Lab inputs
+  const raciProfile = {
+    industry: String(industry),
+    management_level: String(management_level),
+    department: String(department),
+    // Map triad → RACI accountability lens used in prompts
+    accountable_level: String(management_level),
+    responsible_function: String(department),
+    operating_context: String(industry),
+    competency_pillars: [
+      "requirements",
+      "implementation",
+      "auditing",
+      "daily_use",
+    ],
+  };
+
   // 🔥 STEP 1: AI suggestion api
   const suggestionRes = await axios.post(
     `${process.env.AI_BASE_URL}/discovery/iso-suggestions/advanced`,
@@ -219,6 +237,9 @@ const generateQuiz = async (payload: any) => {
       industry,
       management_level,
       department,
+      raci_profile: raciProfile,
+      context_instruction:
+        "Suggest the most relevant ISO standards for this industry, management level, and department/job function so Mastery Lab can assess competency across requirements, implementation, auditing, and daily operational use.",
     },
     { timeout: 1000 * 60 * 2 },
   );
@@ -334,10 +355,13 @@ const generateQuiz = async (payload: any) => {
     "context",
     JSON.stringify({
       ...parsedContext,
+      raci_profile: raciProfile,
       suggestedStandards: normalizedStandards,
       difficulty_level: "EXPERT",
       difficulty_intent: "extremely difficult",
       difficulty_instructions: EXPERT_DIFFICULTY_INSTRUCTIONS,
+      purpose:
+        "ISO Mastery Lab competency assessment grounded in the learner RACI profile (industry × management level × department) covering requirements, implementation, auditing, and daily use of the relevant standards.",
       timestamp: Date.now(),
     }),
   );

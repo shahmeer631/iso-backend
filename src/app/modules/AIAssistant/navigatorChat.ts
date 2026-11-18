@@ -197,6 +197,19 @@ export async function buildNavigatorChatGrounding(params: {
 
   const hasGrounding = Boolean(excerpt.trim()) || Boolean(docSnippet);
 
+  const askedForDocList =
+    looksLikeNavigatorDocumentedInfoRequest(
+      params.documentTitle || question,
+      question,
+      params.clause,
+    ) ||
+    /\b(list|inventory|catalogue|catalog)\b.{0,40}\b(documents?|records?|documented information)\b/i.test(
+      question,
+    ) ||
+    /\b(documents?|records?|documented information)\b.{0,40}\b(list|required|mandatory|needed)\b/i.test(
+      question,
+    );
+
   const imsRules = isIms
     ? `
 IMS ANALYSIS RULES:
@@ -204,10 +217,14 @@ IMS ANALYSIS RULES:
 - PRIMARY IMS source: Integrated Management System – A Practical Guide${imsGuideTitle ? ` ("${imsGuideTitle}")` : ""} for integration methodology / IMS structure.
 - Selected ISO standards remain authoritative for standard-specific requirements. Do not introduce standards that were not selected.
 - Analyze the IMS Practical Guide + retrieved selected standards TOGETHER.
-- Identify: (1) explicitly required documented information for the IMS; (2) common/integratable requirements; (3) standard-specific requirements; (4) maintain vs retain when the source states it; (5) source standard + clause when available; (6) brief integration mapping when helpful.
+- Explain common/integratable requirements and standard-specific differences clearly.
 - Do NOT invent documents, clauses, or obligations. If the sources are insufficient, say so.
 - Do NOT claim two requirements are identical only because they sound similar.
-- Organize answers as Integrated/Common first, then standard-specific (selected families only), then Integration / Source/Clause references when listing documented information.
+${
+  askedForDocList
+    ? "- The user explicitly asked for documented information — you may list required documents/records with maintain vs retain and source/clause when available."
+    : "- Do NOT dump long document/record inventories, catalogues, or mandatory-document tables unless the user explicitly asked for that list."
+}
 ${imsGuideAvailable === false ? "- IMS Practical Guide was not found in the Library. Say clearly that the IMS Practical Guide source is unavailable; do not invent IMS methodology. Ground only on selected ISO standards + organization context if present.\n" : ""}${
         missingEditions?.length
           ? `- Do not invent these unavailable editions: ${missingEditions.join("; ")}.\n`
@@ -219,6 +236,11 @@ RULES:
 - Do not invent clauses, documents, or obligations.
 - Distinguish mandatory requirements from recommendations when the source supports that distinction.
 - Cite standard and clause/section when available in the grounding.
+${
+  askedForDocList
+    ? "- The user explicitly asked for documented information — you may list required documents/records."
+    : "- Do NOT dump long document/record inventories or catalogues unless the user explicitly asked for that list."
+}
 `;
 
   const brief = `You are ISOBrain ISO Navigator assistant (not Universal Ask AI, not Audit Lens, not Expert Studio).
@@ -238,7 +260,7 @@ AUTHORITATIVE SOURCE MATERIAL (uploaded Standards Library / IMS guide excerpts):
 ${excerpt || "(no library excerpt retrieved)"}
 ${docSnippet ? `\nPREVIOUSLY GENERATED NAVIGATOR DOCUMENT (secondary context only):\n${docSnippet}` : ""}
 
-Answer the user's question directly and usefully. Prefer tables or clear headings. Never use internal system terminology (RAG, vector, embedding, prompt).`;
+Answer the user's question directly and usefully with clear headings. Prefer concise prose over inventory tables. Never use internal system terminology (RAG, vector, embedding, prompt).`;
 
   return {
     brief,

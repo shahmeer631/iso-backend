@@ -105,8 +105,24 @@ const issueMasteryCertificateIfEligible = async (
       where: { userId, courseId },
     });
 
+    const withShareMeta = (certificate: any) => ({
+      ...certificate,
+      context: {
+        industry: metadata.industry || "",
+        management_level: metadata.management_level || "",
+        department: metadata.department || "",
+      },
+      dashboardUrl: "https://dashboard.isobrain.ai/user/certificates",
+      shareUrl: certificate?.id
+        ? `https://dashboard.isobrain.ai/certificates/${certificate.id}`
+        : undefined,
+    });
+
     if (existing) {
-      return { certificateIssued: true, certificate: existing };
+      return {
+        certificateIssued: true,
+        certificate: withShareMeta(existing),
+      };
     }
 
     try {
@@ -117,15 +133,7 @@ const issueMasteryCertificateIfEligible = async (
       );
       return {
         certificateIssued: true,
-        certificate: {
-          ...certificate,
-          context: {
-            industry: metadata.industry || "",
-            management_level: metadata.management_level || "",
-            department: metadata.department || "",
-          },
-          dashboardUrl: "https://dashboard.isobrain.ai/user/certificates",
-        },
+        certificate: withShareMeta(certificate),
       };
     } catch (err) {
       if (isPrismaUniqueConflict(err)) {
@@ -133,7 +141,10 @@ const issueMasteryCertificateIfEligible = async (
           where: { userId, courseId },
         });
         if (again) {
-          return { certificateIssued: true, certificate: again };
+          return {
+            certificateIssued: true,
+            certificate: withShareMeta(again),
+          };
         }
       }
       throw err;
@@ -490,10 +501,40 @@ const metricsFromStoredResult = (result: any) => {
   };
 };
 
-const buildResultPayload = (result: any) => {
+const buildResultPayload = async (result: any) => {
   const overallScore = Number(result.score) || 0;
   const passed = overallScore >= MASTERY_PASS_SCORE;
   const metrics = metricsFromStoredResult(result);
+
+  // Ensure Competency certificate is issued (or re-linked) whenever a passing
+  // authenticated attempt is loaded — claim / get-result paths previously
+  // hard-coded certificateIssued: false even after a successful issue.
+  let certificateIssued = false;
+  let certificate: any = null;
+  if (result?.userId && passed) {
+    const certResult = await issueMasteryCertificateIfEligible(
+      String(result.userId),
+      overallScore,
+      {
+        industry: result.industry || undefined,
+        management_level: result.management_level || undefined,
+        department: result.department || undefined,
+      },
+    );
+    certificateIssued = Boolean(certResult.certificateIssued);
+    certificate = certResult.certificate
+      ? {
+          ...certResult.certificate,
+          dashboardUrl:
+            certResult.certificate.dashboardUrl ||
+            "https://dashboard.isobrain.ai/user/certificates",
+          shareUrl: certResult.certificate.id
+            ? `https://dashboard.isobrain.ai/certificates/${certResult.certificate.id}`
+            : undefined,
+        }
+      : null;
+  }
+
   return formatSubmitResponse(result, {
     overallScore,
     comparison: overallScore < 78 ? "Below Average" : "Above Average",
@@ -504,8 +545,8 @@ const buildResultPayload = (result: any) => {
         )
       : [],
     aiFeedback: result.aiFeedback || {},
-    certificateIssued: false,
-    certificate: null,
+    certificateIssued,
+    certificate,
     passed,
     ...metrics,
   });
@@ -551,20 +592,8 @@ const submitMasteryLab = async (payload: any) => {
       const { XpService } = await import("../Gamification/xp.service");
       await XpService.awardMasteryExamPass(userId, existing.id);
     }
-    return formatSubmitResponse(existing, {
-      overallScore: existing.score,
-      comparison:
-        existing.score < 78 ? "Below Average" : "Above Average",
-      benchmarkAverage: 78,
-      weakStandards: suggestedStandards.slice(
-        Math.floor(suggestedStandards.length / 2),
-      ),
-      aiFeedback: existing.aiFeedback,
-      ...metricsFromStoredResult(existing),
-      certificateIssued: false,
-      certificate: null,
-      passed,
-    });
+    // Re-use async payload builder so certificate appears on dashboard + API
+    return buildResultPayload(existing);
   }
 
   const { questions: trusted, primarySessionId, sessions } = loaded;
@@ -703,6 +732,18 @@ const submitMasteryLab = async (payload: any) => {
       return redactMasteryResultForAnonymous(result);
     }
 
+    const certificate = certResult.certificate
+      ? {
+          ...certResult.certificate,
+          dashboardUrl:
+            certResult.certificate.dashboardUrl ||
+            "https://dashboard.isobrain.ai/user/certificates",
+          shareUrl: certResult.certificate.id
+            ? `https://dashboard.isobrain.ai/certificates/${certResult.certificate.id}`
+            : undefined,
+        }
+      : null;
+
     return formatSubmitResponse(result, {
       overallScore,
       comparison,
@@ -710,7 +751,7 @@ const submitMasteryLab = async (payload: any) => {
       weakStandards,
       aiFeedback: aiFeedbackWithMetrics,
       certificateIssued: certResult.certificateIssued,
-      certificate: certResult.certificate,
+      certificate,
       passed,
       progress,
       answered,
@@ -851,13 +892,10 @@ const claimMasteryLabResult = async (
         String((err as Error)?.message || err).slice(0, 200),
       );
     }
-    await issueMasteryCertificateIfEligible(userId, updated.score, {
-      industry: updated.industry || undefined,
-      management_level: updated.management_level || undefined,
-      department: updated.department || undefined,
-    });
   }
 
+  // buildResultPayload re-issues / links the Competency certificate and returns
+  // certificateIssued so the success page + dashboard stay in sync.
   return buildResultPayload(updated);
 };
 
