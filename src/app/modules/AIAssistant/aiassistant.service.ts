@@ -2951,7 +2951,7 @@ const resolveBenchmarkLibraryTarget = async (payload: any = {}) => {
       }
     } else if (rawTarget) {
       const resolved = await resolveNavigatorISOStandard(rawTarget);
-      if (resolved?.selected?.id) {
+      if (resolved.ok && resolved.selected?.id) {
         isoStandardId = resolved.selected.id;
         standardTitle = resolved.selected.title || rawTarget;
       }
@@ -3420,9 +3420,11 @@ const getBenchmarkAISuggestions = async (
       if (label) {
         try {
           const resolved = await resolveNavigatorISOStandard(label);
-          isoStandardId = resolved?.selected?.id;
-          if (resolved?.selected?.title) {
-            sug.standard = resolved.selected.title;
+          if (resolved.ok) {
+            isoStandardId = resolved.selected?.id;
+            if (resolved.selected?.title) {
+              sug.standard = resolved.selected.title;
+            }
           }
         } catch {
           /* keep remote label */
