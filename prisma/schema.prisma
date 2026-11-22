@@ -75,6 +75,9 @@ model User {
   xpLedgers         XpLedger[]
   milestones        UserMilestone[]
 
+  /// Privacy-first Mastery Lab leaderboard: when false, public ranks show "Anonymous User"
+  isLeaderboardPublic Boolean @default(true)
+
   @@map("Users")
 }
 
@@ -811,6 +814,40 @@ model MasteryLeaderboardResetLog {
 
   @@index([createdAt])
   @@map("MasteryLeaderboardResetLogs")
+}
+
+/// Tracks exposed Mastery Lab stems so the same learner does not re-see them.
+model MasteryQuestionHistory {
+  id           String   @id @default(auto()) @map("_id") @db.ObjectId
+  userId       String?  @db.ObjectId
+  guestId      String?
+  questionHash String
+  industry     String?
+  createdAt    DateTime @default(now())
+
+  @@index([userId, createdAt])
+  @@index([guestId, createdAt])
+  @@index([questionHash])
+  @@map("MasteryQuestionHistories")
+}
+
+/// Pre-generated Mastery Lab questions for instant exam serve / replenishment.
+model MasteryQuestionBank {
+  id               String    @id @default(auto()) @map("_id") @db.ObjectId
+  userId           String?   @db.ObjectId
+  guestId          String?
+  industry         String
+  managementLevel  String
+  department       String
+  questionHash     String
+  questionPayload  Json
+  createdAt        DateTime  @default(now())
+  consumedAt       DateTime?
+
+  @@index([userId, industry, managementLevel, department, consumedAt])
+  @@index([guestId, industry, managementLevel, department, consumedAt])
+  @@index([questionHash])
+  @@map("MasteryQuestionBanks")
 }
 
 /// Phase 3.1/3.2 — trusted Mastery Lab question set issued at generation time.

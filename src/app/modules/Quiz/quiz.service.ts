@@ -13,6 +13,13 @@ import {
   MASTERY_DEFAULT_DIFFICULTY,
   normalizeQuizDifficulty,
 } from "./quizDifficulty";
+import {
+  hashQuestionStem,
+  loadPriorQuestionHashes,
+  recordQuestionHistory,
+  stashQuestionBank,
+  tryServeFromQuestionBank,
+} from "./masteryQuestionBank";
 
 export { MASTERY_DEFAULT_DIFFICULTY, normalizeQuizDifficulty };
 
@@ -54,23 +61,58 @@ const resolveRoleFocus = (managementLevel: string): string => {
   return ROLE_FOCUS_BY_LEVEL.Senior;
 };
 
+const COMPANY_SIZES = [
+  "12-person startup",
+  "85-employee SME",
+  "400-person mid-market firm",
+  "2,500-employee enterprise",
+  "multi-site global corporation",
+  "family-owned manufacturer",
+  "regulated public-sector agency",
+];
+
+const TRIGGER_EVENTS = [
+  "failed third-party audit finding",
+  "serious near-miss incident",
+  "customer complaint escalation",
+  "regulatory inspection notice",
+  "merger integration deadline",
+  "supplier nonconformity cascade",
+  "management review with declining KPIs",
+  "certification surveillance visit in 10 days",
+  "whistleblower report on control gaps",
+  "new contract requiring dual-standard evidence",
+];
+
+const pickNovelty = <T,>(items: T[]): T =>
+  items[Math.floor(Math.random() * items.length)];
+
 const EXPERT_DIFFICULTY_INSTRUCTIONS = [
   "Generate EXTREMELY DIFFICULT, EXPERT-LEVEL scenario-based ISO competency questions at certification / professional-practice depth.",
   "Ban obvious definitions, benefits, acronym expansions, textbook recall, and common-sense items answerable without knowing the cited ISO requirement.",
   "CLAUSE SPECIFICITY (mandatory for EVERY question): Identify the relevant ISO standard and edition/version from the attached sources; test a specific clause or subclause; require interpretation and application of what that clause actually requires.",
+  "DUAL-CLAUSE SYNTHESIS (mandatory for most items): Prefer scenarios that force the learner to reconcile TWO interacting clauses (primary + secondary standard/clause) — e.g. operational control interacting with competence, documented information interacting with performance evaluation, leadership interacting with risk.",
   "Include difficult distinctions between closely related clauses; mandatory requirements vs documented information vs guidance/recommended practice; objective audit evidence; and whether an action satisfies a requirement without adding obligations the standard does not impose.",
   "Each question object MUST include structured fields when possible: standard, version, clause, subclause, exam_level, pillar, difficulty, explanation — plus the stem, four options, and correct_answer.",
   "The question stem itself SHOULD name the standard and the clause/subclause under test (paraphrase requirements; do NOT paste substantial copyrighted standard text).",
-  "RACI PROFILE GROUNDING (mandatory): Every question MUST be framed for the learner's RACI-style competency profile built from the three context inputs — Industry, Management level (accountability / decision authority), and Department / job function (day-to-day responsibility). Scenario actors, decisions, and evidence MUST match that role profile (who is Responsible / Accountable / Consulted / Informed in that function).",
+  "RACI PROFILE GROUNDING (mandatory): Every question MUST be framed for the learner's RACI-style competency profile built from the three context inputs — Industry, Management level (accountability / decision authority), and Department / job function (day-to-day responsibility). Frame the crisis from the Accountable vs Responsible perspective for that role. Scenario actors, decisions, and evidence MUST match that role profile.",
   "CRITICAL COMPETENCY MIX (mandatory): Across the full quiz, cover FOUR pillars — (1) REQUIREMENTS / interpretation of shall-requirements, (2) IMPLEMENTATION / embedding controls in processes and documented information, (3) AUDITING / evidence evaluation and nonconformity judgment, and (4) DAILY USE / operational application of the relevant standards in routine work for that industry + department.",
-  "Target balance for a 10-question set: roughly 2–3 requirements, 2–3 implementation, 2–3 auditing, and 2–3 daily-use. For other lengths, keep approximately equal coverage across all four pillars. Do NOT make every question about auditing alone.",
+  "Target balance for a 10-question set: roughly 2–3 requirements, 2–3 implementation, 2–3 auditing, and 2–3 daily-use. For 30-question exams, keep approximately equal coverage across all four pillars. Do NOT make every question about auditing alone.",
   "Every item must require multi-clause reasoning, trade-offs, incomplete-evidence judgment, monitoring vs implementation distinctions, nonconformity classification, corrective-action / root-cause thinking, management-system integration, OR realistic day-to-day application — applied to the assigned pillar AND the RACI profile.",
   "Provide exactly FOUR single-select options (A–D). Exactly one option is defensibly correct under the stated conditions.",
-  "Distractors must be professionally plausible: common implementation mistakes, incomplete compliance approaches, confusion between related requirements, role/accountability mistakes, or incorrect interpretations — never absurd or obviously wrong.",
+  "ADVERSARIAL DISTRACTORS (mandatory): Incorrect options must sound like plausible corporate best practices. Base at least ONE distractor on an incorrect, outdated, or closely-related-but-wrong clause interpretation. Do NOT use absolute trigger words (\"always\", \"never\", \"all\", \"none\") that make options obviously wrong. Correct answers must hinge on subtle clause requirements — not buzzwords.",
+  "LENGTH LIMITS (hard): Scenario/stem text MUST NOT exceed 60–80 words. Each option text MUST NOT exceed 15 words. Prefer concise operational language.",
   "Keep option length, grammar, specificity, and technical detail reasonably consistent; do not make the correct answer linguistically obvious or unusually detailed.",
   "Ground every requirement claim in the attached source material. Do not invent clause numbers or treat guidance notes as normative shall-requirements.",
   "If the sources cannot support an expert clause-specific question, omit that item rather than fabricating content.",
 ].join(" ");
+
+/** Hardcoded post-exam upsell destinations from Mastery Lab implementation plan. */
+export const MASTERY_UPSELL_URLS = {
+  library: "https://isobrain.ai/en/library/iso-standards",
+  academy: "https://isobrain.ai/en/academy",
+  ai_assistant: "https://isobrain.ai/en/ai-assistant-home",
+} as const;
 
 const generateQuizAndSave = async (lessonId: string, payload: any) => {
   // check lesson exists
@@ -232,6 +274,86 @@ const persistMasteryExamSession = async (params: {
     },
   });
   return session.id;
+};
+
+/** AI /quiz/generate accepts <= 30, but single 30-Q calls often return empty/non-JSON. */
+const AI_MAX_QUESTIONS = 30;
+const AI_SAFE_BATCH_SIZE = 15;
+const AI_MAX_ATTACHED_FILES = 2;
+const AI_MAX_FILE_BYTES = 1.5 * 1024 * 1024;
+
+type AttachedQuizFile = {
+  title: string;
+  buffer: Buffer;
+  filename: string;
+};
+
+const formatAiErrorDetail = (aiErr: any): string => {
+  const responseData = aiErr?.response?.data;
+  const detail =
+    responseData?.message ||
+    responseData?.error ||
+    responseData?.detail ||
+    aiErr?.message ||
+    "Quiz generation failed";
+  if (typeof detail === "string") return detail;
+  if (Array.isArray(detail)) {
+    return (
+      detail
+        .map((d: any) => d?.msg || JSON.stringify(d))
+        .filter(Boolean)
+        .join("; ") || "Quiz generation failed"
+    );
+  }
+  return "Quiz generation failed";
+};
+
+const isEmptyAiJsonError = (message: string) =>
+  /Failed to parse AI response as JSON|Expecting value: line 1 column 1/i.test(
+    message,
+  );
+
+const callAiQuizGenerate = async (params: {
+  contextPayload: Record<string, unknown>;
+  numQuestions: number;
+  difficulty: string;
+  files: AttachedQuizFile[];
+  batchLabel?: string;
+}) => {
+  const formData = new FormData();
+  formData.append("context", JSON.stringify(params.contextPayload));
+  formData.append("num_questions", String(params.numQuestions));
+  formData.append("difficulty", params.difficulty);
+  formData.append("difficulty_level", "EXPERT");
+
+  for (const file of params.files) {
+    formData.append("files", file.buffer, {
+      filename: file.filename,
+      contentType: "application/pdf",
+    });
+  }
+
+  try {
+    const aiResponse = await axios.post(
+      `${process.env.AI_BASE_URL}/quiz/generate`,
+      formData,
+      {
+        headers: formData.getHeaders(),
+        maxBodyLength: Infinity,
+        maxContentLength: Infinity,
+        timeout: 1000 * 60 * 5,
+      },
+    );
+    return aiResponse.data;
+  } catch (aiErr: any) {
+    const message = formatAiErrorDetail(aiErr);
+    console.error(
+      `AI quiz/generate failed${params.batchLabel ? ` (${params.batchLabel})` : ""}:`,
+      message,
+      aiErr?.response?.status ? `| status=${aiErr.response.status}` : "",
+    );
+    throw new Error(message);
+  }
 };
 
 const generateQuiz = async (payload: any) => {
@@ -439,7 +561,7 @@ const generateQuiz = async (payload: any) => {
     if (seenTitles.has(key)) continue;
     seenTitles.add(key);
     selectedFiles.push(src);
-    if (selectedFiles.length >= 3) break;
+    if (selectedFiles.length >= AI_MAX_ATTACHED_FILES) break;
   }
 
   // Soft fallback: relevant ACTIVE ISO standards (ISO-titled) when suggestion match misses.
@@ -463,7 +585,7 @@ const generateQuiz = async (payload: any) => {
       const src = toSource({ title: s.title, fileUrl: s.fileUrl, version: null });
       if (!src) continue;
       selectedFiles.push(src);
-      if (selectedFiles.length >= 3) break;
+      if (selectedFiles.length >= AI_MAX_ATTACHED_FILES) break;
     }
   }
 
@@ -481,47 +603,82 @@ const generateQuiz = async (payload: any) => {
 
   const roleFocus = resolveRoleFocus(String(management_level));
   const requestedCount = Math.min(Number(num_questions) || 5, 30);
+  const randomCompanySize = pickNovelty(COMPANY_SIZES);
+  const randomTriggerEvent = pickNovelty(TRIGGER_EVENTS);
 
-  const formData = new FormData();
+  // Prefer primary + secondary source PDFs for dual-clause synthesis (≈40/60 weighting cue)
+  const primarySources = selectedFiles.slice(0, 1);
+  const secondarySources = selectedFiles.slice(1);
+  const ragHint = {
+    primary_weight: 0.4,
+    secondary_weight: 0.6,
+    primary_standards: primarySources.map((f) => f.title),
+    secondary_standards: secondarySources.map((f) => f.title),
+    instruction:
+      "Retrieve and synthesize TWO interacting clauses (primary + secondary) for most questions.",
+  };
+
+  // Novelty: skip stems already shown to this user/guest
+  const priorHashes = await loadPriorQuestionHashes({
+    userId: userId || null,
+    guestId: guestId || null,
+  });
+
+  // Instant-serve path: drain pre-generated bank when enough unused items exist
+  const bankServed = await tryServeFromQuestionBank({
+    userId: userId || null,
+    guestId: guestId || null,
+    industry: String(industry),
+    management_level: String(management_level),
+    department: String(department),
+    count: requestedCount,
+    priorHashes,
+  });
+  if (bankServed) {
+    return bankServed;
+  }
 
   // EXPERT intent is always explicit — even when AI API difficulty enum is "professional"
-  formData.append(
-    "context",
-    JSON.stringify({
-      ...parsedContext,
-      raci_profile: raciProfile,
-      exam_level: String(management_level),
-      role_focus: roleFocus,
-      suggestedStandards: normalizedStandards,
-      source_documents: selectedFiles.map((f) => ({
-        title: f.title,
-        version: f.version || null,
-      })),
-      difficulty_level: "EXPERT",
-      difficulty_intent: "extremely difficult",
-      difficulty_instructions: [
-        EXPERT_DIFFICULTY_INSTRUCTIONS,
-        roleFocus,
-      ].join(" "),
-      purpose:
-        "ISO Mastery Lab competency assessment grounded in the learner RACI profile (industry × management level × department) covering requirements, implementation, auditing, and daily use of the relevant standards — with mandatory clause-specific items for every question.",
-      timestamp: Date.now(),
-    }),
-  );
+  const contextPayload: Record<string, unknown> = {
+    ...parsedContext,
+    raci_profile: raciProfile,
+    exam_level: String(management_level),
+    role_focus: roleFocus,
+    suggestedStandards: normalizedStandards,
+    source_documents: selectedFiles.map((f) => ({
+      title: f.title,
+      version: f.version || null,
+    })),
+    rag_retrieval: ragHint,
+    // Infinite novelty injection (implementation plan)
+    random_company_size: randomCompanySize,
+    random_trigger_event: randomTriggerEvent,
+    novelty_instruction: `Set every scenario in a ${randomCompanySize} operating in ${industry}. Trigger crisis: ${randomTriggerEvent}. Do not reuse generic textbook vignettes.`,
+    avoid_question_hashes: Array.from(priorHashes).slice(0, 40),
+    difficulty_level: "EXPERT",
+    difficulty_intent: "extremely difficult",
+    difficulty_instructions: [
+      EXPERT_DIFFICULTY_INSTRUCTIONS,
+      roleFocus,
+      `NOVELTY: company_size=${randomCompanySize}; trigger_event=${randomTriggerEvent}; industry=${industry}.`,
+    ].join(" "),
+    purpose:
+      "ISO Mastery Lab competency assessment grounded in the learner RACI profile (industry × management level × department) covering requirements, implementation, auditing, and daily use of the relevant standards — with mandatory clause-specific items for every question.",
+    timestamp: Date.now(),
+  };
 
-  // Over-request so clause/quality filtering can still yield a full exam set
+  // Target requested count; over-request within AI max for filter headroom.
+  // Single 30-Q AI calls often return empty JSON — generate in safe batches instead.
   const generateCount = Math.min(
-    30,
-    Math.max(requestedCount, Math.ceil(requestedCount * 1.8)),
+    AI_MAX_QUESTIONS,
+    Math.max(requestedCount, Math.ceil(requestedCount * 1.2)),
   );
-  formData.append("num_questions", String(generateCount));
-  formData.append("difficulty", resolvedDifficulty);
-  formData.append("difficulty_level", "EXPERT");
 
-  // 🔥 attach files with timeouts; skip failures instead of hanging the request
-  let attachedCount = 0;
+  // 🔥 download source PDFs once (reuse across batches)
+  const attachedFiles: AttachedQuizFile[] = [];
   for (const file of selectedFiles) {
     if (!file.fileUrl) continue;
+    if (attachedFiles.length >= AI_MAX_ATTACHED_FILES) break;
 
     console.log("Downloading File:", file.fileUrl);
 
@@ -537,16 +694,23 @@ const generateQuiz = async (payload: any) => {
         console.warn("Skipping empty file:", file.title);
         continue;
       }
+      if (buffer.length > AI_MAX_FILE_BYTES) {
+        console.warn(
+          `Skipping oversized file (${Math.round(buffer.length / 1024)}KB):`,
+          file.title,
+        );
+        continue;
+      }
 
       const safeName = String(file.title || "document")
         .replace(/[^\w.\-]+/g, "_")
         .slice(0, 80);
 
-      formData.append("files", buffer, {
+      attachedFiles.push({
+        title: file.title,
+        buffer,
         filename: `${safeName}.pdf`,
-        contentType: "application/pdf",
       });
-      attachedCount += 1;
     } catch (downloadErr: any) {
       console.warn(
         "Skipping failed document download:",
@@ -556,169 +720,274 @@ const generateQuiz = async (payload: any) => {
     }
   }
 
-  console.log(`Attached ${attachedCount} document(s) for quiz generation`);
+  // If every candidate was oversized, retry with the smallest downloaded candidate
+  if (!attachedFiles.length) {
+    for (const file of selectedFiles) {
+      if (!file.fileUrl) continue;
+      try {
+        const fileRes = await axios.get(file.fileUrl, {
+          responseType: "arraybuffer",
+          timeout: 1000 * 25,
+          maxContentLength: 25 * 1024 * 1024,
+        });
+        const buffer = Buffer.from(fileRes.data);
+        if (!buffer.length) continue;
+        const safeName = String(file.title || "document")
+          .replace(/[^\w.\-]+/g, "_")
+          .slice(0, 80);
+        attachedFiles.push({
+          title: file.title,
+          buffer,
+          filename: `${safeName}.pdf`,
+        });
+        break;
+      } catch {
+        /* try next */
+      }
+    }
+  }
 
-  if (attachedCount === 0) {
+  console.log(
+    `Attached ${attachedFiles.length} document(s) for quiz generation`,
+  );
+
+  if (!attachedFiles.length) {
     throw new Error(
       "Unable to download any matched ISO source documents. Cannot generate clause-grounded questions without source material.",
     );
   }
 
-  // 🔥 STEP 5: generate quiz
-  try {
-    const aiResponse = await axios.post(
-      `${process.env.AI_BASE_URL}/quiz/generate`,
-      formData,
-      {
-        headers: formData.getHeaders(),
-        maxBodyLength: Infinity,
-        maxContentLength: Infinity,
-        timeout: 1000 * 60 * 5,
-      },
-    );
+  // 🔥 STEP 5: generate quiz in safe batches (15-Q chunks) to avoid OpenAI empty-JSON 500s
+  const rawQuestions: any[] = [];
+  let lastAiPayload: any = {};
+  let remaining = generateCount;
+  let batchIndex = 0;
 
-    const rawQuestions = Array.isArray(aiResponse.data?.questions)
-      ? aiResponse.data.questions
+  while (remaining > 0) {
+    batchIndex += 1;
+    const batchSize = Math.min(AI_SAFE_BATCH_SIZE, remaining);
+    const batchLabel = `batch ${batchIndex}, n=${batchSize}`;
+    console.log(`[MasteryQuiz] Generating ${batchLabel}…`);
+
+    let batchData: any;
+    try {
+      batchData = await callAiQuizGenerate({
+        contextPayload: {
+          ...contextPayload,
+          batch_index: batchIndex,
+          timestamp: Date.now(),
+        },
+        numQuestions: batchSize,
+        difficulty: resolvedDifficulty,
+        files: attachedFiles,
+        batchLabel,
+      });
+    } catch (batchErr: any) {
+      const msg = String(batchErr?.message || batchErr);
+      // One retry with a smaller chunk + single primary PDF when OpenAI returns empty JSON
+      if (isEmptyAiJsonError(msg) && batchSize > 5) {
+        const retrySize = Math.min(5, batchSize);
+        console.warn(
+          `[MasteryQuiz] Empty AI JSON on ${batchLabel}; retrying with n=${retrySize} and 1 file`,
+        );
+        batchData = await callAiQuizGenerate({
+          contextPayload: {
+            ...contextPayload,
+            batch_index: batchIndex,
+            retry: true,
+            timestamp: Date.now(),
+          },
+          numQuestions: retrySize,
+          difficulty: resolvedDifficulty,
+          files: attachedFiles.slice(0, 1),
+          batchLabel: `${batchLabel} retry`,
+        });
+      } else {
+        throw batchErr;
+      }
+    }
+
+    lastAiPayload = batchData || {};
+    const batchQuestions = Array.isArray(batchData?.questions)
+      ? batchData.questions
       : [];
+    rawQuestions.push(...batchQuestions);
+    remaining -= batchSize;
 
-    // Stamp exam_level + backfill standard codes from stem when AI omits "ISO …"
-    const stamped = rawQuestions.map((q: any) => {
-      const base = {
-        ...q,
-        exam_level: q?.exam_level || String(management_level),
-        difficulty: q?.difficulty || "expert",
-      };
-      const blob = `${base.question || ""}\n${base.explanation || ""}`;
-      if (!String(base.standard || "").trim()) {
-        for (const n of isoNumbers) {
-          if (new RegExp(`\\b${n}\\b`).test(blob)) {
-            base.standard = `ISO ${n}`;
-            break;
-          }
+    if (!batchQuestions.length) {
+      console.warn(
+        `[MasteryQuiz] ${batchLabel} returned 0 questions; stopping further batches`,
+      );
+      break;
+    }
+  }
+
+  // Stamp exam_level + backfill standard codes from stem when AI omits "ISO …"
+  const stamped = rawQuestions.map((q: any) => {
+    const base = {
+      ...q,
+      exam_level: q?.exam_level || String(management_level),
+      difficulty: q?.difficulty || "expert",
+    };
+    const blob = `${base.question || ""}\n${base.explanation || ""}`;
+    if (!String(base.standard || "").trim()) {
+      for (const n of isoNumbers) {
+        if (new RegExp(`\\b${n}\\b`).test(blob)) {
+          base.standard = `ISO ${n}`;
+          break;
         }
       }
-      return base;
-    });
-
-    const { accepted, rejected } = filterValidatedMasteryQuestions(
-      stamped,
-      () => randomUUID(),
-    );
-
-    if (rejected.length) {
-      console.warn(
-        `[MasteryQuiz] Rejected ${rejected.length}/${rawQuestions.length} questions:`,
-        rejected.map((r) => `#${r.index}: ${r.reason}`).join("; "),
-      );
     }
+    return base;
+  });
 
-    const minAccepted = minimumAcceptedQuestions(requestedCount);
-    if (accepted.length < minAccepted) {
-      throw new ApiError(
-        httpStatus.BAD_REQUEST,
-        `Quiz generation produced only ${accepted.length} valid clause-specific expert questions (minimum ${minAccepted} of ${requestedCount} requested). Please retry.`,
-      );
-    }
+  const { accepted, rejected } = filterValidatedMasteryQuestions(
+    stamped,
+    () => randomUUID(),
+  );
 
-    // Prefer returning the requested count when we over-generated
-    const publishSet = accepted.slice(0, Math.max(requestedCount, minAccepted));
-
-    const trustedQuestions: TrustedExamQuestion[] = publishSet.map((q) => ({
-      id: q.id,
-      question: q.question,
-      options: q.options,
-      answer: q.answer,
-      explanation: q.explanation,
-      standard: q.standard,
-      version: q.version,
-      clause: q.clause,
-      subclause: q.subclause,
-      exam_level: q.exam_level || String(management_level),
-      pillar: q.pillar,
-      difficulty: q.difficulty || "expert",
-      qualityScore: q.qualityScore,
-    }));
-
-    const metadata = {
-      industry,
-      management_level,
-      department,
-      exam_level: String(management_level),
-      role_focus: roleFocus,
-      suggestedStandards: normalizedStandards,
-      sourceDocuments: selectedFiles.map((f) => f.title),
-      difficulty: resolvedDifficulty,
-      difficulty_level: "EXPERT",
-      validation: {
-        accepted: accepted.length,
-        published: publishSet.length,
-        rejected: rejected.length,
-        minAccepted,
-        requested: requestedCount,
-        generated: generateCount,
-        avgQualityScore:
-          publishSet.length > 0
-            ? Math.round(
-                publishSet.reduce((s, q) => s + (q.qualityScore || 0), 0) /
-                  publishSet.length,
-              )
-            : 0,
-      },
-    };
-
-    // Persist trusted answer key server-side (Phase 3.1)
-    let examSessionId: string | null = null;
-    if (trustedQuestions.length > 0) {
-      examSessionId = await persistMasteryExamSession({
-        userId: userId || null,
-        guestId: guestId || null,
-        questions: trustedQuestions,
-        metadata,
-      });
-    }
-
-    // Return questions with stable ids; clients may still see correct_answer for UX
-    // but submit scoring ignores client-supplied keys and uses MasteryExamSession.
-    const clientQuestions = trustedQuestions.map((q, idx) => {
-      const raw = publishSet[idx];
-      const optionsRecord = Object.fromEntries(
-        q.options.map((o) => [o.label, o.text]),
-      );
-      return {
-        id: q.id,
-        question: q.question,
-        options: optionsRecord,
-        correct_answer: q.answer,
-        explanation: raw?.explanation || "",
-        standard: raw?.standard || "",
-        version: raw?.version || "",
-        clause: raw?.clause || "",
-        subclause: raw?.subclause || "",
-        exam_level: raw?.exam_level || String(management_level),
-        pillar: raw?.pillar || "",
-        difficulty: raw?.difficulty || "expert",
-        qualityScore: raw?.qualityScore,
-      };
-    });
-
-    return {
-      ...aiResponse.data,
-      examSessionId,
-      questions: clientQuestions,
-      metadata,
-      validation: metadata.validation,
-    };
-  } catch (aiErr: any) {
-    const detail =
-      aiErr?.response?.data?.message ||
-      aiErr?.response?.data?.error ||
-      aiErr?.message ||
-      "Quiz generation failed";
-    console.error("AI quiz/generate failed:", detail);
-    throw new Error(
-      typeof detail === "string" ? detail : "Quiz generation failed",
+  if (rejected.length) {
+    console.warn(
+      `[MasteryQuiz] Rejected ${rejected.length}/${rawQuestions.length} questions:`,
+      rejected.map((r) => `#${r.index}: ${r.reason}`).join("; "),
     );
   }
+
+  // Drop stems already served to this learner (novelty guarantee)
+  const novelAccepted = accepted.filter((q) => {
+    const hash = hashQuestionStem(q.question);
+    return !priorHashes.has(hash);
+  });
+
+  const minAccepted = minimumAcceptedQuestions(requestedCount);
+  const pool = novelAccepted.length >= minAccepted ? novelAccepted : accepted;
+  if (pool.length < minAccepted) {
+    throw new ApiError(
+      httpStatus.BAD_REQUEST,
+      `Quiz generation produced only ${pool.length} valid clause-specific expert questions (minimum ${minAccepted} of ${requestedCount} requested). Please retry.`,
+    );
+  }
+
+  // Prefer returning the requested count when we over-generated
+  const publishSet = pool.slice(0, Math.max(requestedCount, minAccepted));
+  const bankExtras = pool.slice(publishSet.length);
+
+  const trustedQuestions: TrustedExamQuestion[] = publishSet.map((q) => ({
+    id: q.id,
+    question: q.question,
+    options: q.options,
+    answer: q.answer,
+    explanation: q.explanation,
+    standard: q.standard,
+    version: q.version,
+    clause: q.clause,
+    subclause: q.subclause,
+    exam_level: q.exam_level || String(management_level),
+    pillar: q.pillar,
+    difficulty: q.difficulty || "expert",
+    qualityScore: q.qualityScore,
+  }));
+
+  const metadata = {
+    industry,
+    management_level,
+    department,
+    exam_level: String(management_level),
+    role_focus: roleFocus,
+    suggestedStandards: normalizedStandards,
+    sourceDocuments: attachedFiles.map((f) => f.title),
+    difficulty: resolvedDifficulty,
+    difficulty_level: "EXPERT",
+    novelty: {
+      random_company_size: randomCompanySize,
+      random_trigger_event: randomTriggerEvent,
+      prior_hashes_considered: priorHashes.size,
+    },
+    rag_retrieval: ragHint,
+    validation: {
+      accepted: accepted.length,
+      novel: novelAccepted.length,
+      published: publishSet.length,
+      rejected: rejected.length,
+      minAccepted,
+      requested: requestedCount,
+      generated: rawQuestions.length,
+      batches: batchIndex,
+      avgQualityScore:
+        publishSet.length > 0
+          ? Math.round(
+              publishSet.reduce((s, q) => s + (q.qualityScore || 0), 0) /
+                publishSet.length,
+            )
+          : 0,
+    },
+  };
+
+  // Persist trusted answer key server-side (Phase 3.1)
+  let examSessionId: string | null = null;
+  if (trustedQuestions.length > 0) {
+    examSessionId = await persistMasteryExamSession({
+      userId: userId || null,
+      guestId: guestId || null,
+      questions: trustedQuestions,
+      metadata,
+    });
+  }
+
+  // Return questions with stable ids; clients may still see correct_answer for UX
+  // but submit scoring ignores client-supplied keys and uses MasteryExamSession.
+  const clientQuestions = trustedQuestions.map((q, idx) => {
+    const raw = publishSet[idx];
+    const optionsRecord = Object.fromEntries(
+      q.options.map((o) => [o.label, o.text]),
+    );
+    return {
+      id: q.id,
+      question: q.question,
+      options: optionsRecord,
+      correct_answer: q.answer,
+      explanation: raw?.explanation || "",
+      standard: raw?.standard || "",
+      version: raw?.version || "",
+      clause: raw?.clause || "",
+      subclause: raw?.subclause || "",
+      exam_level: raw?.exam_level || String(management_level),
+      pillar: raw?.pillar || "",
+      difficulty: raw?.difficulty || "expert",
+      qualityScore: raw?.qualityScore,
+    };
+  });
+
+  // Record novelty history + stash unused validated items for instant next exams
+  void recordQuestionHistory({
+    userId: userId || null,
+    guestId: guestId || null,
+    questions: publishSet.map((q) => q.question),
+    industry: String(industry),
+  }).catch((e) =>
+    console.warn("[MasteryQuiz] history write failed:", e?.message || e),
+  );
+  if (bankExtras.length) {
+    void stashQuestionBank({
+      userId: userId || null,
+      guestId: guestId || null,
+      industry: String(industry),
+      management_level: String(management_level),
+      department: String(department),
+      questions: bankExtras,
+    }).catch((e) =>
+      console.warn("[MasteryQuiz] bank stash failed:", e?.message || e),
+    );
+  }
+
+  return {
+    ...lastAiPayload,
+    examSessionId,
+    questions: clientQuestions,
+    metadata,
+    validation: metadata.validation,
+    served_from: "live_generate",
+  };
 };
 
 export const QuizService = {

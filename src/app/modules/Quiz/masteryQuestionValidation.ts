@@ -217,6 +217,9 @@ export const computeQuestionQualityScore = (params: {
   hasGiveaway: boolean;
   isGeneric: boolean;
   isFabricated: boolean;
+  /** Soft penalties from implementation plan length limits (stem ≤80 words, options ≤15). */
+  stemWordCount?: number;
+  maxOptionWordCount?: number;
 }): number => {
   let score = 40;
   if (params.hasStandard) score += 15;
@@ -227,8 +230,24 @@ export const computeQuestionQualityScore = (params: {
   if (params.hasGiveaway) score -= 25;
   if (params.isGeneric) score -= 40;
   if (params.isFabricated) score -= 40;
+  // Soft length guidance (do not hard-reject — yield matters)
+  if ((params.stemWordCount || 0) > 80) score -= 8;
+  else if ((params.stemWordCount || 0) > 0 && (params.stemWordCount || 0) <= 80)
+    score += 3;
+  if ((params.maxOptionWordCount || 0) > 15) score -= 6;
+  else if (
+    (params.maxOptionWordCount || 0) > 0 &&
+    (params.maxOptionWordCount || 0) <= 15
+  )
+    score += 2;
   return Math.max(0, Math.min(100, score));
 };
+
+const wordCount = (text: string) =>
+  String(text || "")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean).length;
 
 /**
  * Minimum accepted questions for a generate batch.
@@ -394,6 +413,12 @@ export const validateMasteryQuestion = (
     };
   }
 
+  const stemWordCount = wordCount(question);
+  const maxOptionWordCount = Math.max(
+    0,
+    ...options.map((o) => wordCount(o.text)),
+  );
+
   const qualityScore = computeQuestionQualityScore({
     hasStandard,
     hasClause,
@@ -402,6 +427,8 @@ export const validateMasteryQuestion = (
     hasGiveaway: giveaway,
     isGeneric,
     isFabricated: fabricated,
+    stemWordCount,
+    maxOptionWordCount,
   });
 
   if (qualityScore < 55) {

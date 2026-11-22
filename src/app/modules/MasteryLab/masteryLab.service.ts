@@ -119,8 +119,9 @@ const issueMasteryCertificateIfEligible = async (
         department: metadata.department || "",
       },
       dashboardUrl: "https://dashboard.isobrain.ai/user/certificates",
+      // Public verify page with Open Graph tags for LinkedIn share expansion
       shareUrl: certificate?.id
-        ? `https://dashboard.isobrain.ai/certificates/${certificate.id}`
+        ? `https://isobrain.ai/en/verify/${certificate.id}`
         : undefined,
     });
 
@@ -534,9 +535,11 @@ const buildResultPayload = async (result: any) => {
           dashboardUrl:
             certResult.certificate.dashboardUrl ||
             "https://dashboard.isobrain.ai/user/certificates",
-          shareUrl: certResult.certificate.id
-            ? `https://dashboard.isobrain.ai/certificates/${certResult.certificate.id}`
-            : undefined,
+          shareUrl:
+            certResult.certificate.shareUrl ||
+            (certResult.certificate.id
+              ? `https://isobrain.ai/en/verify/${certResult.certificate.id}`
+              : undefined),
         }
       : null;
   }
@@ -680,6 +683,18 @@ const submitMasteryLab = async (payload: any) => {
             answered,
             total,
           },
+          report_schema: {
+            strengths_summary:
+              "Praise for passed clauses / competencies (short).",
+            weaknesses_summary:
+              "Operational vulnerabilities based on failed clauses (short).",
+            library_upsell:
+              "Recommend standards to read; always include URL https://isobrain.ai/en/library/iso-standards",
+            academy_upsell:
+              "Recommend masterclasses; always include URL https://isobrain.ai/en/academy",
+            ai_assistant_upsell:
+              "Pitch daily guidance; always include URL https://isobrain.ai/en/ai-assistant-home",
+          },
         },
       );
       aiFeedback = aiResponse?.data || {};
@@ -687,9 +702,27 @@ const submitMasteryLab = async (payload: any) => {
       console.warn("Mastery Lab AI feedback failed:", (err as Error)?.message);
     }
 
-    // Persist metrics snapshot inside aiFeedback without schema migration
+    // Persist metrics snapshot + hardcoded upsell URLs (implementation plan)
     const aiFeedbackWithMetrics = {
       ...(aiFeedback && typeof aiFeedback === "object" ? aiFeedback : {}),
+      library_upsell: {
+        ...(typeof aiFeedback?.library_upsell === "object"
+          ? aiFeedback.library_upsell
+          : { text: aiFeedback?.library_upsell }),
+        url: "https://isobrain.ai/en/library/iso-standards",
+      },
+      academy_upsell: {
+        ...(typeof aiFeedback?.academy_upsell === "object"
+          ? aiFeedback.academy_upsell
+          : { text: aiFeedback?.academy_upsell }),
+        url: "https://isobrain.ai/en/academy",
+      },
+      ai_assistant_upsell: {
+        ...(typeof aiFeedback?.ai_assistant_upsell === "object"
+          ? aiFeedback.ai_assistant_upsell
+          : { text: aiFeedback?.ai_assistant_upsell }),
+        url: "https://isobrain.ai/en/ai-assistant-home",
+      },
       scoring_metrics: {
         progress,
         score: overallScore,
@@ -785,7 +818,11 @@ const submitMasteryLab = async (payload: any) => {
  * It is NOT driven by Gamification XP. Soft-reset hides attempts via leaderboardEligible
  * without deleting historical results.
  */
-const getLeaderboard = async () => {
+const getLeaderboard = async (opts?: {
+  filter?: "global" | "industry" | "management_level";
+  industry?: string | null;
+  managementLevel?: string | null;
+}) => {
   const all = await prisma.masteryLab.findMany({
     where: {
       NOT: {
@@ -799,12 +836,17 @@ const getLeaderboard = async () => {
           id: true,
           firstName: true,
           lastName: true,
+          isLeaderboardPublic: true,
         },
       },
     },
   });
 
-  return buildMasteryLeaderboard(all as any, 10);
+  return buildMasteryLeaderboard(all as any, 100, {
+    filter: opts?.filter || "global",
+    industry: opts?.industry,
+    managementLevel: opts?.managementLevel,
+  });
 };
 
 /**

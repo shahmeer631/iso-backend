@@ -89,7 +89,25 @@ const claimMasteryLabResult = catchAsync(async (req, res) => {
 });
 
 const getLeaderboard = catchAsync(async (req, res) => {
-  const result = await MasteryLabService.getLeaderboard();
+  const rawFilter = String(req.query?.filter || "global").toLowerCase();
+  const filter =
+    rawFilter === "industry" || rawFilter === "management_level"
+      ? (rawFilter as "industry" | "management_level")
+      : "global";
+  const industry =
+    typeof req.query?.industry === "string" ? req.query.industry : null;
+  const managementLevel =
+    typeof req.query?.management_level === "string"
+      ? req.query.management_level
+      : typeof req.query?.managementLevel === "string"
+        ? req.query.managementLevel
+        : null;
+
+  const result = await MasteryLabService.getLeaderboard({
+    filter,
+    industry,
+    managementLevel,
+  });
 
   sendResponse(res, {
     statusCode: 200,

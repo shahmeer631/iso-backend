@@ -73,4 +73,66 @@ describe("Mastery Lab leaderboard soft-reset helpers", () => {
     );
     assert.deepEqual(board, []);
   });
+
+  it("masks names when isLeaderboardPublic is false", () => {
+    const board = buildMasteryLeaderboard(
+      [
+        {
+          id: "1",
+          userId: "u1",
+          score: 88,
+          leaderboardEligible: true,
+          industry: "Construction",
+          management_level: "Senior",
+          user: {
+            id: "u1",
+            firstName: "Hidden",
+            lastName: "Name",
+            isLeaderboardPublic: false,
+          },
+        },
+      ] as any,
+      10,
+    );
+    assert.equal(board[0].name, "Anonymous User");
+    assert.equal(board[0].isAnonymous, true);
+    assert.equal(board[0].industry, "Construction");
+  });
+
+  it("filters by industry and management level", () => {
+    const rows = [
+      {
+        id: "1",
+        userId: "u1",
+        score: 95,
+        industry: "Auto",
+        management_level: "Manager",
+        leaderboardEligible: true,
+        user: { id: "u1", firstName: "A", lastName: "One" },
+      },
+      {
+        id: "2",
+        userId: "u2",
+        score: 90,
+        industry: "Pharma",
+        management_level: "Senior",
+        leaderboardEligible: true,
+        user: { id: "u2", firstName: "B", lastName: "Two" },
+      },
+    ];
+
+    const byIndustry = buildMasteryLeaderboard(rows as any, 100, {
+      filter: "industry",
+      industry: "Auto",
+    });
+    assert.equal(byIndustry.length, 1);
+    assert.equal(byIndustry[0].userId, "u1");
+
+    const byLevel = buildMasteryLeaderboard(rows as any, 100, {
+      filter: "management_level",
+      managementLevel: "Senior",
+    });
+    assert.equal(byLevel.length, 1);
+    assert.equal(byLevel[0].userId, "u2");
+  });
 });

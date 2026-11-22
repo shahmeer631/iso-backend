@@ -326,7 +326,11 @@ const getSingleCertificate = async (id: string) => {
     industry: masteryAttempt?.industry || certificate.user?.industry || "",
     managementLevel: masteryAttempt?.management_level || "",
     jobFunction: masteryAttempt?.department || "",
-    shareUrl: `https://dashboard.isobrain.ai/certificates/${certificate.id}`,
+    shareUrl: `https://isobrain.ai/en/verify/${certificate.id}`,
+    verifyUrl: `https://isobrain.ai/en/verify/${certificate.id}`,
+    imageUrl:
+      certificate.template?.backgroundImageUrl ||
+      "https://isobrain.ai/og-certificate-default.png",
   };
 };
 
