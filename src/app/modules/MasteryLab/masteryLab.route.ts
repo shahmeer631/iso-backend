@@ -27,6 +27,15 @@ router.post(
 
 router.get("/leaderboard", MasteryLabController.getLeaderboard);
 
+// Soft-reset (preserves historical MasteryLab attempts). SUPER_ADMIN only.
+// Requires body/query: confirm=RESET_MASTERY_LEADERBOARD
+router.post(
+  "/leaderboard/reset",
+  auth(UserRole.SUPER_ADMIN),
+  MasteryLabController.resetLeaderboard,
+);
+
+// Backward-compatible alias — still SUPER_ADMIN + confirmation required
 router.delete(
   "/leaderboard",
   auth(UserRole.SUPER_ADMIN),

@@ -9,6 +9,16 @@ export type TrustedExamQuestion = {
   question: string;
   options: Array<{ label: string; text: string }>;
   answer: string;
+  /** Optional clause-grounding metadata (ignored by scorer). */
+  explanation?: string;
+  standard?: string;
+  version?: string;
+  clause?: string;
+  subclause?: string;
+  exam_level?: string;
+  pillar?: string;
+  difficulty?: string;
+  qualityScore?: number;
 };
 
 export type SubmittedExamAnswer = {

@@ -791,9 +791,26 @@ model MasteryLab {
   /// Links submit scoring to the issued question set (Phase 3.1)
   examSessionId String? @db.ObjectId
 
+  /// When false, attempt remains in history but is excluded from public leaderboard.
+  /// Soft leaderboard resets set this to false instead of deleting MasteryLab rows.
+  leaderboardEligible Boolean @default(true)
+
   createdAt  DateTime  @default(now())
   category   Category? @relation(fields: [categoryId], references: [id])
   categoryId String?   @db.ObjectId
+}
+
+/// Audit trail for SUPER_ADMIN Mastery Lab leaderboard soft-resets.
+model MasteryLeaderboardResetLog {
+  id             String   @id @default(auto()) @map("_id") @db.ObjectId
+  adminUserId    String   @db.ObjectId
+  confirmPhrase  String
+  hiddenCount    Int
+  note           String?
+  createdAt      DateTime @default(now())
+
+  @@index([createdAt])
+  @@map("MasteryLeaderboardResetLogs")
 }
 
 /// Phase 3.1/3.2 — trusted Mastery Lab question set issued at generation time.

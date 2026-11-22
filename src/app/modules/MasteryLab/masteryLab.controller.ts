@@ -100,7 +100,18 @@ const getLeaderboard = catchAsync(async (req, res) => {
 });
 
 const resetLeaderboard = catchAsync(async (req, res) => {
-  const result = await MasteryLabService.resetLeaderboard();
+  const adminUserId = String((req as any).user?.id || "");
+  const confirm = String(
+    req.body?.confirm || req.query?.confirm || "",
+  ).trim();
+  const note =
+    typeof req.body?.note === "string" ? req.body.note : undefined;
+
+  const result = await MasteryLabService.resetLeaderboard({
+    adminUserId,
+    confirm,
+    note,
+  });
 
   sendResponse(res, {
     statusCode: 200,

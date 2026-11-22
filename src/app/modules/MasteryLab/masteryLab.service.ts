@@ -14,6 +14,12 @@ import {
   unconsumedWhere,
 } from "./masteryExam.claim";
 import { isPrismaUniqueConflict } from "../Activity/activity.accounting";
+import {
+  buildMasteryLeaderboard,
+  MASTERY_LEADERBOARD_RESET_CONFIRM,
+} from "./masteryLeaderboard";
+
+export { MASTERY_LEADERBOARD_RESET_CONFIRM };
 
 const MASTERY_PASS_SCORE = Number(process.env.MASTERY_PASS_SCORE ?? 70);
 const MASTERY_CERT_COURSE_TITLE = "ISO Mastery Lab – Certificate of Competency";
@@ -710,6 +716,8 @@ const submitMasteryLab = async (payload: any) => {
         department,
         timeTaken,
         suggestedStandards,
+        // New attempts are eligible after a soft leaderboard reset
+        leaderboardEligible: true,
       },
     });
 
@@ -772,6 +780,11 @@ const submitMasteryLab = async (payload: any) => {
   }
 };
 
+/**
+ * Leaderboard is derived from MasteryLab attempts (best score per authenticated user).
+ * It is NOT driven by Gamification XP. Soft-reset hides attempts via leaderboardEligible
+ * without deleting historical results.
+ */
 const getLeaderboard = async () => {
   const all = await prisma.masteryLab.findMany({
     where: {
@@ -791,31 +804,73 @@ const getLeaderboard = async () => {
     },
   });
 
-  const map = new Map();
-
-  for (const item of all) {
-    const key = item.userId;
-    if (!key) continue;
-    if (!map.has(key)) {
-      map.set(key, item);
-    }
-  }
-
-  const top = Array.from(map.values()).slice(0, 10);
-
-  return top.map((item, index) => ({
-    rank: index + 1,
-    userId: item.user?.id,
-    name: `${item.user?.firstName || ""} ${item.user?.lastName || ""}`.trim(),
-    score: Math.round(item.score),
-    industry: item.industry || "Unknown",
-    category: item.industry || item.department || "Mastery Lab",
-  }));
+  return buildMasteryLeaderboard(all as any, 10);
 };
 
-const resetLeaderboard = async () => {
-  const result = await prisma.masteryLab.deleteMany({});
-  return { deleted: result.count };
+/**
+ * Soft-reset: hide all current MasteryLab attempts from the public leaderboard.
+ * Preserves MasteryLab rows, exam sessions, certificates, XP, and user accounts.
+ */
+const resetLeaderboard = async (params: {
+  adminUserId: string;
+  confirm: string;
+  note?: string;
+}) => {
+  const confirm = String(params.confirm || "").trim();
+  if (confirm !== MASTERY_LEADERBOARD_RESET_CONFIRM) {
+    throw new ApiError(
+      httpStatus.BAD_REQUEST,
+      `Confirmation required. Send body.confirm = "${MASTERY_LEADERBOARD_RESET_CONFIRM}"`,
+    );
+  }
+
+  if (!params.adminUserId) {
+    throw new ApiError(httpStatus.UNAUTHORIZED, "Admin identity required");
+  }
+
+  const beforeRows = await prisma.masteryLab.findMany({
+    where: { NOT: { userId: null } },
+    select: { id: true, leaderboardEligible: true },
+  });
+  const beforeVisible = beforeRows.filter(
+    (r) => (r as any).leaderboardEligible !== false,
+  ).length;
+
+  // Hide every attempt from leaderboard rankings (historical rows kept)
+  const updated = await prisma.masteryLab.updateMany({
+    data: { leaderboardEligible: false },
+  });
+
+  const audit = await prisma.masteryLeaderboardResetLog.create({
+    data: {
+      adminUserId: params.adminUserId,
+      confirmPhrase: confirm,
+      hiddenCount: updated.count,
+      note: params.note?.slice(0, 500) || null,
+    },
+  });
+
+  return {
+    mode: "soft_hide" as const,
+    hiddenCount: updated.count,
+    previouslyVisibleApprox: beforeVisible,
+    deleted: 0,
+    preserved: {
+      masteryLabAttempts: true,
+      examSessions: true,
+      certificates: true,
+      userAccounts: true,
+      xpLedgers: true,
+    },
+    audit: {
+      id: audit.id,
+      adminUserId: audit.adminUserId,
+      createdAt: audit.createdAt,
+      hiddenCount: audit.hiddenCount,
+    },
+    message:
+      "Mastery Lab leaderboard soft-reset complete. Historical attempts remain available; new submissions will appear on the leaderboard.",
+  };
 };
 
 const getMasteryLabResult = async (userId: string, resultId: string) => {

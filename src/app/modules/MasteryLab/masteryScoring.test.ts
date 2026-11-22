@@ -3,6 +3,10 @@ import assert from "node:assert/strict";
 import { scoreAgainstTrustedExam } from "../Gamification/xp.integrity";
 import {
   filterValidatedMasteryQuestions,
+  hasClauseReference,
+  hasStandardReference,
+  looksLikeGenericCommonSenseStem,
+  minimumAcceptedQuestions,
   validateMasteryQuestion,
 } from "../Quiz/masteryQuestionValidation";
 import {
@@ -124,27 +128,36 @@ describe("Mastery Lab EXPERT difficulty default", () => {
   });
 });
 
+const expertClauseMcq = {
+  question:
+    "Under ISO 9001:2015 clause 8.5.1, production controls are documented and operators follow work instructions, but there is no consistent evidence that control methods remain effective after a process change. Management claims documented implementation alone satisfies the requirement. Which response best reflects the clause expectation?",
+  options: {
+    A: "Implementation of documented controls is sufficient without evaluation of effectiveness.",
+    B: "Controlled conditions include monitoring that methods remain effective, not documentation alone.",
+    C: "Only external auditors may evaluate control effectiveness after changes.",
+    D: "Documented information always proves effective operation regardless of monitoring results.",
+  },
+  correct_answer: "B",
+  explanation:
+    "Clause 8.5.1 expects controlled conditions including monitoring that control methods remain effective; records of implementation alone do not demonstrate ongoing effectiveness after change.",
+  standard: "ISO 9001:2015",
+  version: "2015",
+  clause: "8.5.1",
+  exam_level: "Senior",
+  pillar: "implementation",
+  difficulty: "expert",
+};
+
 describe("Mastery question validation", () => {
-  it("accepts a well-formed expert MCQ with 4 options and answer key", () => {
+  it("accepts a well-formed expert MCQ with clause metadata, 4 options, and explanation", () => {
     const seen = new Set<string>();
-    const result = validateMasteryQuestion(
-      {
-        question:
-          "During an integrated QMS/ISMS internal audit, operational controls are documented but there is no consistent evidence that control effectiveness is periodically evaluated. Management claims implementation alone satisfies the requirement. Which response best reflects the standards-based expectation?",
-        options: {
-          A: "Implementation of documented controls is sufficient without evaluation of effectiveness.",
-          B: "Effectiveness of controls should be monitored and evaluated using objective evidence over time.",
-          C: "Only external auditors may evaluate control effectiveness.",
-          D: "Documented information always proves effective operation regardless of monitoring results.",
-        },
-        correct_answer: "B",
-        explanation:
-          "Implementation alone does not demonstrate that controls remain effective; monitoring/evaluation evidence is required.",
-      },
-      0,
-      seen,
-    );
+    const result = validateMasteryQuestion(expertClauseMcq, 0, seen);
     assert.equal(result.ok, true);
+    if (result.ok) {
+      assert.ok(result.question.qualityScore >= 55);
+      assert.equal(result.question.clause, "8.5.1");
+      assert.equal(result.question.validationStatus, "accepted");
+    }
   });
 
   it("rejects definitional stems, wrong option counts, and missing keys", () => {
@@ -176,6 +189,73 @@ describe("Mastery question validation", () => {
     );
   });
 
+  it("rejects questions without standard references", () => {
+    const seen = new Set<string>();
+    const result = validateMasteryQuestion(
+      {
+        question:
+          "During an internal audit, operational controls are documented but effectiveness is never evaluated. Which conclusion is most defensible for the management system?",
+        options: {
+          A: "Implementation of documented controls is enough.",
+          B: "Effectiveness should be monitored with objective evidence over time.",
+          C: "Only external auditors may evaluate effectiveness.",
+          D: "Documented information always proves effective operation.",
+        },
+        correct_answer: "B",
+        explanation:
+          "Monitoring and evaluation evidence is expected; implementation records alone are insufficient.",
+      },
+      0,
+      seen,
+    );
+    assert.equal(result.ok, false);
+  });
+
+  it("accepts ISO-standard expert stems that use normative language without a numeric clause id", () => {
+    const seen = new Set<string>();
+    const result = validateMasteryQuestion(
+      {
+        question:
+          "An ISO 9001 internal audit finds that process owners retain operational control records, yet management review never receives objective evidence that controls remain effective after change. Which conclusion is most defensible?",
+        options: {
+          A: "Records of implementation alone prove effectiveness.",
+          B: "Missing evaluation evidence indicates a gap against monitoring and effectiveness expectations.",
+          C: "Management review is optional when controls exist.",
+          D: "Only certification bodies can request effectiveness evidence.",
+        },
+        correct_answer: "B",
+        explanation:
+          "ISO 9001 expects objective evidence that operational controls remain effective; implementation records alone do not satisfy monitoring and management-review expectations.",
+      },
+      0,
+      seen,
+    );
+    assert.equal(result.ok, true);
+  });
+
+  it("rejects missing or too-short explanations even when clause metadata exists", () => {
+    const seen = new Set<string>();
+    const result = validateMasteryQuestion(
+      {
+        ...expertClauseMcq,
+        explanation: "Too short.",
+      },
+      0,
+      seen,
+    );
+    assert.equal(result.ok, false);
+  });
+
+  it("rejects generic common-sense stems", () => {
+    assert.equal(
+      looksLikeGenericCommonSenseStem("Why is quality important for organizations?"),
+      true,
+    );
+    assert.equal(hasStandardReference("ISO 9001:2015 clause 9.3", ""), true);
+    assert.equal(hasClauseReference("under clause 8.5.1", "", ""), true);
+    assert.equal(hasClauseReference("no clause here", "", ""), false);
+  });
+
   it("filters invalid items from a mixed AI batch", () => {
     const { accepted, rejected } = filterValidatedMasteryQuestions(
       [
@@ -184,21 +264,31 @@ describe("Mastery question validation", () => {
           options: { A: "a", B: "b", C: "c", D: "d" },
           correct_answer: "A",
         },
+        expertClauseMcq,
         {
           question:
-            "An auditor finds that process owners retain operational control records, yet no evaluation of control effectiveness appears in management review inputs. Which conclusion is most defensible?",
+            "Why should organizations maintain documentation in a quality system?",
           options: {
-            A: "Records of implementation alone prove effectiveness.",
-            B: "Missing evaluation evidence indicates a gap against monitoring/effectiveness expectations.",
-            C: "Management review is optional when controls exist.",
-            D: "Only certification bodies can request effectiveness evidence.",
+            A: "Because it looks professional.",
+            B: "Because auditors always demand binders.",
+            C: "Because documentation is always mandatory for every activity.",
+            D: "Because leadership prefers paperwork.",
           },
-          correct_answer: "B",
+          correct_answer: "A",
+          explanation: "This is a generic common-sense style question that should be rejected by validation.",
+          standard: "ISO 9001",
+          clause: "7.5",
         },
       ],
       () => "id-1",
     );
     assert.equal(accepted.length, 1);
-    assert.ok(rejected.length >= 1);
+    assert.ok(rejected.length >= 2);
+  });
+
+  it("computes minimum accepted batch size as max(3, 30% of requested)", () => {
+    assert.equal(minimumAcceptedQuestions(10), 3);
+    assert.equal(minimumAcceptedQuestions(4), 3);
+    assert.equal(minimumAcceptedQuestions(20), 6);
   });
 });
