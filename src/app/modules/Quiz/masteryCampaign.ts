@@ -16,7 +16,7 @@ export const MASTERY_ACTIVE_CAMPAIGN_ID =
   String(process.env.MASTERY_CAMPAIGN_ID || "").trim() || "knowledge-v1-2026";
 
 /** Prompt / generation contract version stamped on sessions. */
-export const MASTERY_PROMPT_VERSION = "knowledge-exam-v1";
+export const MASTERY_PROMPT_VERSION = "knowledge-exam-v3-full-category-catalog";
 
 export const MASTERY_CAMPAIGN_STATUS = {
   previous: "closed",

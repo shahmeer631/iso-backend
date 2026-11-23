@@ -80,6 +80,7 @@ type BankQuestionPayload = {
   knowledge_category?: string;
   primary_knowledge_category?: string;
   secondary_knowledge_categories?: string[];
+  iso_standard_category?: string;
   question_type?: string;
   source_document?: string;
   difficulty?: string;
@@ -223,6 +224,7 @@ const toClientQuestion = (q: BankQuestionPayload) => {
     primary_knowledge_category:
       q.primary_knowledge_category || q.knowledge_category || "",
     secondary_knowledge_categories: q.secondary_knowledge_categories || [],
+    iso_standard_category: q.iso_standard_category || "",
     question_type: q.question_type || "knowledge",
     source_document: q.source_document || "",
     difficulty: q.difficulty || "expert",
@@ -311,6 +313,7 @@ export const tryServeFromQuestionBank = async (params: {
         primary_knowledge_category:
           q.primary_knowledge_category || q.knowledge_category,
         secondary_knowledge_categories: q.secondary_knowledge_categories || [],
+        iso_standard_category: q.iso_standard_category || "",
         question_type: q.question_type || "knowledge",
         source_document: q.source_document,
         difficulty: q.difficulty || "expert",
@@ -335,6 +338,7 @@ export const tryServeFromQuestionBank = async (params: {
       knowledge_category: q.knowledge_category,
       primary_knowledge_category: q.primary_knowledge_category,
       secondary_knowledge_categories: q.secondary_knowledge_categories,
+      iso_standard_category: q.iso_standard_category,
       question_type: q.question_type,
       source_document: q.source_document,
       difficulty: q.difficulty || "expert",

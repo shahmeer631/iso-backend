@@ -29,6 +29,7 @@ export type RawMasteryQuestion = {
   knowledge_category?: string;
   primary_knowledge_category?: string;
   secondary_knowledge_categories?: string[];
+  iso_standard_category?: string;
   question_type?: string;
   source_document?: string;
   difficulty?: string;
@@ -49,6 +50,7 @@ export type ValidatedMasteryQuestion = {
   knowledge_category: string;
   primary_knowledge_category: string;
   secondary_knowledge_categories: string[];
+  iso_standard_category: string;
   question_type: string;
   source_document: string;
   difficulty: string;
@@ -304,7 +306,7 @@ export const computeQuestionQualityScore = (params: {
   if (params.explanationLen >= 40) score += 10;
   if (params.explanationLen >= 80) score += 5;
   if (params.optionCount === 4) score += 5;
-  if (params.hasGiveaway) score -= 25;
+  if (params.hasGiveaway) score -= 12;
   if (params.isGeneric) score -= 40;
   if (params.isFabricated) score -= 40;
   if (params.isLengthyScenario) score -= 20;
@@ -403,17 +405,9 @@ export const validateMasteryQuestion = (
     };
   }
 
+  // Length disparity is a soft quality signal — do not hard-reject
+  // (hard reject was discarding otherwise clause-valid expert items and failing exams).
   const giveaway = hasLengthGiveaway(options);
-  if (giveaway) {
-    return {
-      ok: false,
-      issue: {
-        index,
-        reason: "Option length disparity suggests giveaway wording",
-        qualityScore: 25,
-      },
-    };
-  }
 
   const fabricated = looksLikeFabricatedClause(question);
   if (fabricated) {
@@ -601,6 +595,7 @@ export const validateMasteryQuestion = (
       knowledge_category: primaryCategory,
       primary_knowledge_category: primaryCategory,
       secondary_knowledge_categories: secondaryCategories,
+      iso_standard_category: String(raw?.iso_standard_category || "").trim(),
       question_type:
         String(raw?.question_type || "knowledge").trim() || "knowledge",
       source_document: String(raw?.source_document || "").trim(),
@@ -647,13 +642,31 @@ export const filterValidatedMasteryQuestions = (
 /** Max share of situational vignette stems in a published exam (client: knowledge-first). */
 export const MASTERY_MAX_SITUATIONAL_RATIO = 0.2;
 
+/** Extract ISO number from question metadata/stem for multi-standard diversity. */
+export const extractIsoNumberFromQuestion = (q: {
+  question?: string;
+  standard?: string;
+  version?: string;
+}): string | null => {
+  const blob = `${q.standard || ""} ${q.version || ""} ${q.question || ""}`;
+  const labeled = blob.match(/\biso(?:\/iec|[\s-]*iec)?[\s-]*(\d{4,5})\b/i);
+  if (labeled?.[1]) {
+    const n = Number(labeled[1]);
+    if (!(n >= 1990 && n <= 2100)) return labeled[1];
+  }
+  return null;
+};
+
 /**
  * Build a publish set that prefers direct knowledge stems, caps situational
- * vignettes, and diversifies primary knowledge categories.
+ * vignettes, diversifies knowledge categories, and spreads across distinct
+ * ISO standard numbers inside the library category families.
  */
 export const selectKnowledgePublishSet = <
   T extends {
     question: string;
+    standard?: string;
+    version?: string;
     primary_knowledge_category?: string;
     knowledge_category?: string;
     qualityScore?: number;
@@ -669,6 +682,8 @@ export const selectKnowledgePublishSet = <
     0,
     Math.floor(target * MASTERY_MAX_SITUATIONAL_RATIO),
   );
+  // Cap any single ISO number so flagship standards (9001/27001) cannot dominate
+  const maxPerIso = Math.max(2, Math.ceil(target / 4));
 
   const scored = [...pool].sort(
     (a, b) => (b.qualityScore || 0) - (a.qualityScore || 0),
@@ -681,69 +696,105 @@ export const selectKnowledgePublishSet = <
 
   const selected: T[] = [];
   const usedCategories = new Set<string>();
+  const isoCounts = new Map<string, number>();
 
   const categoryOf = (q: T) =>
     String(q.primary_knowledge_category || q.knowledge_category || "").trim();
+  const isoOf = (q: T) => extractIsoNumberFromQuestion(q) || "";
 
-  const tryPick = (candidates: T[], allowSituational: boolean) => {
+  const canTake = (q: T, allowSituational: boolean, enforceIsoCap: boolean) => {
+    if (selected.includes(q)) return false;
+    const isSit = looksLikeSituationalVignette(q.question);
+    if (isSit && !allowSituational) return false;
+    if (
+      isSit &&
+      selected.filter((s) => looksLikeSituationalVignette(s.question)).length >=
+        maxSituational
+    ) {
+      return false;
+    }
+    const iso = isoOf(q);
+    if (enforceIsoCap && iso && (isoCounts.get(iso) || 0) >= maxPerIso) {
+      return false;
+    }
+    return true;
+  };
+
+  const take = (q: T) => {
+    selected.push(q);
+    const cat = categoryOf(q);
+    if (cat) usedCategories.add(cat);
+    const iso = isoOf(q);
+    if (iso) isoCounts.set(iso, (isoCounts.get(iso) || 0) + 1);
+  };
+
+  const tryPick = (
+    candidates: T[],
+    allowSituational: boolean,
+    preferUnseenKnowledgeCat: boolean,
+    preferUnseenIso: boolean,
+  ) => {
     for (const q of candidates) {
       if (selected.length >= target) break;
-      if (selected.includes(q)) continue;
-      const isSit = looksLikeSituationalVignette(q.question);
-      if (isSit && !allowSituational) continue;
+      if (!canTake(q, allowSituational, true)) continue;
+      const cat = categoryOf(q);
       if (
-        isSit &&
-        selected.filter((s) => looksLikeSituationalVignette(s.question))
-          .length >= maxSituational
+        preferUnseenKnowledgeCat &&
+        cat &&
+        usedCategories.has(cat) &&
+        selected.length < target * 0.7
       ) {
         continue;
       }
-      const cat = categoryOf(q);
-      // Prefer unseen categories while building the set
-      if (cat && usedCategories.has(cat) && selected.length < target * 0.7) {
-        // defer duplicates until diversity is weaker
-        continue;
+      const iso = isoOf(q);
+      if (
+        preferUnseenIso &&
+        iso &&
+        (isoCounts.get(iso) || 0) > 0 &&
+        selected.length < target * 0.85
+      ) {
+        // Defer repeats of the same ISO number while other standards remain
+        const hasUnseenIso = candidates.some((c) => {
+          if (selected.includes(c)) return false;
+          if (!canTake(c, allowSituational, true)) return false;
+          const cIso = isoOf(c);
+          return Boolean(cIso && (isoCounts.get(cIso) || 0) === 0);
+        });
+        if (hasUnseenIso) continue;
       }
-      selected.push(q);
-      if (cat) usedCategories.add(cat);
+      take(q);
     }
   };
 
-  // Pass 1: unique categories from direct knowledge stems
-  tryPick(direct, false);
-  // Pass 2: fill with remaining direct stems (allow category repeats)
+  // Pass 1: unique knowledge cats + unique ISO numbers from direct stems
+  tryPick(direct, false, true, true);
+  // Pass 2: remaining direct, still prefer unseen ISO numbers
+  tryPick(direct, false, false, true);
+  // Pass 3: remaining direct (allow ISO repeats within cap)
   for (const q of direct) {
     if (selected.length >= target) break;
-    if (!selected.includes(q)) selected.push(q);
+    if (canTake(q, false, true)) take(q);
   }
-  // Pass 3: limited situational fill
-  tryPick(situational, true);
+  // Pass 4: limited situational fill (prefer unseen ISO)
+  tryPick(situational, true, false, true);
   for (const q of situational) {
     if (selected.length >= target) break;
-    if (selected.includes(q)) continue;
-    const sitCount = selected.filter((s) =>
-      looksLikeSituationalVignette(s.question),
-    ).length;
-    if (sitCount >= maxSituational) break;
-    selected.push(q);
+    if (!canTake(q, true, true)) continue;
+    take(q);
   }
 
-  // Pass 4: if still short, prefer remaining direct; then situational only to cap
+  // Pass 5: if still short, prefer remaining direct (lift ISO cap softly)
   if (selected.length < target) {
     for (const q of direct) {
       if (selected.length >= target) break;
-      if (!selected.includes(q)) selected.push(q);
+      if (canTake(q, false, false)) take(q);
     }
   }
+  // Pass 6 (last resort): lift situational soft-cap so exams can start
   if (selected.length < target) {
     for (const q of situational) {
       if (selected.length >= target) break;
-      if (selected.includes(q)) continue;
-      const sitCount = selected.filter((s) =>
-        looksLikeSituationalVignette(s.question),
-      ).length;
-      if (sitCount >= maxSituational) break;
-      selected.push(q);
+      if (!selected.includes(q)) take(q);
     }
   }
 

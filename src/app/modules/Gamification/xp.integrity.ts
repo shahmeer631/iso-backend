@@ -21,6 +21,7 @@ export type TrustedExamQuestion = {
   knowledge_category?: string;
   primary_knowledge_category?: string;
   secondary_knowledge_categories?: string[];
+  iso_standard_category?: string;
   question_type?: string;
   source_document?: string;
   difficulty?: string;
