@@ -17,6 +17,12 @@ export type TrustedExamQuestion = {
   subclause?: string;
   exam_level?: string;
   pillar?: string;
+  /** Primary knowledge category slug (client exam framework). */
+  knowledge_category?: string;
+  primary_knowledge_category?: string;
+  secondary_knowledge_categories?: string[];
+  question_type?: string;
+  source_document?: string;
   difficulty?: string;
   qualityScore?: number;
 };

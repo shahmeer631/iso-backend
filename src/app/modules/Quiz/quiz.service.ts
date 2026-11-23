@@ -8,6 +8,7 @@ import { TrustedExamQuestion } from "../Gamification/xp.integrity";
 import {
   filterValidatedMasteryQuestions,
   minimumAcceptedQuestions,
+  selectKnowledgePublishSet,
 } from "./masteryQuestionValidation";
 import {
   MASTERY_DEFAULT_DIFFICULTY,
@@ -20,28 +21,39 @@ import {
   stashQuestionBank,
   tryServeFromQuestionBank,
 } from "./masteryQuestionBank";
+import {
+  getActiveMasteryCampaign,
+  MASTERY_ACTIVE_CAMPAIGN_ID,
+} from "./masteryCampaign";
+import {
+  buildKnowledgeCategoryPromptBlock,
+  inferKnowledgeCategoryFromContent,
+  MASTERY_KNOWLEDGE_CATEGORIES,
+  normalizeKnowledgeCategory,
+} from "./masteryKnowledgeCategories";
 
 export { MASTERY_DEFAULT_DIFFICULTY, normalizeQuizDifficulty };
+export { getActiveMasteryCampaign, MASTERY_ACTIVE_CAMPAIGN_ID };
 
 /**
  * Entry / Senior / Manager are professional roles — NOT difficulty tiers.
- * All levels remain EXTREMELY DIFFICULT / EXPERT.
+ * All levels remain EXTREMELY DIFFICULT / EXPERT knowledge examinations.
  */
 const ROLE_FOCUS_BY_LEVEL: Record<string, string> = {
   Entry: [
-    "ROLE FOCUS — ENTRY (expert difficulty): Test detailed understanding of specific ISO clauses and subclauses,",
-    "normative terminology, documented-information expectations, and correct interpretation of what a shall-requirement actually requires.",
-    "Prefer close distinctions between related clauses and mandatory vs guidance language.",
+    "ROLE FOCUS — ENTRY (EXPERT knowledge exam): Precise clause knowledge, terminology, definitions,",
+    "requirements, distinctions between related clauses, and standard structure.",
+    "Do NOT make Entry easy — require exact knowledge of what the cited clause states and implies.",
   ].join(" "),
   Senior: [
-    "ROLE FOCUS — SENIOR (expert difficulty): Test practical implementation, interactions between clauses,",
-    "process control, objective evidence evaluation, nonconformity judgment, risk-based thinking, and corrective-action / root-cause decisions",
-    "that a senior practitioner would make day-to-day.",
+    "ROLE FOCUS — SENIOR (EXPERT knowledge exam): Detailed interpretation, implementation methods,",
+    "procedural knowledge, evidence expectations, clause relationships, and evaluation of conformity.",
+    "Test how requirements are applied and verified — still clause-grounded, never generic best practice.",
   ].join(" "),
   Manager: [
-    "ROLE FOCUS — MANAGER (expert difficulty): Test strategic implementation, leadership accountability, governance,",
-    "management review inputs/outputs, organizational risks/opportunities, performance evaluation, audit findings escalation,",
-    "and system-wide compliance decisions — still grounded in specific clauses, never generic leadership platitudes.",
+    "ROLE FOCUS — MANAGER (EXPERT knowledge exam): Strategic understanding, governance, management-system",
+    "integration, accountability, structural relationships between clauses, and advanced interpretation.",
+    "Still require specific ISO knowledge — never soft leadership platitudes or common-sense management advice.",
   ].join(" "),
 };
 
@@ -61,50 +73,25 @@ const resolveRoleFocus = (managementLevel: string): string => {
   return ROLE_FOCUS_BY_LEVEL.Senior;
 };
 
-const COMPANY_SIZES = [
-  "12-person startup",
-  "85-employee SME",
-  "400-person mid-market firm",
-  "2,500-employee enterprise",
-  "multi-site global corporation",
-  "family-owned manufacturer",
-  "regulated public-sector agency",
-];
-
-const TRIGGER_EVENTS = [
-  "failed third-party audit finding",
-  "serious near-miss incident",
-  "customer complaint escalation",
-  "regulatory inspection notice",
-  "merger integration deadline",
-  "supplier nonconformity cascade",
-  "management review with declining KPIs",
-  "certification surveillance visit in 10 days",
-  "whistleblower report on control gaps",
-  "new contract requiring dual-standard evidence",
-];
-
-const pickNovelty = <T,>(items: T[]): T =>
-  items[Math.floor(Math.random() * items.length)];
-
 const EXPERT_DIFFICULTY_INSTRUCTIONS = [
-  "Generate EXTREMELY DIFFICULT, EXPERT-LEVEL scenario-based ISO competency questions at certification / professional-practice depth.",
-  "Ban obvious definitions, benefits, acronym expansions, textbook recall, and common-sense items answerable without knowing the cited ISO requirement.",
-  "CLAUSE SPECIFICITY (mandatory for EVERY question): Identify the relevant ISO standard and edition/version from the attached sources; test a specific clause or subclause; require interpretation and application of what that clause actually requires.",
-  "DUAL-CLAUSE SYNTHESIS (mandatory for most items): Prefer scenarios that force the learner to reconcile TWO interacting clauses (primary + secondary standard/clause) — e.g. operational control interacting with competence, documented information interacting with performance evaluation, leadership interacting with risk.",
-  "Include difficult distinctions between closely related clauses; mandatory requirements vs documented information vs guidance/recommended practice; objective audit evidence; and whether an action satisfies a requirement without adding obligations the standard does not impose.",
-  "Each question object MUST include structured fields when possible: standard, version, clause, subclause, exam_level, pillar, difficulty, explanation — plus the stem, four options, and correct_answer.",
-  "The question stem itself SHOULD name the standard and the clause/subclause under test (paraphrase requirements; do NOT paste substantial copyrighted standard text).",
-  "RACI PROFILE GROUNDING (mandatory): Every question MUST be framed for the learner's RACI-style competency profile built from the three context inputs — Industry, Management level (accountability / decision authority), and Department / job function (day-to-day responsibility). Frame the crisis from the Accountable vs Responsible perspective for that role. Scenario actors, decisions, and evidence MUST match that role profile.",
-  "CRITICAL COMPETENCY MIX (mandatory): Across the full quiz, cover FOUR pillars — (1) REQUIREMENTS / interpretation of shall-requirements, (2) IMPLEMENTATION / embedding controls in processes and documented information, (3) AUDITING / evidence evaluation and nonconformity judgment, and (4) DAILY USE / operational application of the relevant standards in routine work for that industry + department.",
-  "Target balance for a 10-question set: roughly 2–3 requirements, 2–3 implementation, 2–3 auditing, and 2–3 daily-use. For 30-question exams, keep approximately equal coverage across all four pillars. Do NOT make every question about auditing alone.",
-  "Every item must require multi-clause reasoning, trade-offs, incomplete-evidence judgment, monitoring vs implementation distinctions, nonconformity classification, corrective-action / root-cause thinking, management-system integration, OR realistic day-to-day application — applied to the assigned pillar AND the RACI profile.",
-  "Provide exactly FOUR single-select options (A–D). Exactly one option is defensibly correct under the stated conditions.",
-  "ADVERSARIAL DISTRACTORS (mandatory): Incorrect options must sound like plausible corporate best practices. Base at least ONE distractor on an incorrect, outdated, or closely-related-but-wrong clause interpretation. Do NOT use absolute trigger words (\"always\", \"never\", \"all\", \"none\") that make options obviously wrong. Correct answers must hinge on subtle clause requirements — not buzzwords.",
-  "LENGTH LIMITS (hard): Scenario/stem text MUST NOT exceed 60–80 words. Each option text MUST NOT exceed 15 words. Prefer concise operational language.",
-  "Keep option length, grammar, specificity, and technical detail reasonably consistent; do not make the correct answer linguistically obvious or unusually detailed.",
-  "Ground every requirement claim in the attached source material. Do not invent clause numbers or treat guidance notes as normative shall-requirements.",
-  "If the sources cannot support an expert clause-specific question, omit that item rather than fabricating content.",
+  "Generate EXTREMELY DIFFICULT, EXPERT-LEVEL ISO KNOWLEDGE examination questions grounded in the attached authorized ISO source documents.",
+  "DEFAULT FORMAT (mandatory for ≥80% of items): direct knowledge probes — NOT workplace vignettes. Preferred stem form: \"Under ISO <number>:<year> clause <x.y[.z], …\" or \"According to ISO … clause …\".",
+  "Situational mini-cases (\"A university…\", \"An organization…\") are LIMITED to at most ~20% of the set, only for situational/conditional/experiential categories, and MUST still name the standard + clause in the stem.",
+  "DO NOT open with long crisis stories. Ban stems answerable by common sense, generic management knowledge, or elimination of obviously wrong options.",
+  "Ban obvious definitions-for-beginners, benefits lists, acronym expansions, and textbook recall that does not require clause-level knowledge.",
+  "CLAUSE SPECIFICITY (HARD mandatory): Every question MUST include structured fields standard, version, clause (and subclause when applicable). Inventing clause numbers is forbidden.",
+  "KNOWLEDGE CATEGORY (HARD mandatory): Every question MUST set primary_knowledge_category to exactly one slug from the 14-category framework. Diversify across the exam — do not reuse only 1–2 categories.",
+  "Prefer: precise knowledge; clause interpretation; relationships between requirements; mandatory vs guidance; structure/intent; documented information; procedural application; distinctions between similar requirements.",
+  "Each question object MUST include: question, options (A–D), correct_answer, explanation, standard, version, clause, subclause (when applicable), exam_level, difficulty, question_type, primary_knowledge_category, secondary_knowledge_categories (optional), source_document.",
+  "Paraphrase requirements; do NOT paste substantial copyrighted standard text.",
+  "RACI PROFILE (context only): Industry, Management level, and Department select which standards and role lens apply — NOT an excuse to invent crisis storylines.",
+  buildKnowledgeCategoryPromptBlock(),
+  `Across the exam, diversify primary_knowledge_category across these slugs: ${MASTERY_KNOWLEDGE_CATEGORIES.join(", ")}.`,
+  "Provide exactly FOUR single-select options (A–D). Exactly one option is defensibly correct under the cited requirement.",
+  "ANTI-GUESSABILITY (mandatory): All four options must be technically plausible and relevant to the same standard/clause/concept. Use subtle technical differences (related clauses, responsibilities, mandatory vs recommended, documented-information nuances, monitoring vs measurement vs evaluation vs review, correction vs corrective action).",
+  "Do NOT use absolute trigger words that make options obviously wrong. Do NOT make the correct answer noticeably longer or more detailed. Do NOT invent false technical requirements solely to craft distractors.",
+  "LENGTH LIMITS: Stem preferably ≤80 words (concise knowledge probes). Each option preferably ≤20 words. Keep option length/specificity consistent.",
+  "Ground every requirement claim in the attached source material. If sources cannot support an expert knowledge question, omit that item rather than fabricating content.",
 ].join(" ");
 
 /** Hardcoded post-exam upsell destinations from Mastery Lab implementation plan. */
@@ -280,7 +267,8 @@ const persistMasteryExamSession = async (params: {
 const AI_MAX_QUESTIONS = 30;
 const AI_SAFE_BATCH_SIZE = 15;
 const AI_MAX_ATTACHED_FILES = 2;
-const AI_MAX_FILE_BYTES = 1.5 * 1024 * 1024;
+/** Allow large normative PDFs (e.g. ISO 15189 ~5MB); still skip huge outliers. */
+const AI_MAX_FILE_BYTES = 6 * 1024 * 1024;
 
 type AttachedQuizFile = {
   title: string;
@@ -391,6 +379,7 @@ const generateQuiz = async (payload: any) => {
     accountable_level: String(management_level),
     responsible_function: String(department),
     operating_context: String(industry),
+    knowledge_categories: [...MASTERY_KNOWLEDGE_CATEGORIES],
     competency_pillars: [
       "requirements",
       "implementation",
@@ -398,6 +387,8 @@ const generateQuiz = async (payload: any) => {
       "daily_use",
     ],
   };
+
+  const campaign = getActiveMasteryCampaign();
 
   // 🔥 STEP 1: AI suggestion api
   const suggestionRes = await axios.post(
@@ -408,7 +399,7 @@ const generateQuiz = async (payload: any) => {
       department,
       raci_profile: raciProfile,
       context_instruction:
-        "Suggest the most relevant ISO standards for this industry, management level, and department/job function so Mastery Lab can assess competency across requirements, implementation, auditing, and daily operational use.",
+        "Suggest the most relevant ISO standards for this industry, management level, and department/job function so Mastery Lab can run a knowledge-based examination of actual ISO requirements, clauses, terminology, and implementation principles.",
     },
     { timeout: 1000 * 60 * 2 },
   );
@@ -603,19 +594,17 @@ const generateQuiz = async (payload: any) => {
 
   const roleFocus = resolveRoleFocus(String(management_level));
   const requestedCount = Math.min(Number(num_questions) || 5, 30);
-  const randomCompanySize = pickNovelty(COMPANY_SIZES);
-  const randomTriggerEvent = pickNovelty(TRIGGER_EVENTS);
 
-  // Prefer primary + secondary source PDFs for dual-clause synthesis (≈40/60 weighting cue)
+  // Prefer primary + secondary source PDFs for clause relationships / structural knowledge
   const primarySources = selectedFiles.slice(0, 1);
   const secondarySources = selectedFiles.slice(1);
   const ragHint = {
-    primary_weight: 0.4,
-    secondary_weight: 0.6,
+    primary_weight: 0.5,
+    secondary_weight: 0.5,
     primary_standards: primarySources.map((f) => f.title),
     secondary_standards: secondarySources.map((f) => f.title),
     instruction:
-      "Retrieve and synthesize TWO interacting clauses (primary + secondary) for most questions.",
+      "Ground every question in the attached ISO source text. Prefer clause-specific knowledge probes; use secondary sources for structural/relationship items when relevant. Do not invent lengthy workplace crisis scenarios.",
   };
 
   // Novelty: skip stems already shown to this user/guest
@@ -624,7 +613,7 @@ const generateQuiz = async (payload: any) => {
     guestId: guestId || null,
   });
 
-  // Instant-serve path: drain pre-generated bank when enough unused items exist
+  // Instant-serve path: only active-campaign bank items (legacy scenario bank blocked)
   const bankServed = await tryServeFromQuestionBank({
     userId: userId || null,
     guestId: guestId || null,
@@ -633,6 +622,8 @@ const generateQuiz = async (payload: any) => {
     department: String(department),
     count: requestedCount,
     priorHashes,
+    campaignId: campaign.campaignId,
+    promptVersion: campaign.promptVersion,
   });
   if (bankServed) {
     return bankServed;
@@ -641,29 +632,29 @@ const generateQuiz = async (payload: any) => {
   // EXPERT intent is always explicit — even when AI API difficulty enum is "professional"
   const contextPayload: Record<string, unknown> = {
     ...parsedContext,
+    campaign_id: campaign.campaignId,
+    prompt_version: campaign.promptVersion,
+    exam_mode: "knowledge_based",
     raci_profile: raciProfile,
     exam_level: String(management_level),
     role_focus: roleFocus,
     suggestedStandards: normalizedStandards,
+    knowledge_categories: [...MASTERY_KNOWLEDGE_CATEGORIES],
     source_documents: selectedFiles.map((f) => ({
       title: f.title,
       version: f.version || null,
     })),
     rag_retrieval: ragHint,
-    // Infinite novelty injection (implementation plan)
-    random_company_size: randomCompanySize,
-    random_trigger_event: randomTriggerEvent,
-    novelty_instruction: `Set every scenario in a ${randomCompanySize} operating in ${industry}. Trigger crisis: ${randomTriggerEvent}. Do not reuse generic textbook vignettes.`,
     avoid_question_hashes: Array.from(priorHashes).slice(0, 40),
     difficulty_level: "EXPERT",
-    difficulty_intent: "extremely difficult",
+    difficulty_intent: "extremely difficult knowledge examination",
     difficulty_instructions: [
       EXPERT_DIFFICULTY_INSTRUCTIONS,
       roleFocus,
-      `NOVELTY: company_size=${randomCompanySize}; trigger_event=${randomTriggerEvent}; industry=${industry}.`,
+      `Industry context for standard selection: ${industry}. Exam mode: knowledge-based (not scenario-campaign).`,
     ].join(" "),
     purpose:
-      "ISO Mastery Lab competency assessment grounded in the learner RACI profile (industry × management level × department) covering requirements, implementation, auditing, and daily use of the relevant standards — with mandatory clause-specific items for every question.",
+      "ISO Mastery Lab knowledge examination: assess deep, explicit and applied knowledge of actual ISO standards across the client's 14 knowledge categories — clause-grounded, anti-guessable, EXPERT difficulty for Entry/Senior/Manager roles.",
     timestamp: Date.now(),
   };
 
@@ -822,12 +813,34 @@ const generateQuiz = async (payload: any) => {
     }
   }
 
-  // Stamp exam_level + backfill standard codes from stem when AI omits "ISO …"
-  const stamped = rawQuestions.map((q: any) => {
+    // Stamp exam_level, knowledge categories, and backfill standard codes
+  const stamped = rawQuestions.map((q: any, idx: number) => {
+    let primary =
+      normalizeKnowledgeCategory(
+        q?.primary_knowledge_category || q?.knowledge_category || q?.pillar,
+      ) || "";
+    if (!primary) {
+      primary = inferKnowledgeCategoryFromContent(
+        q?.question,
+        q?.explanation,
+        idx,
+      );
+    }
+    const secondaryRaw = Array.isArray(q?.secondary_knowledge_categories)
+      ? q.secondary_knowledge_categories
+      : [];
+    const secondary = secondaryRaw
+      .map((c: string) => normalizeKnowledgeCategory(c))
+      .filter(Boolean);
     const base = {
       ...q,
       exam_level: q?.exam_level || String(management_level),
       difficulty: q?.difficulty || "expert",
+      primary_knowledge_category: primary,
+      knowledge_category: primary,
+      secondary_knowledge_categories: secondary,
+      pillar: primary || String(q?.pillar || "").trim(),
+      question_type: String(q?.question_type || "knowledge").trim() || "knowledge",
     };
     const blob = `${base.question || ""}\n${base.explanation || ""}`;
     if (!String(base.standard || "").trim()) {
@@ -868,9 +881,17 @@ const generateQuiz = async (payload: any) => {
     );
   }
 
-  // Prefer returning the requested count when we over-generated
-  const publishSet = pool.slice(0, Math.max(requestedCount, minAccepted));
-  const bankExtras = pool.slice(publishSet.length);
+  // Knowledge-first publish set: cap situational vignettes + diversify categories
+  const publishTarget = Math.max(requestedCount, minAccepted);
+  const publishSet = selectKnowledgePublishSet(pool, publishTarget);
+  if (publishSet.length < minAccepted) {
+    throw new ApiError(
+      httpStatus.BAD_REQUEST,
+      `Quiz generation produced only ${publishSet.length} publishable knowledge questions after clause/category filters (minimum ${minAccepted} of ${requestedCount} requested). Please retry.`,
+    );
+  }
+  const publishIds = new Set(publishSet.map((q) => q.id));
+  const bankExtras = pool.filter((q) => !publishIds.has(q.id));
 
   const trustedQuestions: TrustedExamQuestion[] = publishSet.map((q) => ({
     id: q.id,
@@ -884,6 +905,11 @@ const generateQuiz = async (payload: any) => {
     subclause: q.subclause,
     exam_level: q.exam_level || String(management_level),
     pillar: q.pillar,
+    knowledge_category: q.knowledge_category || q.primary_knowledge_category,
+    primary_knowledge_category: q.primary_knowledge_category,
+    secondary_knowledge_categories: q.secondary_knowledge_categories,
+    question_type: q.question_type,
+    source_document: q.source_document,
     difficulty: q.difficulty || "expert",
     qualityScore: q.qualityScore,
   }));
@@ -894,15 +920,15 @@ const generateQuiz = async (payload: any) => {
     department,
     exam_level: String(management_level),
     role_focus: roleFocus,
+    campaignId: campaign.campaignId,
+    promptVersion: campaign.promptVersion,
+    examMode: "knowledge_based",
     suggestedStandards: normalizedStandards,
     sourceDocuments: attachedFiles.map((f) => f.title),
     difficulty: resolvedDifficulty,
     difficulty_level: "EXPERT",
-    novelty: {
-      random_company_size: randomCompanySize,
-      random_trigger_event: randomTriggerEvent,
-      prior_hashes_considered: priorHashes.size,
-    },
+    knowledge_categories_framework: [...MASTERY_KNOWLEDGE_CATEGORIES],
+    prior_hashes_considered: priorHashes.size,
     rag_retrieval: ragHint,
     validation: {
       accepted: accepted.length,
@@ -953,12 +979,19 @@ const generateQuiz = async (payload: any) => {
       subclause: raw?.subclause || "",
       exam_level: raw?.exam_level || String(management_level),
       pillar: raw?.pillar || "",
+      knowledge_category:
+        raw?.knowledge_category || raw?.primary_knowledge_category || "",
+      primary_knowledge_category: raw?.primary_knowledge_category || "",
+      secondary_knowledge_categories: raw?.secondary_knowledge_categories || [],
+      question_type: raw?.question_type || "knowledge",
+      source_document: raw?.source_document || "",
       difficulty: raw?.difficulty || "expert",
       qualityScore: raw?.qualityScore,
+      campaign_id: campaign.campaignId,
     };
   });
 
-  // Record novelty history + stash unused validated items for instant next exams
+  // Record history + stash unused validated items for active campaign only
   void recordQuestionHistory({
     userId: userId || null,
     guestId: guestId || null,
@@ -974,6 +1007,8 @@ const generateQuiz = async (payload: any) => {
       industry: String(industry),
       management_level: String(management_level),
       department: String(department),
+      campaignId: campaign.campaignId,
+      promptVersion: campaign.promptVersion,
       questions: bankExtras,
     }).catch((e) =>
       console.warn("[MasteryQuiz] bank stash failed:", e?.message || e),

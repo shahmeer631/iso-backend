@@ -798,18 +798,26 @@ model MasteryLab {
   /// Soft leaderboard resets set this to false instead of deleting MasteryLab rows.
   leaderboardEligible Boolean @default(true)
 
+  /// Examination campaign id (e.g. knowledge-v1-2026). Historical rows may be null/legacy.
+  campaignId String?
+
   createdAt  DateTime  @default(now())
   category   Category? @relation(fields: [categoryId], references: [id])
   categoryId String?   @db.ObjectId
+
+  @@index([campaignId, leaderboardEligible])
 }
 
-/// Audit trail for SUPER_ADMIN Mastery Lab leaderboard soft-resets.
+/// Audit trail for SUPER_ADMIN Mastery Lab leaderboard soft-resets / campaign transitions.
 model MasteryLeaderboardResetLog {
   id             String   @id @default(auto()) @map("_id") @db.ObjectId
   adminUserId    String   @db.ObjectId
   confirmPhrase  String
   hiddenCount    Int
   note           String?
+  campaignId     String?
+  bankInvalidated Int?
+  sessionsExpired Int?
   createdAt      DateTime @default(now())
 
   @@index([createdAt])
@@ -839,6 +847,8 @@ model MasteryQuestionBank {
   industry         String
   managementLevel  String
   department       String
+  /// Active campaign stamp; legacy rows without this are not served.
+  campaignId       String?
   questionHash     String
   questionPayload  Json
   createdAt        DateTime  @default(now())
@@ -846,6 +856,7 @@ model MasteryQuestionBank {
 
   @@index([userId, industry, managementLevel, department, consumedAt])
   @@index([guestId, industry, managementLevel, department, consumedAt])
+  @@index([campaignId, consumedAt])
   @@index([questionHash])
   @@map("MasteryQuestionBanks")
 }

@@ -1,6 +1,10 @@
 import { createHash, randomUUID } from "crypto";
 import prisma from "../../../shared/prisma";
 import { TrustedExamQuestion } from "../Gamification/xp.integrity";
+import {
+  MASTERY_ACTIVE_CAMPAIGN_ID,
+  MASTERY_PROMPT_VERSION,
+} from "./masteryCampaign";
 
 export const hashQuestionStem = (stem: string): string =>
   createHash("sha256")
@@ -25,7 +29,6 @@ export const loadPriorQuestionHashes = async (params: {
     });
     return new Set(rows.map((r: { questionHash: string }) => r.questionHash));
   } catch (err: any) {
-    // Model may not be migrated yet — fail soft
     console.warn(
       "[MasteryQuestionBank] history load skipped:",
       err?.message || err,
@@ -53,7 +56,6 @@ export const recordQuestionHistory = async (params: {
   if (!rows.length) return;
 
   try {
-    // createMany may not de-dupe on Mongo; ignore unique races
     await (prisma as any).masteryQuestionHistory.createMany({ data: rows });
   } catch (err: any) {
     console.warn(
@@ -75,8 +77,15 @@ type BankQuestionPayload = {
   subclause?: string;
   exam_level?: string;
   pillar?: string;
+  knowledge_category?: string;
+  primary_knowledge_category?: string;
+  secondary_knowledge_categories?: string[];
+  question_type?: string;
+  source_document?: string;
   difficulty?: string;
   qualityScore?: number;
+  campaignId?: string;
+  promptVersion?: string;
 };
 
 export const stashQuestionBank = async (params: {
@@ -85,10 +94,15 @@ export const stashQuestionBank = async (params: {
   industry: string;
   management_level: string;
   department: string;
+  campaignId?: string;
+  promptVersion?: string;
   questions: BankQuestionPayload[];
 }) => {
   if (!params.userId && !params.guestId) return;
   if (!params.questions.length) return;
+
+  const campaignId = params.campaignId || MASTERY_ACTIVE_CAMPAIGN_ID;
+  const promptVersion = params.promptVersion || MASTERY_PROMPT_VERSION;
 
   try {
     await (prisma as any).masteryQuestionBank.createMany({
@@ -98,15 +112,93 @@ export const stashQuestionBank = async (params: {
         industry: params.industry,
         managementLevel: params.management_level,
         department: params.department,
+        campaignId,
         questionHash: hashQuestionStem(q.question),
-        questionPayload: q,
+        questionPayload: {
+          ...q,
+          campaignId,
+          promptVersion,
+        },
       })),
     });
   } catch (err: any) {
+    // Fallback if campaignId column not migrated yet — stash without field
+    try {
+      await (prisma as any).masteryQuestionBank.createMany({
+        data: params.questions.map((q) => ({
+          userId: params.userId || null,
+          guestId: params.guestId || null,
+          industry: params.industry,
+          managementLevel: params.management_level,
+          department: params.department,
+          questionHash: hashQuestionStem(q.question),
+          questionPayload: {
+            ...q,
+            campaignId,
+            promptVersion,
+          },
+        })),
+      });
+    } catch (err2: any) {
+      console.warn(
+        "[MasteryQuestionBank] bank stash failed:",
+        err2?.message || err2,
+      );
+    }
+  }
+};
+
+/** Soft-invalidate all unused bank items (legacy + current). */
+export const invalidateAllUnusedQuestionBank = async (): Promise<number> => {
+  try {
+    const result = await (prisma as any).masteryQuestionBank.updateMany({
+      where: { consumedAt: null },
+      data: { consumedAt: new Date() },
+    });
+    return result?.count || 0;
+  } catch (err: any) {
     console.warn(
-      "[MasteryQuestionBank] bank stash failed:",
+      "[MasteryQuestionBank] invalidate bank failed:",
       err?.message || err,
     );
+    return 0;
+  }
+};
+
+/**
+ * Expire unconsumed exam sessions that are not stamped with the active campaign
+ * so old scenario sessions cannot be mixed into the knowledge campaign.
+ */
+export const expireLegacyUnconsumedExamSessions = async (
+  activeCampaignId: string,
+): Promise<number> => {
+  try {
+    const open = await prisma.masteryExamSession.findMany({
+      where: { consumedAt: null },
+      select: { id: true, metadata: true },
+      take: 2000,
+    });
+    const legacyIds = open
+      .filter((s) => {
+        const meta = (s.metadata || {}) as Record<string, unknown>;
+        const cid = String(meta.campaignId || meta.campaign_id || "").trim();
+        return cid !== activeCampaignId;
+      })
+      .map((s) => s.id);
+
+    if (!legacyIds.length) return 0;
+
+    const result = await prisma.masteryExamSession.updateMany({
+      where: { id: { in: legacyIds }, consumedAt: null },
+      data: { consumedAt: new Date() },
+    });
+    return result.count;
+  } catch (err: any) {
+    console.warn(
+      "[MasteryQuestionBank] expire legacy sessions failed:",
+      err?.message || err,
+    );
+    return 0;
   }
 };
 
@@ -126,14 +218,22 @@ const toClientQuestion = (q: BankQuestionPayload) => {
     subclause: q.subclause || "",
     exam_level: q.exam_level || "",
     pillar: q.pillar || "",
+    knowledge_category:
+      q.knowledge_category || q.primary_knowledge_category || "",
+    primary_knowledge_category:
+      q.primary_knowledge_category || q.knowledge_category || "",
+    secondary_knowledge_categories: q.secondary_knowledge_categories || [],
+    question_type: q.question_type || "knowledge",
+    source_document: q.source_document || "",
     difficulty: q.difficulty || "expert",
     qualityScore: q.qualityScore,
+    campaign_id: q.campaignId || MASTERY_ACTIVE_CAMPAIGN_ID,
   };
 };
 
 /**
  * Drain unused bank items for this RACI profile when enough exist.
- * Returns a generateQuiz-compatible payload or null to fall through to live AI.
+ * Only serves items stamped with the active campaign (blocks legacy scenario bank).
  */
 export const tryServeFromQuestionBank = async (params: {
   userId?: string | null;
@@ -143,6 +243,8 @@ export const tryServeFromQuestionBank = async (params: {
   department: string;
   count: number;
   priorHashes: Set<string>;
+  campaignId?: string;
+  promptVersion?: string;
 }): Promise<null | {
   examSessionId: string | null;
   questions: ReturnType<typeof toClientQuestion>[];
@@ -151,6 +253,9 @@ export const tryServeFromQuestionBank = async (params: {
   served_from: "question_bank";
 }> => {
   if (!params.userId && !params.guestId) return null;
+
+  const campaignId = params.campaignId || MASTERY_ACTIVE_CAMPAIGN_ID;
+  const promptVersion = params.promptVersion || MASTERY_PROMPT_VERSION;
 
   const ownerOr: Array<{ userId?: string; guestId?: string }> = [];
   if (params.userId) ownerOr.push({ userId: params.userId });
@@ -169,9 +274,14 @@ export const tryServeFromQuestionBank = async (params: {
       take: Math.max(params.count * 2, 40),
     });
 
-    const fresh = candidates.filter(
-      (row: any) => !params.priorHashes.has(row.questionHash),
-    );
+    const fresh = candidates.filter((row: any) => {
+      if (params.priorHashes.has(row.questionHash)) return false;
+      const payload = row.questionPayload || {};
+      const rowCampaign =
+        String(row.campaignId || payload.campaignId || payload.campaign_id || "").trim();
+      // Require active campaign stamp — unstamped legacy rows are blocked
+      return rowCampaign === campaignId;
+    });
     if (fresh.length < Math.min(params.count, 10)) {
       return null;
     }
@@ -197,8 +307,16 @@ export const tryServeFromQuestionBank = async (params: {
         subclause: q.subclause,
         exam_level: q.exam_level || params.management_level,
         pillar: q.pillar,
+        knowledge_category: q.knowledge_category || q.primary_knowledge_category,
+        primary_knowledge_category:
+          q.primary_knowledge_category || q.knowledge_category,
+        secondary_knowledge_categories: q.secondary_knowledge_categories || [],
+        question_type: q.question_type || "knowledge",
+        source_document: q.source_document,
         difficulty: q.difficulty || "expert",
         qualityScore: q.qualityScore,
+        campaignId,
+        promptVersion,
       };
     });
 
@@ -214,6 +332,11 @@ export const tryServeFromQuestionBank = async (params: {
       subclause: q.subclause,
       exam_level: q.exam_level || params.management_level,
       pillar: q.pillar,
+      knowledge_category: q.knowledge_category,
+      primary_knowledge_category: q.primary_knowledge_category,
+      secondary_knowledge_categories: q.secondary_knowledge_categories,
+      question_type: q.question_type,
+      source_document: q.source_document,
       difficulty: q.difficulty || "expert",
       qualityScore: q.qualityScore,
     }));
@@ -227,6 +350,9 @@ export const tryServeFromQuestionBank = async (params: {
           industry: params.industry,
           management_level: params.management_level,
           department: params.department,
+          campaignId,
+          promptVersion,
+          examMode: "knowledge_based",
           served_from: "question_bank",
         } as object,
       },
@@ -255,6 +381,9 @@ export const tryServeFromQuestionBank = async (params: {
         industry: params.industry,
         management_level: params.management_level,
         department: params.department,
+        campaignId,
+        promptVersion,
+        examMode: "knowledge_based",
         served_from: "question_bank",
         validation,
       },

@@ -18,8 +18,21 @@ import {
   buildMasteryLeaderboard,
   MASTERY_LEADERBOARD_RESET_CONFIRM,
 } from "./masteryLeaderboard";
+import {
+  getActiveMasteryCampaign,
+  MASTERY_ACTIVE_CAMPAIGN_ID,
+  MASTERY_CAMPAIGN_TRANSITION_CONFIRM,
+} from "../Quiz/masteryCampaign";
+import {
+  expireLegacyUnconsumedExamSessions,
+  invalidateAllUnusedQuestionBank,
+} from "../Quiz/masteryQuestionBank";
 
-export { MASTERY_LEADERBOARD_RESET_CONFIRM };
+export {
+  MASTERY_LEADERBOARD_RESET_CONFIRM,
+  MASTERY_CAMPAIGN_TRANSITION_CONFIRM,
+  getActiveMasteryCampaign,
+};
 
 const MASTERY_PASS_SCORE = Number(process.env.MASTERY_PASS_SCORE ?? 70);
 const MASTERY_CERT_COURSE_TITLE = "ISO Mastery Lab – Certificate of Competency";
@@ -751,6 +764,7 @@ const submitMasteryLab = async (payload: any) => {
         suggestedStandards,
         // New attempts are eligible after a soft leaderboard reset
         leaderboardEligible: true,
+        campaignId: MASTERY_ACTIVE_CAMPAIGN_ID,
       },
     });
 
@@ -850,8 +864,14 @@ const getLeaderboard = async (opts?: {
 };
 
 /**
- * Soft-reset: hide all current MasteryLab attempts from the public leaderboard.
- * Preserves MasteryLab rows, exam sessions, certificates, XP, and user accounts.
+ * Soft-reset leaderboard (+ optional full campaign transition).
+ *
+ * Accepts either:
+ * - RESET_MASTERY_LEADERBOARD — hide ranks only
+ * - CLOSE_PREVIOUS_START_KNOWLEDGE_V1 — hide ranks + invalidate legacy question bank
+ *   + expire unconsumed non-active-campaign exam sessions
+ *
+ * Does NOT delete MasteryLab rows, certificates, users, or global XP ledgers.
  */
 const resetLeaderboard = async (params: {
   adminUserId: string;
@@ -859,16 +879,24 @@ const resetLeaderboard = async (params: {
   note?: string;
 }) => {
   const confirm = String(params.confirm || "").trim();
-  if (confirm !== MASTERY_LEADERBOARD_RESET_CONFIRM) {
+  const allowed = new Set([
+    MASTERY_LEADERBOARD_RESET_CONFIRM,
+    MASTERY_CAMPAIGN_TRANSITION_CONFIRM,
+  ]);
+  if (!allowed.has(confirm)) {
     throw new ApiError(
       httpStatus.BAD_REQUEST,
-      `Confirmation required. Send body.confirm = "${MASTERY_LEADERBOARD_RESET_CONFIRM}"`,
+      `Confirmation required. Send body.confirm = "${MASTERY_LEADERBOARD_RESET_CONFIRM}" or "${MASTERY_CAMPAIGN_TRANSITION_CONFIRM}"`,
     );
   }
 
   if (!params.adminUserId) {
     throw new ApiError(httpStatus.UNAUTHORIZED, "Admin identity required");
   }
+
+  const campaign = getActiveMasteryCampaign();
+  const isCampaignTransition =
+    confirm === MASTERY_CAMPAIGN_TRANSITION_CONFIRM;
 
   const beforeRows = await prisma.masteryLab.findMany({
     where: { NOT: { userId: null } },
@@ -883,35 +911,58 @@ const resetLeaderboard = async (params: {
     data: { leaderboardEligible: false },
   });
 
+  let bankInvalidated = 0;
+  let sessionsExpired = 0;
+  if (isCampaignTransition) {
+    bankInvalidated = await invalidateAllUnusedQuestionBank();
+    sessionsExpired = await expireLegacyUnconsumedExamSessions(
+      campaign.campaignId,
+    );
+  }
+
   const audit = await prisma.masteryLeaderboardResetLog.create({
     data: {
       adminUserId: params.adminUserId,
       confirmPhrase: confirm,
       hiddenCount: updated.count,
       note: params.note?.slice(0, 500) || null,
-    },
+      campaignId: campaign.campaignId,
+      bankInvalidated,
+      sessionsExpired,
+    } as any,
   });
 
   return {
-    mode: "soft_hide" as const,
+    mode: isCampaignTransition
+      ? ("campaign_transition_soft_hide" as const)
+      : ("soft_hide" as const),
+    campaign,
+    previousCampaignClosed: campaign.previousCampaignId,
     hiddenCount: updated.count,
     previouslyVisibleApprox: beforeVisible,
+    bankInvalidated,
+    sessionsExpired,
     deleted: 0,
     preserved: {
       masteryLabAttempts: true,
       examSessions: true,
+      historicalScores: true,
       certificates: true,
       userAccounts: true,
       xpLedgers: true,
+      academyProgress: true,
+      isoLibrary: true,
     },
     audit: {
       id: audit.id,
       adminUserId: audit.adminUserId,
       createdAt: audit.createdAt,
       hiddenCount: audit.hiddenCount,
+      campaignId: campaign.campaignId,
     },
-    message:
-      "Mastery Lab leaderboard soft-reset complete. Historical attempts remain available; new submissions will appear on the leaderboard.",
+    message: isCampaignTransition
+      ? "Previous Mastery Lab campaign closed. Leaderboard soft-reset; legacy question bank invalidated; unconsumed legacy sessions expired. New knowledge-based attempts use the active campaign."
+      : "Mastery Lab leaderboard soft-reset complete. Historical attempts remain available; new submissions will appear on the leaderboard.",
   };
 };
 

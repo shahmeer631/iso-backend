@@ -1,25 +1,30 @@
 /**
- * Soft-reset Mastery Lab leaderboard (does NOT delete historical attempts).
+ * Soft-reset Mastery Lab leaderboard and optionally close the previous campaign.
  *
  * Usage:
- *   node scripts/reset-mastery-leaderboard.js
  *   node scripts/reset-mastery-leaderboard.js --confirm=RESET_MASTERY_LEADERBOARD
+ *   node scripts/reset-mastery-leaderboard.js --confirm=CLOSE_PREVIOUS_START_KNOWLEDGE_V1
  *
- * Sets leaderboardEligible=false on all MasteryLab rows so the public
- * leaderboard starts empty. User accounts, scores, certificates, XP, and
- * exam sessions are preserved. New submissions remain leaderboard-eligible.
+ * Soft-hide: sets leaderboardEligible=false on all MasteryLab rows.
+ * Campaign transition: also invalidates unused question bank items and expires
+ * unconsumed exam sessions that are not stamped with the active campaign.
+ *
+ * Does NOT delete user accounts, historical attempts, certificates, or XP.
  */
 require("dotenv").config();
 const { PrismaClient } = require("@prisma/client");
 
-const CONFIRM = "RESET_MASTERY_LEADERBOARD";
+const SOFT = "RESET_MASTERY_LEADERBOARD";
+const TRANSITION = "CLOSE_PREVIOUS_START_KNOWLEDGE_V1";
+const ACTIVE_CAMPAIGN =
+  String(process.env.MASTERY_CAMPAIGN_ID || "").trim() || "knowledge-v1-2026";
 
 async function main() {
   const arg = process.argv.find((a) => a.startsWith("--confirm="));
-  const confirm = arg ? arg.split("=").slice(1).join("=") : CONFIRM;
-  if (confirm !== CONFIRM) {
+  const confirm = arg ? arg.split("=").slice(1).join("=") : "";
+  if (confirm !== SOFT && confirm !== TRANSITION) {
     console.error(
-      `Refusing to run. Pass --confirm=${CONFIRM} to soft-reset the leaderboard.`,
+      `Refusing to run. Pass --confirm=${SOFT} or --confirm=${TRANSITION}`,
     );
     process.exit(1);
   }
@@ -38,26 +43,68 @@ async function main() {
       data: { leaderboardEligible: false },
     });
 
+    let bankInvalidated = 0;
+    let sessionsExpired = 0;
+
+    if (confirm === TRANSITION) {
+      const bank = await prisma.masteryQuestionBank.updateMany({
+        where: { consumedAt: null },
+        data: { consumedAt: new Date() },
+      });
+      bankInvalidated = bank.count;
+
+      const open = await prisma.masteryExamSession.findMany({
+        where: { consumedAt: null },
+        select: { id: true, metadata: true },
+        take: 2000,
+      });
+      const legacyIds = open
+        .filter((s) => {
+          const meta = s.metadata || {};
+          const cid = String(meta.campaignId || meta.campaign_id || "").trim();
+          return cid !== ACTIVE_CAMPAIGN;
+        })
+        .map((s) => s.id);
+      if (legacyIds.length) {
+        const expired = await prisma.masteryExamSession.updateMany({
+          where: { id: { in: legacyIds }, consumedAt: null },
+          data: { consumedAt: new Date() },
+        });
+        sessionsExpired = expired.count;
+      }
+    }
+
     const audit = await prisma.masteryLeaderboardResetLog.create({
       data: {
         adminUserId: "000000000000000000000000",
-        confirmPhrase: CONFIRM,
+        confirmPhrase: confirm,
         hiddenCount: updated.count,
         note: "CLI soft-reset via scripts/reset-mastery-leaderboard.js",
+        campaignId: ACTIVE_CAMPAIGN,
+        bankInvalidated,
+        sessionsExpired,
       },
     });
 
     console.log(
       JSON.stringify(
         {
-          mode: "soft_hide",
+          mode:
+            confirm === TRANSITION
+              ? "campaign_transition_soft_hide"
+              : "soft_hide",
+          activeCampaignId: ACTIVE_CAMPAIGN,
           totalMasteryLabRows: before,
           previouslyVisibleApprox: visibleBefore,
           hiddenCount: updated.count,
+          bankInvalidated,
+          sessionsExpired,
           deleted: 0,
           auditId: audit.id,
           message:
-            "Leaderboard soft-reset complete. Historical MasteryLab rows preserved.",
+            confirm === TRANSITION
+              ? "Campaign transition complete. Leaderboard cleared; legacy bank/sessions closed. Historical rows preserved."
+              : "Leaderboard soft-reset complete. Historical MasteryLab rows preserved.",
         },
         null,
         2,
