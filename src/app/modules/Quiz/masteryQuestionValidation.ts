@@ -6,6 +6,7 @@
 import {
   inferKnowledgeCategoryFromContent,
   isValidKnowledgeCategory,
+  MasteryKnowledgeCategory,
   normalizeKnowledgeCategory,
 } from "./masteryKnowledgeCategories";
 
@@ -489,7 +490,10 @@ export const validateMasteryQuestion = (
       : []
   )
     .map((c) => normalizeKnowledgeCategory(c))
-    .filter((c): c is string => Boolean(c) && c !== primaryCategory);
+    .filter(
+      (c): c is MasteryKnowledgeCategory =>
+        Boolean(c) && c !== primaryCategory,
+    );
   const hasKnowledgeCategory = isValidKnowledgeCategory(primaryCategory);
   const hasStandard = hasStandardReference(question, standard);
   const hasClause = hasClauseReference(
