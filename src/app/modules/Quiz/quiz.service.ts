@@ -31,6 +31,11 @@ import {
   MASTERY_KNOWLEDGE_CATEGORIES,
   normalizeKnowledgeCategory,
 } from "./masteryKnowledgeCategories";
+import {
+  buildCategoryFamilyExamTitle,
+  isSingleStandardExamTitle,
+  pickMustKnowGoodToKnowCategories,
+} from "./masteryMustKnowGoodToKnow";
 
 export { MASTERY_DEFAULT_DIFFICULTY, normalizeQuizDifficulty };
 export { getActiveMasteryCampaign, MASTERY_ACTIVE_CAMPAIGN_ID };
@@ -81,13 +86,16 @@ const EXPERT_DIFFICULTY_INSTRUCTIONS = [
   "Ban obvious definitions-for-beginners, benefits lists, acronym expansions, and textbook recall that does not require clause-level knowledge.",
   "CLAUSE SPECIFICITY (HARD mandatory): Every question MUST include structured fields standard, version, clause (and subclause when applicable). Inventing clause numbers is forbidden.",
   "EDITION / VERSION (HARD mandatory): Cite ONLY the latest edition/year listed in the library category catalog or attached PDF titles (e.g. ISO 14001:2026 — NEVER cite withdrawn/outdated years such as ISO 14001:2015 when 2026 is in the catalog). AI training knowledge is outdated — the ISOBrain library is the source of truth.",
-  "MUST KNOW / GOOD TO KNOW = CATEGORY FAMILIES (HARD mandatory): Context provides must_know_categories and good_to_know_categories. Each is a full ISOBrain library category (e.g. Quality Management Systems, Information Security Management Systems), NOT a single ISO number.",
-  "Within each category, treat the WHOLE category catalog as the question bank — exactly as listed on isobrain.ai/library (e.g. Information Security: 27000, 27001, 27002, 27005, 27007…; Quality: 9000, 9001, 9004, 10000-series…). Do NOT fixate on one flagship standard (never only 27001 or only 9001).",
-  "DISTRIBUTION: about 2/3 of questions from Must Know category families; about 1/3 from Good to Know category families. Across the set, cover multiple distinct ISO numbers inside each category so learners discover standards they may not know.",
+  "MUST KNOW / GOOD TO KNOW = CATEGORY FAMILIES (HARD mandatory): Context provides must_know_categories and good_to_know_categories. Each is a full ISOBrain library category (e.g. Environmental Management Systems + Occupational Health & Safety for EHS), NOT a single ISO number.",
+  "Example (Construction / Entry / EHS): Must Know = Environment + OH&S families (14001, 14004, 45001, 45002, 45003, 45004… — ALL library children). Good to Know = supporting families such as Quality (9001), Auditing (19011), Risk (31000). NEVER examine only ISO 14001 + ISO 45001.",
+  "Within each category, treat the WHOLE category catalog as the question bank — exactly as listed on isobrain.ai/library. Do NOT fixate on one flagship standard (never only 27001, only 9001, or only 14001+45001).",
+  "DISTRIBUTION: about 2/3 of questions from Must Know category families; about 1/3 from Good to Know / supporting category families. Across the set, cover multiple distinct ISO numbers inside each category so learners discover standards they may not know.",
   "FOUNDATIONAL + OPERATIONAL INTERPLAY: Where a category includes both vocabulary/fundamentals and requirements/guidance (e.g. ISO 9000 with ISO 9001/9004, or ISO/IEC 27000 with 27001/27002), craft some items that test relationships across those standards in the same family.",
   "Each question MUST still cite one specific standard+clause for the correct answer, but the full exam must span multiple standards from the category catalogs.",
-  "QUIZ TITLE: Must describe an EXPERT multi-standard / category-family knowledge examination for the learner context — never name only one ISO number as if the whole exam is about that one standard alone, and never label Beginner/Intermediate/easy.",
-  "iso_standard_category (HARD mandatory): set to the library/family category name of the cited standard (e.g. Information Security Management Systems, Quality Management Systems) — not only the ISO number.",
+  "CLAUSE-IN-OPTIONS (HARD when testing clause identity): When the stem asks which clause / requirement applies, EVERY option MUST name a concrete clause id (e.g. \"ISO 45001:2018 clause 7.2 — Competence\" vs \"clause 7.3 — Awareness\"). Do not hide the clause number only in metadata while options stay generic management advice.",
+  "LIBRARY-ONLY EDITIONS (HARD): Cite ONLY standards and edition years present in category_standard_catalog / attached PDFs. Never invent withdrawn years from AI training data (e.g. never ISO 14001:2015 when the library lists ISO 14001:2026).",
+  "QUIZ TITLE: Must describe an EXPERT multi-standard / Must-Know+Good-to-Know category-family examination for the learner context — never name only one or two ISO numbers as if the whole exam is only about those, and never label Beginner/Intermediate/easy.",
+  "iso_standard_category (HARD mandatory): set to the library/family category name of the cited standard (e.g. Occupational Health & Safety, Environmental Management Systems) — not only the ISO number.",
   "KNOWLEDGE CATEGORY (HARD mandatory): Every question MUST set primary_knowledge_category to exactly one slug from the 14-category framework. Diversify across the exam — do not reuse only 1–2 categories.",
   "Prefer: precise knowledge; clause interpretation; relationships between requirements; mandatory vs guidance; structure/intent; documented information; procedural application; distinctions between similar requirements.",
   "Each question object MUST include: question, options (A–D), correct_answer, explanation, standard, version, clause, subclause (when applicable), exam_level, difficulty, question_type, primary_knowledge_category, secondary_knowledge_categories (optional), iso_standard_category, source_document.",
@@ -409,14 +417,15 @@ const generateQuiz = async (payload: any) => {
       department,
       raci_profile: raciProfile,
       context_instruction: [
-        "Suggest ISO STANDARDS CATEGORIES / FAMILIES relevant to this industry, management level, and department/job function",
-        "(Must Know categories first, then Good to Know / adjacent categories).",
-        "For EACH category, list multiple CURRENT-edition ISO standards that belong to that family — never only one flagship number.",
-        "Examples: Quality Management (9000/9001/9004/10000-series), Information Security (27000/27001/27002/27005/27007),",
-        "Environmental Management (14001/14004/…), OH&S (45001/45002/45003/45004), Artificial Intelligence (42001/42005/…).",
+        "Suggest Must Know AND Good to Know ISO STANDARDS CATEGORY FAMILIES for this industry, management level, and department.",
+        "Must Know = core categories for the role (e.g. EHS → Environmental Management + Occupational Health & Safety).",
+        "Good to Know = supporting / integrated categories (e.g. for EHS also Quality Management, Auditing/19011, Risk Management/31000).",
+        "For EACH category, list multiple CURRENT-edition ISO standards from that family — never only one or two flagship numbers (never only 14001+45001).",
+        "Examples: Quality (9000/9001/9004/10000-series), Information Security (27000/27001/27002/27005/27007),",
+        "Environmental (14001/14004/…), OH&S (45001/45002/45003/45004), Artificial Intelligence (42001/42005/…).",
         "Prefer the latest published edition year (e.g. ISO 14001:2026 over withdrawn ISO 14001:2015).",
         "Return a diverse set covering at least 2–4 categories when the profile supports it.",
-        "Mastery Lab examines the WHOLE category catalogs as listed on the ISOBrain library, not a single standard.",
+        "Mastery Lab examines the WHOLE ISOBrain library category catalogs, not a single standard.",
       ].join(" "),
     },
     { timeout: 1000 * 60 * 2 },
@@ -617,7 +626,7 @@ const generateQuiz = async (payload: any) => {
     ),
   );
 
-  // Rank categories by how many suggestion hits they contain
+  // Rank suggestion-matched categories by hit count
   const categoryHitCount = new Map<string, number>();
   for (const s of standards) {
     if (!s.categoryId) continue;
@@ -630,27 +639,24 @@ const generateQuiz = async (payload: any) => {
     (a, b) => (categoryHitCount.get(b) || 0) - (categoryHitCount.get(a) || 0),
   );
 
-  // Must Know: top 1–2 matched library categories; Good to Know: remaining matched + adjacent
-  let mustKnowCategoryIds = rankedMatchedCategoryIds.slice(0, 2);
-  let goodToKnowCategoryIds = rankedMatchedCategoryIds.slice(2);
+  // All library categories that have ACTIVE standards (website category list)
+  const allLibraryCategories = await prisma.category.findMany({
+    where: { isoStandards: { some: { status: "ACTIVE" } } },
+    select: { id: true, name: true, slug: true },
+    orderBy: { order: "asc" },
+  });
 
-  if (mustKnowCategoryIds.length < 1) {
-    // No direct match — pick primary library categories as soft fallback later
-    mustKnowCategoryIds = [];
-  }
-  if (goodToKnowCategoryIds.length < 1) {
-    const adjacent = await prisma.category.findMany({
-      where: {
-        isoStandards: { some: { status: "ACTIVE" } },
-        id: { notIn: mustKnowCategoryIds.length ? mustKnowCategoryIds : ["_"] },
-      },
-      select: { id: true, name: true },
-      orderBy: { order: "asc" },
-      take: 4,
-    });
-    // Prefer adjacent categories that still relate via suggestion keywords / industry
-    goodToKnowCategoryIds = adjacent.map((c) => c.id).slice(0, 2);
-  }
+  const { mustKnow, goodToKnow } = pickMustKnowGoodToKnowCategories({
+    allCategories: allLibraryCategories,
+    suggestionMatchedCategoryIds: rankedMatchedCategoryIds,
+    industry: String(industry),
+    department: String(department),
+    mustKnowLimit: 2,
+    goodToKnowLimit: 3,
+  });
+
+  const mustKnowCategoryIds = mustKnow.map((c) => c.id);
+  const goodToKnowCategoryIds = goodToKnow.map((c) => c.id);
 
   const portfolioCategoryIds = Array.from(
     new Set([...mustKnowCategoryIds, ...goodToKnowCategoryIds]),
@@ -1025,7 +1031,7 @@ const generateQuiz = async (payload: any) => {
       `Industry: ${industry}. Must Know category families: ${mustKnowCategoryNames.join(", ") || "from catalog"}. Good to Know category families: ${goodToKnowCategoryNames.join(", ") || "adjacent"}.`,
       `Target ~${mustKnowCount} Must Know + ~${goodToKnowCount} Good to Know questions.`,
       standardsCoveragePlan,
-      "CRITICAL: Do NOT produce an exam that is mostly one standard (e.g. only ISO/IEC 27001 or only ISO 9001). Use the WHOLE category family as on isobrain.ai library category pages.",
+      "CRITICAL: Do NOT produce an exam that is mostly one standard (e.g. only ISO 15189, only ISO/IEC 27001, or only ISO 9001). Use the WHOLE category family as on isobrain.ai library category pages. Cap any single ISO number at roughly 1/6 of the exam.",
       `ISOBrain library category catalogs (latest editions only — cite these years): ${catalogSummary || "see attached PDFs"}.`,
       "Never cite outdated editions (e.g. ISO 14001:2015) when a newer library edition exists (e.g. ISO 14001:2026).",
     ].join(" "),
@@ -1147,16 +1153,25 @@ const generateQuiz = async (payload: any) => {
     const batchLabel = `batch ${batchIndex}, n=${batchSize}`;
     console.log(`[MasteryQuiz] Generating ${batchLabel}…`);
 
-    // Alternate halves of the category catalog per batch so flagships cannot monopolize
-    const mid = Math.ceil(catalogIsoNumbers.length / 2) || 0;
-    const batchFocusIso =
-      catalogIsoNumbers.length <= 2
+    // Split catalog ISO numbers across batches so flagships (e.g. 15189) cannot monopolize
+    const batchCountApprox = Math.max(
+      1,
+      Math.ceil(generateCount / AI_SAFE_BATCH_SIZE),
+    );
+    const chunkSize = Math.max(
+      1,
+      Math.ceil(catalogIsoNumbers.length / batchCountApprox),
+    );
+    const focusStart = ((batchIndex - 1) * chunkSize) % Math.max(1, catalogIsoNumbers.length);
+    let batchFocusIso =
+      catalogIsoNumbers.length <= 3
         ? catalogIsoNumbers
-        : batchIndex % 2 === 1
-          ? catalogIsoNumbers.slice(0, mid)
-          : catalogIsoNumbers.slice(mid);
+        : catalogIsoNumbers.slice(focusStart, focusStart + chunkSize);
+    if (!batchFocusIso.length && catalogIsoNumbers.length) {
+      batchFocusIso = catalogIsoNumbers.slice(0, chunkSize);
+    }
     const batchFocusInstruction = batchFocusIso.length
-      ? `This batch MUST primarily cite these standards from the category catalogs (still use latest editions only): ${batchFocusIso.map((n) => `ISO ${n}`).join(", ")}. Do not default every item to a single flagship standard.`
+      ? `This batch MUST cite these standards from the category catalogs (latest editions only), roughly evenly: ${batchFocusIso.map((n) => `ISO ${n}`).join(", ")}. HARD RULE: do not make more than ~20% of this batch about any single ISO number (especially not only ISO 15189 / 9001 / 27001 / 14001 / 45001). Prefer direct knowledge stems naming standard+clause.`
       : standardsCoveragePlan;
 
     let batchData: any;
@@ -1486,11 +1501,33 @@ const generateQuiz = async (payload: any) => {
     );
   }
 
+  const categoryFamilyTitle = buildCategoryFamilyExamTitle({
+    mustKnowNames: mustKnowCategoryNames,
+    goodToKnowNames: goodToKnowCategoryNames,
+    industry: String(industry),
+    department: String(department),
+    managementLevel: String(management_level),
+  });
+  const aiTitle = String(
+    lastAiPayload?.quiz_title || lastAiPayload?.title || "",
+  ).trim();
+  const quizTitle =
+    !aiTitle || isSingleStandardExamTitle(aiTitle)
+      ? categoryFamilyTitle
+      : aiTitle;
+
   return {
     ...lastAiPayload,
+    quiz_title: quizTitle,
+    title: quizTitle,
     examSessionId,
     questions: clientQuestions,
-    metadata,
+    metadata: {
+      ...metadata,
+      quiz_title: quizTitle,
+      mustKnowCategories: mustKnowCategoryNames,
+      goodToKnowCategories: goodToKnowCategoryNames,
+    },
     validation: metadata.validation,
     served_from: "live_generate",
   };

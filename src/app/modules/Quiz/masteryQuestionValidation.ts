@@ -682,8 +682,9 @@ export const selectKnowledgePublishSet = <
     0,
     Math.floor(target * MASTERY_MAX_SITUATIONAL_RATIO),
   );
-  // Cap any single ISO number so flagship standards (9001/27001) cannot dominate
-  const maxPerIso = Math.max(2, Math.ceil(target / 4));
+  // Cap any single ISO number so flagships (15189/9001/27001) cannot dominate
+  // ~1/6 of the exam max per ISO → forces Must Know + Good to Know breadth
+  const maxPerIso = Math.max(2, Math.ceil(target / 6));
 
   const scored = [...pool].sort(
     (a, b) => (b.qualityScore || 0) - (a.qualityScore || 0),
