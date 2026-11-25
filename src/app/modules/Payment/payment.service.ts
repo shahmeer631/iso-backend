@@ -1,3 +1,4 @@
+import { Prisma } from "@prisma/client";
 import ApiError from "../../../errors/ApiErrors";
 import prisma from "../../../shared/prisma";
 import stripe from "../../../shared/stripe";
@@ -18,11 +19,7 @@ const couponService = new CouponService();
 
 /** Highest active lifetime PlanStatus for a user, or null if none. */
 async function highestLifetimePlanStatus(
-  tx: {
-    lifetimePurchase: {
-      findMany: (args: unknown) => Promise<Array<{ tier: string }>>;
-    };
-  },
+  tx: Prisma.TransactionClient,
   userId: string,
 ): Promise<"SILVER" | "GOLD" | "PLATINUM" | null> {
   const purchases = await tx.lifetimePurchase.findMany({

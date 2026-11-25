@@ -1,4 +1,5 @@
 import httpStatus from "http-status";
+import { Prisma } from "@prisma/client";
 import prisma from "../../../shared/prisma";
 import { LTD_DEFAULT_PROMOTION_ID } from "./lifetime.constants";
 import { LTD_ERROR_CODES, ltdError } from "./lifetime.errors";
@@ -132,8 +133,14 @@ async function writeAuditLog(params: {
         promotionId: params.promotionId,
         promotionConfigId: params.promotionConfigId ?? undefined,
         action: params.action,
-        before: params.before ?? undefined,
-        after: params.after ?? undefined,
+        before:
+          params.before == null
+            ? undefined
+            : (params.before as Prisma.InputJsonValue),
+        after:
+          params.after == null
+            ? undefined
+            : (params.after as Prisma.InputJsonValue),
         ip: params.ip ?? undefined,
         userAgent: params.userAgent ?? undefined,
       },

@@ -55,11 +55,10 @@ export function resolveLtdRefundAccessAction(params: {
 
   return {
     recordStatus,
-    revokeAccess: revokeApproved === true,
-    decision:
-      revokeApproved === true
-        ? "REVOKE_ACCESS_APPROVED"
-        : "RECORD_ONLY_ACCESS_UNCHANGED",
+    revokeAccess: Boolean(revokeApproved),
+    decision: revokeApproved
+      ? "REVOKE_ACCESS_APPROVED"
+      : "RECORD_ONLY_ACCESS_UNCHANGED",
     decisionRequired: LTD_REFUND_ACCESS_POLICY.decisionRequired,
   };
 }
