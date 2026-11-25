@@ -502,6 +502,28 @@ const getUserBillingOverview = async (userId: string) => {
     },
   });
 
+  // 🔥 3. lifetime purchases (LTD) — never implies subscription cancel
+  const lifetimePurchases = await prisma.lifetimePurchase.findMany({
+    where: {
+      userId,
+      status: "SUCCEEDED",
+    },
+    orderBy: {
+      purchasedAt: "desc",
+    },
+    include: {
+      plan: { select: { id: true, name: true, features: true } },
+      userAccess: {
+        select: {
+          id: true,
+          isActive: true,
+          expiresAt: true,
+          startDate: true,
+        },
+      },
+    },
+  });
+
   // 🔥 format order history
   const orderHistory = payments.map((p, index) => ({
     invoiceId: `INV-${new Date(p.createdAt).getFullYear()}-${String(
@@ -514,22 +536,85 @@ const getUserBillingOverview = async (userId: string) => {
     paymentId: p.id,
   }));
 
+  const lifetimeOrderHistory = lifetimePurchases.map((p, index) => ({
+    invoiceId: `LTD-${new Date(p.purchasedAt || p.createdAt).getFullYear()}-${String(
+      index + 1,
+    ).padStart(3, "0")}`,
+    date: p.purchasedAt || p.createdAt,
+    item: `Lifetime ${p.tier}`,
+    amount: p.amount,
+    status: p.status,
+    paymentId: p.id,
+    purchaseType: "LIFETIME" as const,
+    receiptRef:
+      p.stripePaymentIntentId || p.stripeCheckoutSessionId || p.id,
+  }));
+
+  const activeLifetime = lifetimePurchases.find(
+    (p) =>
+      p.entitlementActivatedAt &&
+      p.userAccess?.isActive &&
+      p.userAccess.expiresAt == null,
+  );
+
+  const isLifetimeAccess = Boolean(
+    currentAccess?.expiresAt == null && currentAccess?.lifetimePurchaseId,
+  );
+
   return {
     currentPlan: currentAccess
       ? {
           name: currentAccess.plan.name,
           price: currentAccess.plan.discountedPrice,
-
           expiresAt: currentAccess.expiresAt,
           isActive: currentAccess.isActive,
-          source: "subscription" as const,
+          source: isLifetimeAccess
+            ? ("lifetime" as const)
+            : ("subscription" as const),
+          isLifetime: isLifetimeAccess,
+          lifetimeTier: activeLifetime?.tier ?? null,
         }
       : null,
 
     /** Group + subscription union — cash/offline access shows up here */
     effectiveAccess,
 
-    orderHistory,
+    lifetimeAccess: activeLifetime
+      ? {
+          tier: activeLifetime.tier,
+          status: activeLifetime.status,
+          purchaseType: activeLifetime.purchaseType,
+          purchasedAt: activeLifetime.purchasedAt,
+          entitlementActivatedAt: activeLifetime.entitlementActivatedAt,
+          amount: activeLifetime.amount,
+          currency: activeLifetime.currency,
+          promotionId: activeLifetime.promotionId,
+          receiptRef:
+            activeLifetime.stripePaymentIntentId ||
+            activeLifetime.stripeCheckoutSessionId ||
+            activeLifetime.id,
+          planName: activeLifetime.plan?.name ?? null,
+          isPermanent: true,
+        }
+      : null,
+
+    lifetimePurchases: lifetimePurchases.map((p) => ({
+      id: p.id,
+      tier: p.tier,
+      status: p.status,
+      amount: p.amount,
+      currency: p.currency,
+      purchasedAt: p.purchasedAt,
+      entitlementActivatedAt: p.entitlementActivatedAt,
+      receiptRef:
+        p.stripePaymentIntentId || p.stripeCheckoutSessionId || p.id,
+      isActive: Boolean(p.userAccess?.isActive && p.entitlementActivatedAt),
+    })),
+
+    orderHistory: [...lifetimeOrderHistory, ...orderHistory].sort(
+      (a, b) =>
+        new Date(b.date).getTime() - new Date(a.date).getTime(),
+    ),
   };
 };
 

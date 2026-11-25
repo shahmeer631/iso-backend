@@ -28,3 +28,24 @@ export function planKeyFromName(name: string): GroupPlanKey | null {
   if (n.includes("plus")) return "PLUS";
   return null;
 }
+
+/**
+ * Plan-tier check with hierarchy: ULTRA ⊇ PRO ⊇ PLUS.
+ * Pure helper (no DB) — shared by effectiveAccess and LifetimeDeal.
+ */
+export function effectivePlansIncludeTier(
+  effectivePlans: GroupPlanKey[],
+  required: GroupPlanKey | GroupPlanKey[],
+): boolean {
+  const owned = new Set(effectivePlans);
+  const needed = Array.isArray(required) ? required : [required];
+
+  const hasAtLeast = (tier: GroupPlanKey): boolean => {
+    if (tier === "PLUS")
+      return owned.has("PLUS") || owned.has("PRO") || owned.has("ULTRA");
+    if (tier === "PRO") return owned.has("PRO") || owned.has("ULTRA");
+    return owned.has("ULTRA");
+  };
+
+  return needed.some(hasAtLeast);
+}

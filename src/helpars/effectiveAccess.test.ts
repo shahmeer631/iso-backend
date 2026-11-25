@@ -1,11 +1,11 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
+  effectivePlansIncludeTier,
   isGroupPlanKey,
   normalizeGroupPlanKeys,
   planKeyFromName,
 } from "./groupPlanKeys";
-import { effectivePlansIncludeTier } from "./effectiveAccess";
 
 describe("groupPlanKeys helpers", () => {
   it("maps plan names to PLUS / PRO / ULTRA", () => {

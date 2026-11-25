@@ -31,7 +31,7 @@ const GlobalErrorHandler = (
     message = simplifiedError?.message;
     errorSources = simplifiedError?.errorSources;
   }
-  // Handle Custom ApiError
+  // Handle Custom ApiError (includes LtdError with machine-readable `code`)
   else if (err instanceof ApiError) {
     statusCode = err.statusCode;
     message = err.message;
@@ -86,6 +86,7 @@ const GlobalErrorHandler = (
   res.status(statusCode).json({
     success: false,
     message,
+    ...(typeof err?.code === "string" ? { code: err.code } : {}),
     errorSources,
     err,
     stack: config.NODE_ENV === "development" ? err?.stack : null,

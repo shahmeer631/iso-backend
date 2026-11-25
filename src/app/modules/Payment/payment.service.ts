@@ -5,8 +5,41 @@ import { CouponService } from "../Coupon/coupon.service";
 import httpStatus from "http-status";
 import { CreatePaymentIntentDto } from "./payment.types";
 import { getEffectiveAccess } from "../../../helpars/effectiveAccess";
+import { LTD_ERROR_CODES, LtdError } from "../LifetimeDeal/lifetime.errors";
+import { excludeLifetimeAccessWhere } from "../LifetimeDeal/lifetime.compat";
+import {
+  higherPlanStatus,
+  lifetimeTierToPlanStatus,
+} from "../LifetimeDeal/lifetimeEntitlement";
+import type { LtdTier } from "../LifetimeDeal/lifetime.constants";
+import { maxTier } from "../LifetimeDeal/promotion.state";
 
 const couponService = new CouponService();
+
+/** Highest active lifetime PlanStatus for a user, or null if none. */
+async function highestLifetimePlanStatus(
+  tx: {
+    lifetimePurchase: {
+      findMany: (args: unknown) => Promise<Array<{ tier: string }>>;
+    };
+  },
+  userId: string,
+): Promise<"SILVER" | "GOLD" | "PLATINUM" | null> {
+  const purchases = await tx.lifetimePurchase.findMany({
+    where: {
+      userId,
+      status: "SUCCEEDED",
+      entitlementActivatedAt: { not: null },
+    },
+    select: { tier: true },
+  });
+  const tiers = purchases
+    .map((p) => p.tier)
+    .filter((t): t is LtdTier => t === "PLUS" || t === "PRO" || t === "ULTRA");
+  if (tiers.length === 0) return null;
+  const highest = tiers.reduce((a, b) => maxTier(a, b));
+  return lifetimeTierToPlanStatus(highest);
+}
 
 const handleStripeWebhook = async (payload: Buffer, signature: string) => {
   let event;
@@ -19,17 +52,39 @@ const handleStripeWebhook = async (payload: Buffer, signature: string) => {
     );
   } catch (err) {
     console.error("❌ Webhook signature error:", err);
-    throw new Error("Webhook signature verification failed");
+    throw new LtdError(
+      httpStatus.BAD_REQUEST,
+      LTD_ERROR_CODES.WEBHOOK_INVALID_SIGNATURE,
+      "Webhook signature verification failed",
+    );
   }
 
   switch (event.type) {
     case "payment_intent.succeeded": {
-      const paymentIntent = event.data.object;
+      const paymentIntent = event.data.object as any;
       console.log("🔥 WEBHOOK PI:", paymentIntent.id);
 
       // ✅ Skip subscription payments — they are handled by invoice.payment_succeeded
-      if ((paymentIntent as any).invoice) {
+      if (paymentIntent.invoice) {
         console.log("⚡ Skipping payment_intent.succeeded for subscription invoice — handled by invoice.payment_succeeded");
+        break;
+      }
+
+      // Phase 5 LTD — verify payment and permanently activate lifetime entitlements
+      if (paymentIntent.metadata?.purchaseType === "LIFETIME") {
+        console.log("🔓 LTD payment_intent.succeeded — verify + activate");
+        try {
+          const { LifetimeWebhookService } = await import(
+            "../LifetimeDeal/lifetimeWebhook.service"
+          );
+          await LifetimeWebhookService.handleLtdPaymentIntentSucceeded(
+            paymentIntent,
+            event.id,
+          );
+        } catch (err) {
+          console.error("❌ LTD fulfill payment_intent failed:", err);
+          throw err;
+        }
         break;
       }
 
@@ -40,6 +95,84 @@ const handleStripeWebhook = async (payload: Buffer, signature: string) => {
         throw err;
       }
 
+      break;
+    }
+
+    case "checkout.session.completed": {
+      const session = event.data.object as any;
+      if (session?.metadata?.purchaseType === "LIFETIME") {
+        console.log("🔓 LTD checkout.session.completed — verify + activate");
+        try {
+          const { LifetimeWebhookService } = await import(
+            "../LifetimeDeal/lifetimeWebhook.service"
+          );
+          await LifetimeWebhookService.handleLtdCheckoutSessionCompleted(
+            session,
+            event.id,
+          );
+        } catch (err) {
+          console.error("❌ LTD fulfill checkout.session failed:", err);
+          throw err;
+        }
+      }
+      break;
+    }
+
+    case "payment_intent.payment_failed": {
+      const paymentIntent = event.data.object as any;
+      // Skip subscription invoice PIs — annual billing uses invoice events
+      if (paymentIntent.invoice) {
+        console.log(
+          "⚡ Skipping payment_intent.payment_failed for subscription invoice",
+        );
+        break;
+      }
+      if (paymentIntent.metadata?.purchaseType === "LIFETIME") {
+        console.log("⚠️ LTD payment_intent.payment_failed");
+        try {
+          const { LifetimeWebhookService } = await import(
+            "../LifetimeDeal/lifetimeWebhook.service"
+          );
+          await LifetimeWebhookService.handleLtdPaymentIntentFailed(
+            paymentIntent,
+            event.id,
+          );
+        } catch (err) {
+          console.error("❌ LTD payment_failed handler error:", err);
+          throw err;
+        }
+      }
+      break;
+    }
+
+    case "charge.refunded": {
+      const charge = event.data.object as any;
+      try {
+        const { LifetimeWebhookService } = await import(
+          "../LifetimeDeal/lifetimeWebhook.service"
+        );
+        const refundId =
+          typeof charge.refunds?.data?.[0]?.id === "string"
+            ? charge.refunds.data[0].id
+            : null;
+        await LifetimeWebhookService.handleLtdChargeRefunded(
+          {
+            id: charge.id,
+            amount: charge.amount,
+            amount_refunded: charge.amount_refunded,
+            currency: charge.currency,
+            refunded: charge.refunded,
+            payment_intent: charge.payment_intent,
+            customer: charge.customer,
+            metadata: charge.metadata,
+            refundId,
+          },
+          event.id,
+        );
+      } catch (err) {
+        console.error("❌ LTD charge.refunded handler error:", err);
+        throw err;
+      }
       break;
     }
 
@@ -99,11 +232,30 @@ const handleStripeWebhook = async (payload: Buffer, signature: string) => {
 };
 
 // ── Stripe Customer তৈরি বা retrieve ──────────
+// Reuses stored cus_ only when it exists in the *current* Stripe mode
+// (test key + live cus_ → recreate; avoids resource_missing 500s).
 const getOrCreateStripeCustomer = async (userId: string): Promise<string> => {
   const user = await prisma.user.findUnique({ where: { id: userId } });
   if (!user) throw new ApiError(httpStatus.NOT_FOUND, "User not found");
 
-  if (user.stripeCustomerId && user.stripeCustomerId.startsWith("cus_")) return user.stripeCustomerId;
+  if (user.stripeCustomerId && user.stripeCustomerId.startsWith("cus_")) {
+    try {
+      const existing = await stripe.customers.retrieve(user.stripeCustomerId);
+      if (!("deleted" in existing && existing.deleted)) {
+        return existing.id;
+      }
+    } catch (err: any) {
+      const msg = String(err?.message || "");
+      const modeMismatch =
+        err?.code === "resource_missing" ||
+        /no such customer/i.test(msg) ||
+        /similar object exists in (live|test) mode/i.test(msg);
+      if (!modeMismatch) throw err;
+      console.warn(
+        `⚠️ Stripe customer ${user.stripeCustomerId} invalid for current API mode; creating a new one for user ${userId}`,
+      );
+    }
+  }
 
   const customer = await stripe.customers.create({
     email: user.email,
@@ -294,12 +446,9 @@ export async function handlePaymentSuccess(
       data: { status: "SUCCEEDED" },
     });
 
-    // 2. deactivate old access
+    // 2. deactivate old non-lifetime access (Phase 6 — never wipe LTD)
     await tx.userAccess.updateMany({
-      where: {
-        userId: payment.userId,
-        isActive: true,
-      },
+      where: excludeLifetimeAccessWhere(payment.userId),
       data: { isActive: false },
     });
 
@@ -317,11 +466,16 @@ export async function handlePaymentSuccess(
       },
     });
 
+    const ltdPlan = await highestLifetimePlanStatus(tx, payment.userId);
+    const nextPlan = ltdPlan
+      ? higherPlanStatus(ltdPlan, planStatus)
+      : planStatus;
+
     // 4. update user
     await tx.user.update({
       where: { id: payment.userId },
       data: {
-        currentPlan: planStatus,
+        currentPlan: nextPlan,
         subscribed: "SUBSCRIBED",
         planId: payment.planId,
         totalSpent: {
@@ -589,9 +743,9 @@ async function handleSubscriptionInvoicePaid(invoice: any) {
     });
 
     if (shouldActivateAccess) {
-      // 2. Deactivate old access
+      // 2. Deactivate old non-lifetime access (Phase 6 — preserve LTD entitlements)
       await tx.userAccess.updateMany({
-        where: { userId: user.id, isActive: true },
+        where: excludeLifetimeAccessWhere(user.id),
         data: { isActive: false },
       });
 
@@ -607,11 +761,16 @@ async function handleSubscriptionInvoicePaid(invoice: any) {
         },
       });
 
-      // 4. Update user tier & spend
+      const ltdPlan = await highestLifetimePlanStatus(tx, user.id);
+      const nextPlan = ltdPlan
+        ? higherPlanStatus(ltdPlan, planStatus)
+        : planStatus;
+
+      // 4. Update user tier & spend (never lower below active LTD)
       await tx.user.update({
         where: { id: user.id },
         data: {
-          currentPlan: planStatus,
+          currentPlan: nextPlan,
           subscribed: "SUBSCRIBED",
           planId: plan.id,
           totalSpent: {
@@ -715,25 +874,27 @@ async function handleSubscriptionDeleted(subscription: any) {
       });
     }
 
-    // 3. Downgrade user plan status in both cases
-    //    If they have remaining access, they keep the plan features until expiresAt.
-    //    Plan status will visually reflect FREE but access check uses UserAccess.isActive.
+    // 3. Downgrade user plan status — but never below an active lifetime entitlement (Phase 6)
+    const ltdPlan = await highestLifetimePlanStatus(tx, subRecord.userId);
+
     if (!hasRemainingAccess) {
       await tx.user.update({
         where: { id: subRecord.userId },
         data: {
-          currentPlan: "FREE",
-          subscribed: "FREE_USER",
+          currentPlan: ltdPlan ?? "FREE",
+          subscribed: ltdPlan ? "SUBSCRIBED" : "FREE_USER",
         }
       });
     } else {
       // Subscription canceled but access period not yet over — just mark subscribed as FREE_USER
       // so they can't "re-upgrade" thinking they are still subscribed,
       // but keep currentPlan so features remain accessible until expiresAt.
+      // If LTD is also active, keep subscribed signal for lifetime customers.
       await tx.user.update({
         where: { id: subRecord.userId },
         data: {
-          subscribed: "FREE_USER",
+          subscribed: ltdPlan ? "SUBSCRIBED" : "FREE_USER",
+          ...(ltdPlan ? { currentPlan: ltdPlan } : {}),
         }
       });
       console.log(`⏳ Subscription canceled but access valid until: ${userAccess?.expiresAt}`);
@@ -888,20 +1049,30 @@ async function handleSubscriptionUpdated(stripeSubscription: any) {
         else if (plan.name.toLowerCase().includes("pro")) planStatus = "GOLD";
         else if (plan.name.toLowerCase().includes("ultra")) planStatus = "PLATINUM";
 
+        const ltdPlan = await highestLifetimePlanStatus(tx, user.id);
+        const nextPlan = ltdPlan
+          ? higherPlanStatus(ltdPlan, planStatus)
+          : planStatus;
+
         await tx.user.update({
           where: { id: user.id },
-          data: { currentPlan: planStatus, subscribed: "SUBSCRIBED", planId: plan.id }
+          data: { currentPlan: nextPlan, subscribed: "SUBSCRIBED", planId: plan.id }
         });
       }
     } else {
+      // Only deactivate this subscription's access — never lifetime rows
       await tx.userAccess.updateMany({
         where: { subscriptionId: subRecord.id, isActive: true },
         data: { isActive: false }
       });
       if (status === 'CANCELED' || status === 'UNPAID' || status === 'INCOMPLETE') {
+        const ltdPlan = await highestLifetimePlanStatus(tx, user.id);
         await tx.user.update({
           where: { id: user.id },
-          data: { currentPlan: "FREE", subscribed: "FREE_USER" }
+          data: {
+            currentPlan: ltdPlan ?? "FREE",
+            subscribed: ltdPlan ? "SUBSCRIBED" : "FREE_USER",
+          }
         });
       }
     }
@@ -953,8 +1124,9 @@ async function handleSetupIntentSucceeded(setupIntent: any) {
 
   await prisma.$transaction(async (tx) => {
     // Grant access now that card is confirmed!
+    // Phase 6: do not deactivate lifetime UserAccess rows.
     await tx.userAccess.updateMany({
-      where: { userId: user.id, isActive: true },
+      where: excludeLifetimeAccessWhere(user.id),
       data: { isActive: false },
     });
 
@@ -969,10 +1141,15 @@ async function handleSetupIntentSucceeded(setupIntent: any) {
       },
     });
 
+    const ltdPlan = await highestLifetimePlanStatus(tx, user.id);
+    const nextPlan = ltdPlan
+      ? higherPlanStatus(ltdPlan, planStatus)
+      : planStatus;
+
     await tx.user.update({
       where: { id: user.id },
       data: {
-        currentPlan: planStatus,
+        currentPlan: nextPlan,
         subscribed: "SUBSCRIBED",
         planId: plan.id,
       },
@@ -1010,4 +1187,5 @@ export const PaymentService = {
   handleStripeWebhook,
   upgradeSubscription,
   createCustomerPortal,
+  getOrCreateStripeCustomer,
 };

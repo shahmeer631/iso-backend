@@ -59,16 +59,17 @@ model User {
   planId           String?       @db.ObjectId // required → optional
   plan             Plan?         @relation(fields: [planId], references: [id])
   paymentId        String?       @db.ObjectId
-  payments         Payment[]
-  subscriptions    Subscription[]
-  userAccesses     UserAccess[]
-  stripeCustomerId String?       @unique
-  certificates     Certificate[]
-  groupUsers       GroupUser[]
-  masteryLabs       MasteryLab[]
-  chatSessions      ChatSession[]
-  activitySessions  ActivitySession[]
-  resumeState       UserResumeState?
+  payments           Payment[]
+  subscriptions      Subscription[]
+  userAccesses       UserAccess[]
+  lifetimePurchases  LifetimePurchase[]
+  stripeCustomerId   String?       @unique
+  certificates       Certificate[]
+  groupUsers         GroupUser[]
+  masteryLabs        MasteryLab[]
+  chatSessions       ChatSession[]
+  activitySessions   ActivitySession[]
+  resumeState        UserResumeState?
 
   /// Phase 3 — denormalized XP total; ledger is source of truth
   xpTotal           Int               @default(0)
@@ -573,6 +574,7 @@ model Plan {
   accesses  UserAccess[]
   payments  Payment[]
   subscriptions Subscription[]
+  lifetimePurchases LifetimePurchase[]
   createdAt DateTime     @default(now())
   updatedAt DateTime     @updatedAt
   users     User[]
@@ -640,17 +642,163 @@ model UserAccess {
   planId         String  @db.ObjectId
   paymentId      String? @db.ObjectId // Optional now (for one-time legacy)
   subscriptionId String? @db.ObjectId // Optional now (for recurring)
+  /// Phase 1 LTD — permanent access granted via LifetimePurchase (expiresAt null)
+  lifetimePurchaseId String? @unique @db.ObjectId
 
-  user User @relation(fields: [userId], references: [id])
-  plan Plan @relation(fields: [planId], references: [id])
+  user             User              @relation(fields: [userId], references: [id])
+  plan             Plan              @relation(fields: [planId], references: [id])
+  lifetimePurchase LifetimePurchase? @relation(fields: [lifetimePurchaseId], references: [id])
 
   startDate DateTime  @default(now())
-  expiresAt DateTime? // startDate + validityDays
+  expiresAt DateTime? // null = permanent (lifetime); otherwise period end / validity
 
   isActive Boolean @default(true)
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+
+  @@index([userId, isActive])
+}
+
+// ─── PHASE 1: 7-DAY LIFETIME DEAL ───────────────
+/// Centralized LTD promotion configuration. Runtime state is computed
+/// (SCHEDULED | ACTIVE | EXPIRED | DISABLED) — not stored.
+model PromotionConfig {
+  id          String @id @default(auto()) @map("_id") @db.ObjectId
+  /// Stable business key, e.g. "ltd-7day"
+  promotionId String @unique
+  name        String
+  /// Manual kill-switch. DISABLED when false regardless of dates.
+  isEnabled   Boolean  @default(false)
+  startsAt    DateTime
+  endsAt      DateTime
+  currency    String   @default("usd")
+
+  plusPrice  Float @default(65)
+  proPrice   Float @default(80)
+  ultraPrice Float @default(100)
+
+  /// Optional Stripe Product/Price refs (wired in Phase 2 checkout)
+  plusStripeProductId  String?
+  plusStripePriceId    String?
+  proStripeProductId   String?
+  proStripePriceId     String?
+  ultraStripeProductId String?
+  ultraStripePriceId   String?
+
+  /// Optional links to existing Plan rows (feature source / annual anchors)
+  plusPlanId  String? @db.ObjectId
+  proPlanId   String? @db.ObjectId
+  ultraPlanId String? @db.ObjectId
+
+  purchases LifetimePurchase[]
+  auditLogs PromotionConfigAuditLog[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([isEnabled, startsAt, endsAt])
+  @@map("PromotionConfigs")
+}
+
+/// Phase 8 — audit trail for LTD promotion configuration changes (SUPER_ADMIN).
+model PromotionConfigAuditLog {
+  id                String   @id @default(auto()) @map("_id") @db.ObjectId
+  adminUserId       String   @db.ObjectId
+  adminEmail        String?
+  promotionId       String
+  promotionConfigId String?  @db.ObjectId
+  promotionConfig   PromotionConfig? @relation(fields: [promotionConfigId], references: [id])
+  action            String
+  /// Safe JSON snapshot of before/after (no Stripe secrets)
+  before            Json?
+  after             Json?
+  ip                String?
+  userAgent         String?
+  createdAt         DateTime @default(now())
+
+  @@index([promotionId, createdAt])
+  @@index([adminUserId, createdAt])
+  @@map("PromotionConfigAuditLogs")
+}
+
+/// Persistent LTD purchase record. Coexists with Payment / Subscription —
+/// does not replace or mutate annual billing rows.
+model LifetimePurchase {
+  id     String @id @default(auto()) @map("_id") @db.ObjectId
+  userId String @db.ObjectId
+  user   User   @relation(fields: [userId], references: [id])
+
+  tier         LifetimeTier
+  purchaseType LifetimePurchaseType @default(LIFETIME)
+
+  /// Denormalized business key (matches PromotionConfig.promotionId)
+  promotionId       String
+  promotionConfigId String?          @db.ObjectId
+  promotionConfig   PromotionConfig? @relation(fields: [promotionConfigId], references: [id])
+
+  /// Plan used for feature flags (typically annual Plus/Pro/Ultra Plan row)
+  planId String? @db.ObjectId
+  plan   Plan?   @relation(fields: [planId], references: [id])
+
+  amount   Float
+  currency String @default("usd")
+
+  stripeCustomerId        String?
+  stripeCheckoutSessionId String?
+  stripePaymentIntentId   String?
+  /// Phase 10 — charge / refund identifiers for LTD lifecycle
+  stripeChargeId          String?
+  stripeRefundId          String?
+  status                  PaymentStatus @default(PENDING)
+
+  purchasedAt             DateTime?
+  entitlementActivatedAt  DateTime?
+  /// Set when a full refund is recorded (access revoke still policy-gated)
+  refundedAt              DateTime?
+  refundAmount            Float?
+
+  /// Client/server retry key before Stripe ids exist
+  idempotencyKey String?
+
+  userAccess UserAccess?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([idempotencyKey])
+  @@unique([stripePaymentIntentId])
+  @@unique([stripeCheckoutSessionId])
+  @@index([userId, promotionId])
+  @@index([userId, tier, status])
+  @@index([promotionId, status])
+  @@index([stripeChargeId])
+  @@map("LifetimePurchases")
+}
+
+enum LifetimeTier {
+  PLUS
+  PRO
+  ULTRA
+}
+
+enum LifetimePurchaseType {
+  LIFETIME
+}
+
+/// Idempotent Stripe webhook processing ledger (LTD + shared).
+model StripeWebhookEvent {
+  id                 String   @id @default(auto()) @map("_id") @db.ObjectId
+  eventId            String   @unique
+  type               String
+  lifetimePurchaseId String?  @db.ObjectId
+  paymentIntentId    String?
+  checkoutSessionId  String?
+  processedAt        DateTime @default(now())
+
+  @@index([paymentIntentId])
+  @@index([lifetimePurchaseId])
+  @@map("StripeWebhookEvents")
 }
 
 // ─── SUBSCRIPTION ──────────────────────────────

@@ -30,6 +30,7 @@ import { XpRoutes } from "../modules/Gamification/xp.route";
 import { PersonalizationRoutes } from "../modules/Personalization/personalization.route";
 import { ApiUsageRoutes } from "../modules/ApiUsage/apiUsage.route";
 import { TranslationRoutes } from "../modules/Translation/translation.route";
+import { LifetimeDealRoutes } from "../modules/LifetimeDeal/lifetime.routes";
 
 const router = express.Router();
 
@@ -157,6 +158,10 @@ const moduleRoutes = [
   {
     path: "/translation",
     route: TranslationRoutes,
+  },
+  {
+    path: "/lifetime-deal",
+    route: LifetimeDealRoutes,
   },
 ];
 
