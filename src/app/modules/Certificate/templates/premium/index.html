@@ -1,93 +1,139 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>CPD Certificate of Competency</title>
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        @page { size: 1536px 1024px; margin: 0; }
-        body {
-            width: 1536px;
-            height: 1024px;
-            margin: 0;
-            padding: 0;
-            position: relative;
-            overflow: hidden;
-            background: #f7f5f0;
-        }
-        .template-image {
-            width: 100%;
-            height: 100%;
-            position: absolute;
-            top: 0;
-            left: 0;
-        }
-        .cover {
-            position: absolute;
-            background: #f7f5f0;
-        }
-        /* Cover baked-in placeholders on the new landscape layout */
-        /* Tall enough to hide any baked-in double name layers in the template art */
-        .cover-name { left: 180px; top: 348px; width: 1170px; height: 82px; }
-        .cover-date { left: 280px; top: 708px; width: 240px; height: 28px; }
-        .cover-industry { left: 700px; top: 638px; width: 300px; height: 26px; }
-        .cover-mgmt { left: 700px; top: 676px; width: 300px; height: 26px; }
-        .cover-job { left: 700px; top: 714px; width: 340px; height: 26px; }
-        .cover-cert-id { left: 720px; top: 845px; width: 420px; height: 40px; }
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>CPD Certificate of Competency</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    @page { size: 1536px 1024px; margin: 0; }
 
-        .recipient-name {
-            position: absolute;
-            left: 260px;
-            top: 358px;
-            width: 1010px;
-            text-align: center;
-            font-family: Georgia, "Times New Roman", serif;
-            font-size: 44px;
-            font-weight: bold;
-            color: #b8860b;
-            letter-spacing: 0.4px;
-            line-height: 1.15;
-        }
-        .field-value {
-            position: absolute;
-            font-family: Arial, Helvetica, sans-serif;
-            font-size: 15px;
-            font-weight: 600;
-            color: #1a2744;
-            line-height: 1.2;
-        }
-        .date-value { left: 280px; top: 712px; width: 240px; }
-        .industry-value { left: 700px; top: 642px; width: 300px; }
-        .mgmt-value { left: 700px; top: 680px; width: 300px; }
-        .job-value { left: 700px; top: 718px; width: 340px; }
-        .cert-number {
-            position: absolute;
-            left: 720px;
-            top: 850px;
-            width: 420px;
-            font-family: Arial, Helvetica, sans-serif;
-            font-size: 13px;
-            font-weight: 700;
-            color: #1a2744;
-            letter-spacing: 0.2px;
-            white-space: nowrap;
-        }
-    </style>
+    body {
+      width: 1536px;
+      height: 1024px;
+      margin: 0;
+      padding: 0;
+      position: relative;
+      overflow: hidden;
+      background: #fafcfb;
+      -webkit-print-color-adjust: exact;
+      print-color-adjust: exact;
+    }
+
+    .template-image {
+      position: absolute;
+      inset: 0;
+      width: 1536px;
+      height: 1024px;
+      display: block;
+    }
+
+    .overlay {
+      position: absolute;
+      z-index: 3;
+      overflow: hidden;
+    }
+
+    .recipient-name {
+      left: 400px;
+      top: 352px;
+      width: 740px;
+      height: 68px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      text-align: center;
+      font-family: Arial, Helvetica, sans-serif;
+      font-size: 40px;
+      font-weight: 700;
+      color: #b8860b;
+      letter-spacing: 0.2px;
+      line-height: 1.1;
+      white-space: nowrap;
+      background: transparent;
+    }
+
+    .field-value {
+      font-family: Arial, Helvetica, sans-serif;
+      font-size: 15px;
+      font-weight: 400;
+      color: #1a2744;
+      line-height: 1.2;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    /* Baselines aligned to baked-in labels on certificate-template.png */
+    .date-value {
+      left: 575px;
+      top: 712px;
+      width: 155px;
+      background: transparent;
+    }
+
+    .industry-value {
+      left: 900px;
+      top: 634px;
+      width: 190px;
+      background: transparent;
+    }
+
+    .mgmt-value {
+      left: 968px;
+      top: 674px;
+      width: 130px;
+      background: transparent;
+    }
+
+    .job-value {
+      left: 1028px;
+      top: 714px;
+      width: 140px;
+      background: transparent;
+    }
+
+    /* UUID only — "Certificate ID:" label remains on the PNG art */
+    .cert-id {
+      left: 1128px;
+      top: 878px;
+      width: 185px;
+      font-family: Arial, Helvetica, sans-serif;
+      font-size: 9px;
+      font-weight: 600;
+      color: #1a1a1a;
+      letter-spacing: 0;
+      line-height: 1.3;
+      white-space: normal;
+      overflow-wrap: anywhere;
+      background: transparent;
+    }
+  </style>
 </head>
 <body>
-    <img src="{{TEMPLATE_IMAGE}}" class="template-image" alt="Certificate Template" />
-    <div class="cover cover-name"></div>
-    <div class="cover cover-date"></div>
-    <div class="cover cover-industry"></div>
-    <div class="cover cover-mgmt"></div>
-    <div class="cover cover-job"></div>
-    <div class="cover cover-cert-id"></div>
-    <div class="recipient-name">{{RECIPIENT_NAME}}</div>
-    <div class="field-value date-value">{{ISSUED_DATE}}</div>
-    <div class="field-value industry-value">{{INDUSTRY}}</div>
-    <div class="field-value mgmt-value">{{MANAGEMENT_LEVEL}}</div>
-    <div class="field-value job-value">{{JOB_FUNCTION}}</div>
-    <div class="cert-number">Certificate ID: {{CERT_NUMBER}}</div>
+  <img src="{{TEMPLATE_IMAGE}}" class="template-image" alt="" />
+
+  <div class="overlay recipient-name" id="recipient-name">{{RECIPIENT_NAME}}</div>
+  <div class="overlay field-value date-value">{{ISSUED_DATE}}</div>
+  <div class="overlay field-value industry-value">{{INDUSTRY}}</div>
+  <div class="overlay field-value mgmt-value">{{MANAGEMENT_LEVEL}}</div>
+  <div class="overlay field-value job-value">{{JOB_FUNCTION}}</div>
+  <div class="overlay cert-id">{{CERT_NUMBER}}</div>
+
+  <script>
+    (function () {
+      var el = document.getElementById("recipient-name");
+      if (!el) return;
+      var max = 40;
+      var min = 22;
+      el.style.fontSize = max + "px";
+      var guard = 0;
+      while (el.scrollWidth > el.clientWidth && max > min && guard < 40) {
+        max -= 1;
+        el.style.fontSize = max + "px";
+        guard++;
+      }
+    })();
+  </script>
 </body>
 </html>

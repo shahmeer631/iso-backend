@@ -149,13 +149,39 @@ const isMasteryCertificateCourse = (course?: {
   );
 };
 
-const formatCertificateDate = (value?: Date | null) => {
-  const date = value instanceof Date ? value : new Date();
-  return date.toLocaleDateString("en-GB", {
+const formatCertificateDate = (value?: Date | string | null) => {
+  const raw =
+    value instanceof Date
+      ? value
+      : value
+        ? new Date(value)
+        : new Date();
+  const date = Number.isNaN(raw.getTime()) ? new Date() : raw;
+  // UTC avoids off-by-one day shifts from server local timezone
+  return new Intl.DateTimeFormat("en-GB", {
     day: "numeric",
     month: "long",
     year: "numeric",
-  });
+    timeZone: "UTC",
+  }).format(date);
+};
+
+const escapeHtml = (value: string) =>
+  value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+
+/** Keep overlay text inside fixed-width template cells. */
+const fitField = (value: string, maxChars: number) => {
+  const cleaned = String(value || "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!cleaned) return "—";
+  if (cleaned.length <= maxChars) return cleaned;
+  return `${cleaned.slice(0, Math.max(1, maxChars - 1)).trimEnd()}…`;
 };
 
 const previewCertificate = async (userId: string, courseId: string) => {
@@ -217,48 +243,73 @@ const generateCertificatePDF = async (userId: string, courseId: string) => {
   // Read HTML template
   let htmlContent = fs.readFileSync(htmlTemplatePath, "utf-8");
 
-  // Convert template image to base64 or use DB URL
-  let templateImageSource = "";
-  if (data.template?.backgroundImageUrl) {
-    templateImageSource = data.template.backgroundImageUrl;
-  } else {
-    const templateImageBuffer = fs.readFileSync(templateImagePath);
-    templateImageSource = `data:image/png;base64,${templateImageBuffer.toString("base64")}`;
-  }
+  // Always use the local calibrated PNG so absolute overlays stay aligned.
+  // (Remote DB URLs can differ in crop/scale and break field placement.)
+  const templateImageBuffer = fs.readFileSync(templateImagePath);
+  const templateImageSource = `data:image/png;base64,${templateImageBuffer.toString("base64")}`;
 
-  // Title case looks closer to the CPD design than all-caps.
-  const recipientName = data.studentName || "Recipient Name";
+  // Name can be long — HTML template auto-scales font; keep a hard cap for safety.
+  const recipientName = fitField(data.studentName || "Recipient Name", 56);
   const issuedDate = formatCertificateDate(cert?.issuedAt || data.issuedAt);
+  const industry = fitField(data.industry || "", 34);
+  const managementLevel = fitField(data.managementLevel || "", 22);
+  const jobFunction = fitField(data.jobFunction || "", 22);
 
-  // Replace placeholders in HTML
+  // Replace placeholders in HTML (escape user-sourced strings)
   htmlContent = htmlContent
     .replace(/{{TEMPLATE_IMAGE}}/g, templateImageSource)
-    .replace(/{{RECIPIENT_NAME}}/g, recipientName)
-    .replace(/{{CERT_NUMBER}}/g, certificateNo)
-    .replace(/{{ISSUED_DATE}}/g, issuedDate)
-    .replace(/{{INDUSTRY}}/g, data.industry || "—")
-    .replace(/{{MANAGEMENT_LEVEL}}/g, data.managementLevel || "—")
-    .replace(/{{JOB_FUNCTION}}/g, data.jobFunction || "—");
+    .replace(/{{RECIPIENT_NAME}}/g, escapeHtml(recipientName))
+    .replace(/{{CERT_NUMBER}}/g, escapeHtml(certificateNo))
+    .replace(/{{ISSUED_DATE}}/g, escapeHtml(issuedDate))
+    .replace(/{{INDUSTRY}}/g, escapeHtml(industry))
+    .replace(/{{MANAGEMENT_LEVEL}}/g, escapeHtml(managementLevel))
+    .replace(/{{JOB_FUNCTION}}/g, escapeHtml(jobFunction));
 
-  // Generate PDF using Puppeteer
-  const browser = await puppeteer.launch({
+  const launchOptions: Parameters<typeof puppeteer.launch>[0] = {
     headless: true,
-    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
-  });
+    args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
+  };
+  // Prefer system Chrome when the bundled Chromium cache is unavailable (common on Windows).
+  const systemChrome =
+    process.env.PUPPETEER_EXECUTABLE_PATH ||
+    (process.platform === "win32"
+      ? "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
+      : undefined);
+  if (systemChrome && fs.existsSync(systemChrome)) {
+    launchOptions.executablePath = systemChrome;
+  }
 
+  const browser = await puppeteer.launch(launchOptions);
   const page = await browser.newPage();
 
-  // Match the updated CPD Mastery Lab certificate canvas (landscape 1536x1024)
-  await page.setViewport({ width: 1536, height: 1024 });
+  // Match the CPD Mastery Lab certificate canvas (landscape 1536x1024)
+  await page.setViewport({ width: 1536, height: 1024, deviceScaleFactor: 1 });
 
-  // Load HTML content
-  await page.setContent(htmlContent, { waitUntil: "networkidle0" });
+  await page.setContent(htmlContent, {
+    waitUntil: ["load", "domcontentloaded"],
+    timeout: 60_000,
+  });
 
-  // Generate PDF
+  // Wait for template image paint. Avoid async/await here — TS emits __awaiter,
+  // which does not exist in the Puppeteer browser context.
+  await page.evaluate(() => {
+    return Promise.all(
+      Array.from(document.images).map((img) =>
+        img.complete
+          ? Promise.resolve()
+          : new Promise((resolve) => {
+              img.onload = () => resolve(undefined);
+              img.onerror = () => resolve(undefined);
+            }),
+      ),
+    );
+  });
+
   const pdfBuffer = await page.pdf({
     width: "1536px",
     height: "1024px",
     printBackground: true,
+    preferCSSPageSize: true,
     margin: { top: 0, right: 0, bottom: 0, left: 0 },
   });
 
