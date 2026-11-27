@@ -27,14 +27,19 @@ import {
   expireLegacyUnconsumedExamSessions,
   invalidateAllUnusedQuestionBank,
 } from "../Quiz/masteryQuestionBank";
+import {
+  MASTERY_PASS_SCORE,
+  isMasteryPassingScore,
+} from "./masteryPassScore";
 
 export {
   MASTERY_LEADERBOARD_RESET_CONFIRM,
   MASTERY_CAMPAIGN_TRANSITION_CONFIRM,
   getActiveMasteryCampaign,
+  MASTERY_PASS_SCORE,
+  isMasteryPassingScore,
 };
 
-const MASTERY_PASS_SCORE = Number(process.env.MASTERY_PASS_SCORE ?? 70);
 const MASTERY_CERT_COURSE_TITLE = "ISO Mastery Lab – Certificate of Competency";
 const MASTERY_CERT_TEMPLATE_NAME = "Mastery Lab CPD Certificate";
 
@@ -114,7 +119,7 @@ const issueMasteryCertificateIfEligible = async (
     department?: string;
   },
 ) => {
-  if (!userId || overallScore < MASTERY_PASS_SCORE) {
+  if (!userId || !isMasteryPassingScore(overallScore)) {
     return { certificateIssued: false, certificate: null as any };
   }
 
@@ -155,8 +160,12 @@ const issueMasteryCertificateIfEligible = async (
         certificateIssued: true,
         certificate: withShareMeta(certificate),
       };
-    } catch (err) {
-      if (isPrismaUniqueConflict(err)) {
+    } catch (err: any) {
+      // Idempotent: unique constraint or explicit "already exists" from service
+      const alreadyExists =
+        isPrismaUniqueConflict(err) ||
+        /already exists/i.test(String(err?.message || ""));
+      if (alreadyExists) {
         const again = await prisma.certificate.findFirst({
           where: { userId, courseId },
         });
@@ -523,7 +532,7 @@ const metricsFromStoredResult = (result: any) => {
 
 const buildResultPayload = async (result: any) => {
   const overallScore = Number(result.score) || 0;
-  const passed = overallScore >= MASTERY_PASS_SCORE;
+  const passed = isMasteryPassingScore(overallScore);
   const metrics = metricsFromStoredResult(result);
 
   // Ensure Competency certificate is issued (or re-linked) whenever a passing
@@ -608,7 +617,7 @@ const submitMasteryLab = async (payload: any) => {
     if (!userId) {
       return redactMasteryResultForAnonymous(existing);
     }
-    const passed = existing.score >= MASTERY_PASS_SCORE;
+    const passed = isMasteryPassingScore(existing.score);
     // Safe XP retry if pass was recorded but award soft-failed previously
     if (passed && userId) {
       const { XpService } = await import("../Gamification/xp.service");
@@ -776,7 +785,7 @@ const submitMasteryLab = async (payload: any) => {
       { industry, management_level, department },
     );
 
-    const passed = overallScore >= MASTERY_PASS_SCORE;
+    const passed = isMasteryPassingScore(overallScore);
     if (passed && userId) {
       const { XpService } = await import("../Gamification/xp.service");
       await XpService.awardMasteryExamPass(userId, result.id);
@@ -1029,7 +1038,7 @@ const claimMasteryLabResult = async (
     data: { userId },
   });
 
-  const passed = updated.score >= MASTERY_PASS_SCORE;
+  const passed = isMasteryPassingScore(updated.score);
   if (passed) {
     try {
       const { XpService } = await import("../Gamification/xp.service");

@@ -323,17 +323,28 @@ const issueCertificateManually = async (userId: string, courseId: string, templa
   const template = await prisma.certificateTemplate.findUnique({ where: { id: templateId } });
   if (!template) throw new Error("Certificate template does not exist");
 
+  // Idempotent: one certificate per user+course (@@unique). Reuse if already issued
+  // (auto Mastery issue, retries, or prior admin issue).
   const existing = await prisma.certificate.findFirst({ where: { userId, courseId } });
-  if (existing) throw new Error("Certificate already exists for this user and course");
+  if (existing) return existing;
 
-  const created = await prisma.certificate.create({
-    data: { userId, courseId, templateId, downloadCount: 0 },
-  });
+  try {
+    const created = await prisma.certificate.create({
+      data: { userId, courseId, templateId, downloadCount: 0 },
+    });
 
-  const { XpService } = await import("../Gamification/xp.service");
-  await XpService.awardCertificate(userId, courseId);
+    const { XpService } = await import("../Gamification/xp.service");
+    await XpService.awardCertificate(userId, courseId);
 
-  return created;
+    return created;
+  } catch (err: any) {
+    // Race: another request created the same userId+courseId pair
+    if (err?.code === "P2002") {
+      const again = await prisma.certificate.findFirst({ where: { userId, courseId } });
+      if (again) return again;
+    }
+    throw err;
+  }
 };
 
 const getSingleCertificate = async (id: string) => {

@@ -71,6 +71,12 @@ router.get(
   LifetimeController.listAdminAuditLogs,
 );
 
+router.post(
+  "/admin/reconcile-access",
+  auth(UserRole.SUPER_ADMIN),
+  LifetimeController.reconcileAdminPurchases,
+);
+
 // Legacy upsert — still SUPER_ADMIN; prices locked server-side
 router.put(
   "/config",

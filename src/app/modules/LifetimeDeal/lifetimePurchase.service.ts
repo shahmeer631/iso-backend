@@ -175,7 +175,14 @@ const activateLifetimeEntitlement = async (raw: unknown) => {
       (await prisma.userAccess.findUnique({
         where: { lifetimePurchaseId: purchase.id },
       }));
-    if (existing) return { purchase, userAccess: existing, created: false };
+    if (existing) {
+      return {
+        purchase,
+        userAccess: existing,
+        created: false,
+        enrolledCount: 0,
+      };
+    }
   }
 
   const plan = await prisma.plan.findUnique({ where: { id: data.planId } });
@@ -199,6 +206,7 @@ const activateLifetimeEntitlement = async (raw: unknown) => {
         purchase: existingPurchase,
         userAccess: already,
         created: false as const,
+        enrolledCount: 0,
       };
     }
 
@@ -247,18 +255,52 @@ const activateLifetimeEntitlement = async (raw: unknown) => {
     );
 
     // Preserve annual subscription rows & Stripe customer entirely.
-    // Only raise currentPlan; denormalized planId may point at LTD plan for
-    // feature display, but Subscription records are never cancelled/updated.
+    // Raise currentPlan + mark subscribed so FE/dashboard treat LTD as paid.
+    // Subscription records are never cancelled/updated.
     await tx.user.update({
       where: { id: purchase.userId },
       data: {
         currentPlan: nextPlan as "SILVER" | "GOLD" | "PLATINUM",
         planId: data.planId,
+        subscribed: "SUBSCRIBED",
         totalSpent: {
           increment: purchase.amount,
         },
       },
     });
+
+    // Admin Transactions/Orders read Payment rows — create one for LTD visibility.
+    const paymentIntentKey =
+      purchase.stripePaymentIntentId || `ltd_${purchase.id}`;
+    await tx.payment.upsert({
+      where: { stripePaymentIntentId: paymentIntentKey },
+      create: {
+        userId: purchase.userId,
+        planId: data.planId,
+        originalAmount: plan.discountedPrice ?? purchase.amount,
+        discountAmount: Math.max(
+          0,
+          (plan.discountedPrice ?? purchase.amount) - purchase.amount,
+        ),
+        finalAmount: purchase.amount,
+        currency: (purchase.currency || "usd").toLowerCase(),
+        stripePaymentIntentId: paymentIntentKey,
+        status: "SUCCEEDED",
+      },
+      update: {
+        status: "SUCCEEDED",
+        finalAmount: purchase.amount,
+        planId: data.planId,
+      },
+    });
+
+    // Immediate course access: auto-enroll into published Academy courses when
+    // the LTD plan includes COURSES (Pro/Ultra). Users were stuck at 0 enrollments.
+    const planFeatures = (plan.features || []).map((f) => f.toUpperCase());
+    let enrolledCount = 0;
+    if (planFeatures.includes("COURSES")) {
+      enrolledCount = await autoEnrollPublishedCourses(tx, purchase.userId);
+    }
 
     // Hard safety: if an annual sub exists, it must still be present unchanged
     if (activeAnnualSub) {
@@ -294,10 +336,187 @@ const activateLifetimeEntitlement = async (raw: unknown) => {
       purchase: updatedPurchase,
       userAccess,
       created: true as const,
+      enrolledCount,
     };
   });
 
   return result;
+};
+
+type DbClient = {
+  course: typeof prisma.course;
+  enrollment: typeof prisma.enrollment;
+  user: typeof prisma.user;
+};
+
+/** Enroll user in every PUBLISHED course they don't already have. */
+async function autoEnrollPublishedCourses(tx: DbClient, userId: string) {
+  const courses = await tx.course.findMany({
+    where: { status: "PUBLISHED" },
+    select: { id: true },
+  });
+  if (courses.length === 0) return 0;
+
+  const existing = await tx.enrollment.findMany({
+    where: { userId },
+    select: { courseId: true },
+  });
+  const have = new Set(existing.map((e) => e.courseId));
+  const missing = courses.filter((c) => !have.has(c.id));
+  if (missing.length === 0) return 0;
+
+  // Mongo Prisma: create one-by-one for reliable ObjectId handling
+  for (const course of missing) {
+    await tx.enrollment.create({
+      data: { userId, courseId: course.id },
+    });
+  }
+
+  const enrollmentsCount = await tx.enrollment.count({ where: { userId } });
+  await tx.user.update({
+    where: { id: userId },
+    data: { enrollmentsCount },
+  });
+
+  return missing.length;
+}
+
+/**
+ * Repair already-paid LTD buyers: Payment row + SUBSCRIBED + course enrollments.
+ * Idempotent — safe to re-run for the promo access outage.
+ */
+const reconcileSucceededLifetimePurchases = async () => {
+  const purchases = await prisma.lifetimePurchase.findMany({
+    where: {
+      status: "SUCCEEDED",
+    },
+    include: {
+      plan: { select: { id: true, features: true, discountedPrice: true } },
+      userAccess: true,
+    },
+    orderBy: { purchasedAt: "desc" },
+  });
+
+  const summary = {
+    scanned: purchases.length,
+    entitlementsActivated: 0,
+    paymentsCreated: 0,
+    paymentsExisting: 0,
+    subscribedUpdated: 0,
+    coursesEnrolled: 0,
+    skippedNoPlan: 0,
+    errors: [] as Array<{ purchaseId: string; message: string }>,
+  };
+
+  for (const purchase of purchases) {
+    try {
+      let planId = purchase.planId || purchase.userAccess?.planId || null;
+
+      // Paid but never activated — finish entitlement now
+      if (!purchase.entitlementActivatedAt || !purchase.userAccess) {
+        if (!planId) {
+          summary.skippedNoPlan += 1;
+          continue;
+        }
+        await activateLifetimeEntitlement({
+          purchaseId: purchase.id,
+          planId,
+        });
+        summary.entitlementsActivated += 1;
+        // Re-load for payment/enroll steps below
+        const refreshed = await prisma.lifetimePurchase.findUnique({
+          where: { id: purchase.id },
+          include: {
+            plan: { select: { id: true, features: true, discountedPrice: true } },
+            userAccess: true,
+          },
+        });
+        if (refreshed) {
+          Object.assign(purchase, refreshed);
+          planId = refreshed.planId || planId;
+        }
+      }
+
+      if (!planId) {
+        summary.skippedNoPlan += 1;
+        continue;
+      }
+
+      const plan =
+        purchase.plan ||
+        (await prisma.plan.findUnique({
+          where: { id: planId },
+          select: { id: true, features: true, discountedPrice: true },
+        }));
+      if (!plan) {
+        summary.skippedNoPlan += 1;
+        continue;
+      }
+
+      const paymentIntentKey =
+        purchase.stripePaymentIntentId || `ltd_${purchase.id}`;
+
+      const existingPayment = await prisma.payment.findUnique({
+        where: { stripePaymentIntentId: paymentIntentKey },
+      });
+
+      if (!existingPayment) {
+        await prisma.payment.create({
+          data: {
+            userId: purchase.userId,
+            planId: plan.id,
+            originalAmount: plan.discountedPrice ?? purchase.amount,
+            discountAmount: Math.max(
+              0,
+              (plan.discountedPrice ?? purchase.amount) - purchase.amount,
+            ),
+            finalAmount: purchase.amount,
+            currency: (purchase.currency || "usd").toLowerCase(),
+            stripePaymentIntentId: paymentIntentKey,
+            status: "SUCCEEDED",
+          },
+        });
+        summary.paymentsCreated += 1;
+      } else {
+        summary.paymentsExisting += 1;
+      }
+
+      const user = await prisma.user.findUnique({
+        where: { id: purchase.userId },
+        select: { subscribed: true },
+      });
+      if (user?.subscribed !== "SUBSCRIBED") {
+        await prisma.user.update({
+          where: { id: purchase.userId },
+          data: { subscribed: "SUBSCRIBED", planId: plan.id },
+        });
+        summary.subscribedUpdated += 1;
+      }
+
+      const features = (plan.features || []).map((f) => f.toUpperCase());
+      if (features.includes("COURSES")) {
+        const enrolled = await prisma.$transaction((tx) =>
+          autoEnrollPublishedCourses(tx, purchase.userId),
+        );
+        summary.coursesEnrolled += enrolled;
+      }
+
+      // Ensure lifetime access row stays active
+      if (purchase.userAccess && !purchase.userAccess.isActive) {
+        await prisma.userAccess.update({
+          where: { id: purchase.userAccess.id },
+          data: { isActive: true, expiresAt: null },
+        });
+      }
+    } catch (err: any) {
+      summary.errors.push({
+        purchaseId: purchase.id,
+        message: err?.message || String(err),
+      });
+    }
+  }
+
+  return summary;
 };
 
 const getPurchasesForUser = async (userId: string) => {
@@ -313,4 +532,5 @@ export const LifetimePurchaseService = {
   markPurchasePaid,
   activateLifetimeEntitlement,
   getPurchasesForUser,
+  reconcileSucceededLifetimePurchases,
 };

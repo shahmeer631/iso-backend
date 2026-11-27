@@ -266,6 +266,27 @@ const listAdminAuditLogs = catchAsync(async (req: Request, res: Response) => {
   });
 });
 
+/**
+ * Admin — repair promo/LTD buyers who paid but missing Payment rows,
+ * SUBSCRIBED flag, or course enrollments (Transactions/Orders empty + no access).
+ */
+const reconcileAdminPurchases = catchAsync(
+  async (req: Request, res: Response) => {
+    assertLtdAdminAccess(
+      req.user as { id?: string; role?: string; email?: string },
+    );
+    const data =
+      await LifetimePurchaseService.reconcileSucceededLifetimePurchases();
+
+    sendResponse(res, {
+      statusCode: httpStatus.OK,
+      success: true,
+      message: "Lifetime Deal purchases reconciled",
+      data,
+    });
+  },
+);
+
 const getMyLifetimePurchases = catchAsync(async (req, res: Response) => {
   const userId = req.user?.id as string | undefined;
   if (!userId) {
@@ -335,4 +356,5 @@ export const LifetimeController = {
   updateAdminPromotionSchedule,
   listAdminPurchases,
   listAdminAuditLogs,
+  reconcileAdminPurchases,
 };
